@@ -41,19 +41,3 @@ xiezai
 ```
 
 一键停掉服务、删掉节点、配置和开机自启，清得干干净净。想再装就重新跑一键命令。
-
-## 客户端推荐
-
-- 安卓：v2rayNG、NekoBox
-- 苹果：Shadowrocket、Streisand、SingBox
-- 电脑：Nekoray、v2rayN
-
-## 说明
-
-- 脚本会自动下载 Xray 官方最新内核、生成 REALITY 密钥、写好配置并设为开机自启（systemd / OpenRC）。
-- 端口会自动尝试放行（ufw / firewalld / iptables）；云服务器还需去控制台安全组放行对应端口。
-- 重装：再跑一遍一键命令即可，会覆盖旧节点并重新随机生成账号密码。
-
-## 免责
-
-仅供学习交流，请遵守当地法律法规。
