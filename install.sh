@@ -233,8 +233,25 @@ if [ "$CORE" = "xray" ]; then
       info "安装包已在本地，直接使用（跳过下载）"
     else
       rm -f /tmp/xray.zip
-      _url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip"
-      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/xray.zip "$_url" || die "Xray 下载失败，检查服务器能否访问 github.com"
+      # 先从 API 拿最新版本号，拼出版本直链（/latest/download 中转有时会 504，直链更稳）
+      _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+      _dl_ok=0
+      # 有版本号就优先用直链，再回退到 /latest/download；拿不到版本号就只试 /latest/download
+      for _url in \
+        ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
+        "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
+      ; do
+        [ -z "$_url" ] && continue
+        info "尝试下载：$_url"
+        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o /tmp/xray.zip "$_url"; then
+          _dl_ok=1
+          break
+        fi
+        warn "这个地址下载失败，换下一个地址试试…"
+        rm -f /tmp/xray.zip
+      done
+      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 github.com 的网络不稳定，稍等几分钟后重跑脚本试试"
     fi
     mkdir -p /tmp/xray-dl && unzip -o /tmp/xray.zip -d /tmp/xray-dl xray || die "解压失败"
     install -m 0755 /tmp/xray-dl/xray "$XRAY_BIN" || die "安装 Xray 失败"
