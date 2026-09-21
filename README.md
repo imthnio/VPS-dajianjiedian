@@ -18,7 +18,7 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/xra
 1. **IPv4 还是 IPv6**（默认 IPv4）
 2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks / AnyTLS+REALITY / Hysteria2 / TUIC
 3. **端口**（默认随机一个空闲端口）
-4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：1. www.samsung.com，2. www.apple.com
+4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：10 个实测备选，默认 www.samsung.com（完整清单见下方"REALITY 伪装域名推荐"）
 
 UUID 和密码全部随机生成，不用你操心。
 
