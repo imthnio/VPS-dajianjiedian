@@ -73,6 +73,20 @@ get_ip() { # get_ip 4|6 -> 打印公网 IP，失败返回非零
   return 1
 }
 
+# gh_api_dl <仓库> <文件名> <输出路径>
+# 走 GitHub API 下载 release 文件：api.github.com 比 github.com 稳得多，
+# API 返回 302 跳到 release-assets，下得快。成功返回 0，失败返回非零。
+gh_api_dl() {
+  _gh_repo="$1"; _gh_asset="$2"; _gh_out="$3"
+  _gh_rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${_gh_repo}/releases/latest" 2>/dev/null) || return 1
+  [ -n "$_gh_rel" ] || return 1
+  _gh_aid=$(printf "%s\n" "$_gh_rel" | grep -B10 -F "\"name\": \"${_gh_asset}\"" | grep '"id"' | tail -1 | grep -o '[0-9][0-9]*' | head -1)
+  [ -n "$_gh_aid" ] || return 1
+  curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
+    -H "Accept: application/octet-stream" \
+    -o "$_gh_out" "https://api.github.com/repos/${_gh_repo}/releases/assets/${_gh_aid}"
+}
+
 # ---------- 1. 必须是 root ----------
 if [ "$(id -u)" -ne 0 ]; then
   die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
@@ -233,25 +247,33 @@ if [ "$CORE" = "xray" ]; then
       info "安装包已在本地，直接使用（跳过下载）"
     else
       rm -f /tmp/xray.zip
-      # 先从 API 拿最新版本号，拼出版本直链（/latest/download 中转有时会 504，直链更稳）
-      _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
-        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+      _xasset="Xray-linux-${XARCH}.zip"
       _dl_ok=0
-      # 有版本号就优先用直链，再回退到 /latest/download；拿不到版本号就只试 /latest/download
-      for _url in \
-        ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
-        "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
-      ; do
-        [ -z "$_url" ] && continue
-        info "尝试下载：$_url"
-        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o /tmp/xray.zip "$_url"; then
-          _dl_ok=1
-          break
-        fi
-        warn "这个地址下载失败，换下一个地址试试…"
+      # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
+      info "尝试下载：GitHub API"
+      if gh_api_dl "XTLS/Xray-core" "$_xasset" /tmp/xray.zip; then
+        _dl_ok=1
+      else
+        warn "API 路线失败，换 github.com 直链试试…"
         rm -f /tmp/xray.zip
-      done
-      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 github.com 的网络不稳定，稍等几分钟后重跑脚本试试"
+        # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底）
+        _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+          | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+        for _url in \
+          ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
+          "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
+        ; do
+          [ -z "$_url" ] && continue
+          info "尝试下载：$_url"
+          if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o /tmp/xray.zip "$_url"; then
+            _dl_ok=1
+            break
+          fi
+          warn "这个地址下载失败，换下一个地址试试…"
+          rm -f /tmp/xray.zip
+        done
+      fi
+      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
     fi
     mkdir -p /tmp/xray-dl && unzip -o /tmp/xray.zip -d /tmp/xray-dl xray || die "解压失败"
     install -m 0755 /tmp/xray-dl/xray "$XRAY_BIN" || die "安装 Xray 失败"
@@ -276,7 +298,23 @@ else
       info "安装包已在本地，直接使用（跳过下载）"
     else
       rm -f /tmp/sb.tar.gz
-      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/sb.tar.gz "$_url" || die "sing-box 下载失败，检查服务器能否访问 github.com"
+      _sasset="sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
+      _dl_ok=0
+      # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
+      info "尝试下载：GitHub API"
+      if gh_api_dl "SagerNet/sing-box" "$_sasset" /tmp/sb.tar.gz; then
+        _dl_ok=1
+      else
+        warn "API 路线失败，换 github.com 直链试试…"
+        rm -f /tmp/sb.tar.gz
+        # 路线 B：github.com 版本直链兜底
+        _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
+        info "尝试下载：$_url"
+        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o /tmp/sb.tar.gz "$_url"; then
+          _dl_ok=1
+        fi
+      fi
+      [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
     fi
     mkdir -p /tmp/sb-dl && tar xzvf /tmp/sb.tar.gz -C /tmp/sb-dl || die "解压失败"
     install -m 0755 "/tmp/sb-dl/sing-box-${_ver}-linux-${MACH}${_suffix}/sing-box" "$SB_BIN" || die "安装 sing-box 失败"
