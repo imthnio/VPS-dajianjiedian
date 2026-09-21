@@ -228,9 +228,15 @@ if [ "$CORE" = "xray" ]; then
   if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version >/dev/null 2>&1; then
     info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
   else
-    _url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip"
-    curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/xray.zip "$_url" || die "Xray 下载失败，检查服务器能否访问 github.com"
-    mkdir -p /tmp/xray-dl && unzip -o -q /tmp/xray.zip -d /tmp/xray-dl xray || die "解压失败"
+    # /tmp 里已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）
+    if [ -s /tmp/xray.zip ] && unzip -t -q /tmp/xray.zip >/dev/null 2>&1; then
+      info "安装包已在本地，直接使用（跳过下载）"
+    else
+      rm -f /tmp/xray.zip
+      _url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip"
+      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/xray.zip "$_url" || die "Xray 下载失败，检查服务器能否访问 github.com"
+    fi
+    mkdir -p /tmp/xray-dl && unzip -o /tmp/xray.zip -d /tmp/xray-dl xray || die "解压失败"
     install -m 0755 /tmp/xray-dl/xray "$XRAY_BIN" || die "安装 Xray 失败"
     rm -rf /tmp/xray.zip /tmp/xray-dl
     info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
@@ -248,8 +254,14 @@ else
       | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
     [ -z "$_ver" ] && die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
     _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
-    curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/sb.tar.gz "$_url" || die "sing-box 下载失败，检查服务器能否访问 github.com"
-    mkdir -p /tmp/sb-dl && tar xzf /tmp/sb.tar.gz -C /tmp/sb-dl || die "解压失败"
+    # /tmp 里已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）
+    if [ -s /tmp/sb.tar.gz ] && tar tzf /tmp/sb.tar.gz >/dev/null 2>&1; then
+      info "安装包已在本地，直接使用（跳过下载）"
+    else
+      rm -f /tmp/sb.tar.gz
+      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 3 --retry-delay 3 -o /tmp/sb.tar.gz "$_url" || die "sing-box 下载失败，检查服务器能否访问 github.com"
+    fi
+    mkdir -p /tmp/sb-dl && tar xzvf /tmp/sb.tar.gz -C /tmp/sb-dl || die "解压失败"
     install -m 0755 "/tmp/sb-dl/sing-box-${_ver}-linux-${MACH}${_suffix}/sing-box" "$SB_BIN" || die "安装 sing-box 失败"
     rm -rf /tmp/sb.tar.gz /tmp/sb-dl
     info "sing-box 安装成功：$($SB_BIN version 2>/dev/null | head -1)"
