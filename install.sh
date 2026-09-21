@@ -229,7 +229,7 @@ if [ "$CORE" = "xray" ]; then
     info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
   else
     _url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip"
-    curl -fsSL --max-time 120 -o /tmp/xray.zip "$_url" || die "Xray 下载失败，检查服务器能否访问 github.com"
+    curl -fsSL --retry 3 --retry-delay 3 --max-time 180 -o /tmp/xray.zip "$_url" || die "Xray 下载失败，检查服务器能否访问 github.com"
     mkdir -p /tmp/xray-dl && unzip -o -q /tmp/xray.zip -d /tmp/xray-dl xray || die "解压失败"
     install -m 0755 /tmp/xray-dl/xray "$XRAY_BIN" || die "安装 Xray 失败"
     rm -rf /tmp/xray.zip /tmp/xray-dl
@@ -248,7 +248,7 @@ else
       | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
     [ -z "$_ver" ] && die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
     _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
-    curl -fsSL --max-time 120 -o /tmp/sb.tar.gz "$_url" || die "sing-box 下载失败，检查服务器能否访问 github.com"
+    curl -fsSL --retry 3 --retry-delay 3 --max-time 180 -o /tmp/sb.tar.gz "$_url" || die "sing-box 下载失败，检查服务器能否访问 github.com"
     mkdir -p /tmp/sb-dl && tar xzf /tmp/sb.tar.gz -C /tmp/sb-dl || die "解压失败"
     install -m 0755 "/tmp/sb-dl/sing-box-${_ver}-linux-${MACH}${_suffix}/sing-box" "$SB_BIN" || die "安装 sing-box 失败"
     rm -rf /tmp/sb.tar.gz /tmp/sb-dl
