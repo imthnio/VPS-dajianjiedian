@@ -16,7 +16,7 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/xra
 4 个问题分别是：
 
 1. **IPv4 还是 IPv6**（默认 IPv4）
-2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks
+2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks / AnyTLS+REALITY / Hysteria2 / TUIC
 3. **端口**（默认随机一个空闲端口）
 4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：1. www.samsung.com，2. www.apple.com
 
