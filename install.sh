@@ -9,6 +9,7 @@
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
 # 装完之后，想看节点随时输入：  jiedian
+# 不想要了，输入 xiezai 一键卸载干净
 # ============================================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -452,8 +453,40 @@ JDEOF
 chmod +x /usr/local/bin/jiedian
 info "已安装 jiedian 命令：以后输入 jiedian 就能看节点"
 
+cat > /usr/local/bin/xiezai <<'XZEOF'
+#!/bin/sh
+# 输入 xiezai，一键卸载 xray-node：停掉服务，删掉节点和所有相关配置
+echo "正在卸载 xray-node…"
+
+# 停掉并移除开机自启
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl stop xray >/dev/null 2>&1
+  systemctl disable xray >/dev/null 2>&1
+  rm -f /etc/systemd/system/xray.service
+  systemctl daemon-reload >/dev/null 2>&1
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  rc-service xray stop >/dev/null 2>&1
+  rc-update del xray default >/dev/null 2>&1
+  rm -f /etc/init.d/xray
+fi
+pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
+pkill -x xray >/dev/null 2>&1
+sleep 1
+
+# 删掉配置、节点、日志、可执行文件
+rm -rf /usr/local/etc/xray /etc/xray-node /var/log/xray.log
+rm -f /usr/local/bin/xray /usr/local/bin/jiedian
+rm -f /usr/local/bin/xiezai
+
+echo "卸载完成：节点、配置、开机自启都已清除干净。"
+XZEOF
+chmod +x /usr/local/bin/xiezai
+info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
+
 # ---------- 15. 显示结果 ----------
 printf "\n"
 cat /etc/xray-node/node.txt
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
+printf "以后看节点输入 jiedian，不想要了输入 xiezai 一键卸载。\n"
 printf "客户端推荐：安卓 v2rayNG / NekoBox，苹果 Shadowrocket / Streisand，电脑 Nekoray / v2rayN\n"
