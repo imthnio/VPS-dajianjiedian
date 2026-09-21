@@ -489,4 +489,3 @@ printf "\n"
 cat /etc/xray-node/node.txt
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
 printf "以后看节点输入 jiedian，不想要了输入 xiezai 一键卸载。\n"
-printf "客户端推荐：安卓 v2rayNG / NekoBox，苹果 Shadowrocket / Streisand，电脑 Nekoray / v2rayN\n"
