@@ -89,19 +89,29 @@ if [ -f /etc/xray-node/node.txt ]; then
   case "$_re" in y|Y|yes|YES) ;; *) echo "已取消"; exit 0;; esac
 fi
 
-# ---------- 2. 装依赖 ----------
+# ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
 step "[准备] 检查系统工具…"
-if command -v apt-get >/dev/null 2>&1; then
-  timeout 60 apt-get update -qq >/dev/null 2>&1
-  timeout 120 apt-get install -y -qq curl unzip ca-certificates >/dev/null 2>&1
-elif command -v apk >/dev/null 2>&1; then
-  timeout 120 apk add --no-cache curl unzip ca-certificates >/dev/null 2>&1
-elif command -v dnf >/dev/null 2>&1; then
-  timeout 120 dnf install -y -q curl unzip ca-certificates >/dev/null 2>&1
-elif command -v yum >/dev/null 2>&1; then
-  timeout 120 yum install -y -q curl unzip ca-certificates >/dev/null 2>&1
-elif command -v pacman >/dev/null 2>&1; then
-  timeout 120 pacman -Sy --noconfirm --needed curl unzip ca-certificates >/dev/null 2>&1
+_need_install=0
+command -v curl >/dev/null 2>&1 || _need_install=1
+command -v unzip >/dev/null 2>&1 || _need_install=1
+if [ "$_need_install" -eq 1 ]; then
+  printf "缺少 curl 或 unzip，正在安装（最多等两三分钟）…\n"
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v apt-get >/dev/null 2>&1; then
+    timeout 60 apt-get update -qq >/dev/null 2>&1
+    timeout 120 apt-get install -y -qq curl unzip ca-certificates >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then
+    timeout 120 apk add --no-cache curl unzip ca-certificates >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    timeout 120 dnf install -y -q curl unzip ca-certificates >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    timeout 120 yum install -y -q curl unzip ca-certificates >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    timeout 120 pacman -Sy --noconfirm --needed curl unzip ca-certificates >/dev/null 2>&1
+  fi
+  unset DEBIAN_FRONTEND
+else
+  info "curl / unzip 都有，直接跳过安装"
 fi
 command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl 后重试"
 command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
