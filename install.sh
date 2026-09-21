@@ -472,6 +472,7 @@ info "配置文件校验通过"
 
 else
 # ---------- sing-box 配置（AnyTLS / Hysteria2 / TUIC） ----------
+mkdir -p /usr/local/etc/sing-box
 SB_CONF="/usr/local/etc/sing-box/config.json"
 case "$PROTO" in
   anytls)
