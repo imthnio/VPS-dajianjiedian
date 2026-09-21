@@ -244,12 +244,29 @@ NEED_REALITY=0
 case "$PROTO" in vless|trojan|anytls) NEED_REALITY=1 ;; esac
 if [ "$NEED_REALITY" -eq 1 ]; then
   step "[4/4] REALITY 伪装成哪个网站？"
-  printf "  1) www.samsung.com\n"
-  printf "  2) www.apple.com\n"
+  printf "  1) www.samsung.com（三星官网，零干扰，最稳）\n"
+  printf "  2) www.cisco.com（思科官网，TLS 极稳）\n"
+  printf "  3) itunes.apple.com（苹果音乐服务）\n"
+  printf "  4) www.python.org（Python 官网，技术站小众）\n"
+  printf "  5) m.media-amazon.com（亚马逊图片站）\n"
+  printf "  6) images-na.ssl-images-amazon.com（亚马逊图片 CDN）\n"
+  printf "  7) download-installer.cdn.mozilla.net（火狐下载站）\n"
+  printf "  8) www.lovelive-anime.jp（日本动画官网，小众）\n"
+  printf "  9) academy.nvidia.com（英伟达学院，备选用）\n"
+  printf " 10) lol.secure.dyn.riotcdn.net（游戏补丁 CDN，备选用）\n"
+  printf "不知道选哪个就回车用默认 1。\n"
   ask "请选择" "1" _dm
   case "$_dm" in
-    2) REALITY_DOMAIN="www.apple.com" ;;
-    *) REALITY_DOMAIN="www.samsung.com" ;;
+    2)  REALITY_DOMAIN="www.cisco.com" ;;
+    3)  REALITY_DOMAIN="itunes.apple.com" ;;
+    4)  REALITY_DOMAIN="www.python.org" ;;
+    5)  REALITY_DOMAIN="m.media-amazon.com" ;;
+    6)  REALITY_DOMAIN="images-na.ssl-images-amazon.com" ;;
+    7)  REALITY_DOMAIN="download-installer.cdn.mozilla.net" ;;
+    8)  REALITY_DOMAIN="www.lovelive-anime.jp" ;;
+    9)  REALITY_DOMAIN="academy.nvidia.com" ;;
+    10) REALITY_DOMAIN="lol.secure.dyn.riotcdn.net" ;;
+    *)  REALITY_DOMAIN="www.samsung.com" ;;
   esac
   info "伪装域名：$REALITY_DOMAIN"
 else
