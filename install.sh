@@ -108,9 +108,10 @@ command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip
 info "系统工具就绪"
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
-step "[1/4] 你的服务器用 IPv4 还是 IPv6？"
-printf "  1) IPv4（大多数情况选这个）\n"
-printf "  2) IPv6\n"
+step "[1/4] 节点里填你服务器的哪个公网地址？"
+printf "  1) IPv4 地址（服务器有公网 IPv4 就选这个，大多数情况都是）\n"
+printf "  2) IPv6 地址（只有纯 IPv6、没有 IPv4 的服务器才选这个）\n"
+printf "不知道选哪个就回车用默认 1。\n"
 ask "请选择" "1" _ipver
 case "$_ipver" in
   2) IPVER=6 ;;
