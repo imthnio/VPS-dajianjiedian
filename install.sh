@@ -165,28 +165,6 @@ case "$PROTO" in
   *) CORE="xray" ;;
 esac
 
-# openssl 只有 5/6/7 才需要（生成 REALITY 密钥、自签证书），1-4 不需要。
-# 在这里按需安装，装不上才报错，不挡 1-4 的安装。
-if [ "$CORE" = "sing-box" ] && ! command -v openssl >/dev/null 2>&1; then
-  step "[准备] 安装 openssl（你选的协议需要用它生成密钥）…"
-  export DEBIAN_FRONTEND=noninteractive
-  if command -v apt-get >/dev/null 2>&1; then
-    timeout 60 apt-get update -qq >/dev/null 2>&1
-    timeout 120 apt-get install -y -qq openssl >/dev/null 2>&1
-  elif command -v apk >/dev/null 2>&1; then
-    timeout 120 apk add --no-cache openssl >/dev/null 2>&1
-  elif command -v dnf >/dev/null 2>&1; then
-    timeout 120 dnf install -y -q openssl >/dev/null 2>&1
-  elif command -v yum >/dev/null 2>&1; then
-    timeout 120 yum install -y -q openssl >/dev/null 2>&1
-  elif command -v pacman >/dev/null 2>&1; then
-    timeout 120 pacman -Sy --noconfirm --needed openssl >/dev/null 2>&1
-  fi
-  unset DEBIAN_FRONTEND
-  command -v openssl >/dev/null 2>&1 || die "装不上 openssl。请手动安装后再重跑脚本：Debian/Ubuntu 用 apt-get install -y openssl；Alpine 用 apk add openssl；CentOS 用 yum install -y openssl"
-  info "openssl 已就绪"
-fi
-
 # ---------- 5. 问：端口 ----------
 step "[3/4] 节点用哪个端口？"
 _DEF_PORT=$(rand_port)
@@ -286,13 +264,10 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     REALITY_PRIV=$(printf "%s" "$_out" | grep -i "private" | awk '{print $NF}' | tr -d '\r\n')
     REALITY_PUB=$(printf "%s" "$_out" | grep -i "public" | awk '{print $NF}' | tr -d '\r\n')
   else
-    # sing-box 场景用 openssl 生成 x25519 密钥对（DER 尾部 32 字节即原始密钥）
-    openssl genpkey -algorithm X25519 -out /tmp/rk-priv.pem 2>/dev/null || die "REALITY 密钥生成失败"
-    openssl pkey -in /tmp/rk-priv.pem -outform DER -out /tmp/rk-priv.der 2>/dev/null || die "REALITY 密钥生成失败"
-    openssl pkey -in /tmp/rk-priv.pem -pubout -outform DER -out /tmp/rk-pub.der 2>/dev/null || die "REALITY 密钥生成失败"
-    REALITY_PRIV=$(tail -c 32 /tmp/rk-priv.der | base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '=')
-    REALITY_PUB=$(tail -c 32 /tmp/rk-pub.der | base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '=')
-    rm -f /tmp/rk-priv.pem /tmp/rk-priv.der /tmp/rk-pub.der
+    # sing-box 自带 reality-keypair 生成，不需要 openssl
+    _out=$("$SB_BIN" generate reality-keypair 2>/dev/null)
+    REALITY_PRIV=$(printf "%s" "$_out" | grep -i "privatekey" | awk '{print $NF}' | tr -d '\r\n')
+    REALITY_PUB=$(printf "%s" "$_out" | grep -i "publickey" | awk '{print $NF}' | tr -d '\r\n')
   fi
   [ -z "$REALITY_PRIV" ] || [ -z "$REALITY_PUB" ] && die "REALITY 密钥生成失败"
   REALITY_SID=$(rand_hex 4)
@@ -303,10 +278,13 @@ fi
 if [ "$PROTO" = "hy2" ] || [ "$PROTO" = "tuic" ]; then
   step "[证书] 生成自签证书…"
   mkdir -p /usr/local/etc/sing-box
-  openssl req -x509 -nodes -newkey rsa:2048 \
-    -keyout /usr/local/etc/sing-box/key.pem \
-    -out /usr/local/etc/sing-box/cert.pem \
-    -subj "/CN=www.samsung.com" -days 36500 2>/dev/null \
+  # sing-box 自带 tls-keypair 生成自签证书，不需要 openssl；有效期 120 个月
+  "$SB_BIN" generate tls-keypair www.samsung.com --months 120 > /tmp/sb-tls.pem 2>/dev/null \
+    || die "自签证书生成失败"
+  awk '/BEGIN PRIVATE KEY/{p=1} p{print} /END PRIVATE KEY/{p=0}' /tmp/sb-tls.pem > /usr/local/etc/sing-box/key.pem
+  awk '/BEGIN CERTIFICATE/{p=1} p{print} /END CERTIFICATE/{p=0}' /tmp/sb-tls.pem > /usr/local/etc/sing-box/cert.pem
+  rm -f /tmp/sb-tls.pem
+  [ -s /usr/local/etc/sing-box/key.pem ] && [ -s /usr/local/etc/sing-box/cert.pem ] \
     || die "自签证书生成失败"
   info "自签证书已生成"
 fi
