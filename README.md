@@ -61,11 +61,3 @@ xiezai
 10. `lol.secure.dyn.riotcdn.net` —— 游戏补丁 CDN
 11. `s0.awsstatic.com`
 12. `www.amd.com` —— 有 3% 干扰率，只当备胎
-
-**千万别用：**
-
-- `www.microsoft.com` —— 2026 年 7 月 TLS 升级后 REALITY 握手失败
-- `dl.google.com`、`www.google-analytics.com` —— 国内不通
-- `addons.mozilla.org` —— 老教程的默认选项，2026 年已出现干扰
-
-每个域名启用前，先在服务器上跑 `xray tls ping 域名`，确认 TLS 1.3 和 h2 握手正常——能打开网页不等于 REALITY 能用。
