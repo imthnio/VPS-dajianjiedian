@@ -94,29 +94,27 @@ step "[准备] 检查系统工具…"
 _need_install=0
 command -v curl >/dev/null 2>&1 || _need_install=1
 command -v unzip >/dev/null 2>&1 || _need_install=1
-command -v openssl >/dev/null 2>&1 || _need_install=1
 if [ "$_need_install" -eq 1 ]; then
-  printf "缺少 curl / unzip / openssl，正在安装（最多等两三分钟）…\n"
+  printf "缺少 curl / unzip，正在安装（最多等两三分钟）…\n"
   export DEBIAN_FRONTEND=noninteractive
   if command -v apt-get >/dev/null 2>&1; then
     timeout 60 apt-get update -qq >/dev/null 2>&1
-    timeout 120 apt-get install -y -qq curl unzip openssl ca-certificates >/dev/null 2>&1
+    timeout 120 apt-get install -y -qq curl unzip ca-certificates >/dev/null 2>&1
   elif command -v apk >/dev/null 2>&1; then
-    timeout 120 apk add --no-cache curl unzip openssl ca-certificates >/dev/null 2>&1
+    timeout 120 apk add --no-cache curl unzip ca-certificates >/dev/null 2>&1
   elif command -v dnf >/dev/null 2>&1; then
-    timeout 120 dnf install -y -q curl unzip openssl ca-certificates >/dev/null 2>&1
+    timeout 120 dnf install -y -q curl unzip ca-certificates >/dev/null 2>&1
   elif command -v yum >/dev/null 2>&1; then
-    timeout 120 yum install -y -q curl unzip openssl ca-certificates >/dev/null 2>&1
+    timeout 120 yum install -y -q curl unzip ca-certificates >/dev/null 2>&1
   elif command -v pacman >/dev/null 2>&1; then
-    timeout 120 pacman -Sy --noconfirm --needed curl unzip openssl ca-certificates >/dev/null 2>&1
+    timeout 120 pacman -Sy --noconfirm --needed curl unzip ca-certificates >/dev/null 2>&1
   fi
   unset DEBIAN_FRONTEND
 else
-  info "curl / unzip / openssl 都有，直接跳过安装"
+  info "curl / unzip 都有，直接跳过安装"
 fi
 command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl 后重试"
 command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
-command -v openssl >/dev/null 2>&1 || die "装不上 openssl，请手动安装 openssl 后重试"
 info "系统工具就绪"
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
@@ -166,6 +164,28 @@ case "$PROTO" in
   anytls|hy2|tuic) CORE="sing-box" ;;
   *) CORE="xray" ;;
 esac
+
+# openssl 只有 5/6/7 才需要（生成 REALITY 密钥、自签证书），1-4 不需要。
+# 在这里按需安装，装不上才报错，不挡 1-4 的安装。
+if [ "$CORE" = "sing-box" ] && ! command -v openssl >/dev/null 2>&1; then
+  step "[准备] 安装 openssl（你选的协议需要用它生成密钥）…"
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v apt-get >/dev/null 2>&1; then
+    timeout 60 apt-get update -qq >/dev/null 2>&1
+    timeout 120 apt-get install -y -qq openssl >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then
+    timeout 120 apk add --no-cache openssl >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    timeout 120 dnf install -y -q openssl >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    timeout 120 yum install -y -q openssl >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    timeout 120 pacman -Sy --noconfirm --needed openssl >/dev/null 2>&1
+  fi
+  unset DEBIAN_FRONTEND
+  command -v openssl >/dev/null 2>&1 || die "装不上 openssl。请手动安装后再重跑脚本：Debian/Ubuntu 用 apt-get install -y openssl；Alpine 用 apk add openssl；CentOS 用 yum install -y openssl"
+  info "openssl 已就绪"
+fi
 
 # ---------- 5. 问：端口 ----------
 step "[3/4] 节点用哪个端口？"
