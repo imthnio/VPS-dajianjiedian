@@ -8,8 +8,8 @@
 #      curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/xray-node/main/install.sh && sh /tmp/xray-install.sh
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
-# 装完之后，想看节点随时输入：  jiedian
-# 不想要了，输入 xiezai 一键卸载干净
+# 装完之后，想看所有节点随时输入：  jiedian
+# 输入 xiezai 进入节点管理：查看节点、删除单个节点，或全部卸载
 # ============================================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -160,40 +160,35 @@ wait_for_port() {
 write_helper_cmds() { # 写入/刷新 jiedian 和 xiezai 两个命令（安装和更新都会调）
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
-# 输入 jiedian，立刻显示你的节点
-if [ -f /etc/xray-node/node.txt ]; then
-  cat /etc/xray-node/node.txt
-else
+# 输入 jiedian，显示所有已安装节点的信息和链接
+_n=0
+for _d in /etc/xray-node/nodes/*/; do
+  [ -f "${_d}node.txt" ] || continue
+  _n=1
+  printf "\n==================== 节点 %s ====================\n" "$(basename "$_d")"
+  cat "${_d}node.txt"
+done
+if [ "$_n" = "0" ]; then
   echo "还没安装节点，请先运行一键安装脚本"
 fi
+exit 0
 JDEOF
 chmod +x /usr/local/bin/jiedian
 cat > /usr/local/bin/xiezai <<'XZEOF'
 #!/bin/sh
-# 输入 xiezai，一键卸载 xray-node：停掉服务，删掉节点和所有相关配置
-echo "正在卸载 xray-node…"
+# 输入 xiezai，进入节点管理：查看节点、删除单个节点，或全部卸载
+NODES_DIR=/etc/xray-node/nodes
 
-# 停掉并移除开机自启（xray / sing-box 都处理）
-for _s in xray sing-box; do
-  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl stop "$_s" >/dev/null 2>&1
-    systemctl disable "$_s" >/dev/null 2>&1
-    rm -f "/etc/systemd/system/${_s}.service"
-  fi
-  if command -v rc-service >/dev/null 2>&1; then
-    rc-service "$_s" stop >/dev/null 2>&1
-    rc-update del "$_s" default >/dev/null 2>&1
-    rm -f "/etc/init.d/${_s}"
-  fi
-done
-[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
-pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
-pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
-sleep 1
+# _node_info <节点id>：从 node.txt 里读出"协议，端口"
+_node_info() {
+  _ni_proto=$(grep -m1 '^协议: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^协议: //')
+  _ni_port=$(grep -m1 '^端口: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^端口: //')
+  printf "%s，端口 %s" "$_ni_proto" "$_ni_port"
+}
 
-# 撤销安装时加的防火墙规则（只删我们亲手加过的，用户自己手写的不碰）
-# fw_info 现在可能有多行（ss 会同时放行 tcp 和 udp），逐行处理
-if [ -f /etc/xray-node/fw_info ]; then
+# _del_fw_rules <fw_info路径>：撤销该节点我们亲手加的防火墙规则（用户手写的不碰）
+_del_fw_rules() {
+  [ -f "$1" ] || return 0
   while read -r _fport _fproto _fufw _ffwl _fipt; do
     [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
     # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
@@ -217,44 +212,242 @@ if [ -f /etc/xray-node/fw_info ]; then
       fi
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
-  done < /etc/xray-node/fw_info
-fi
+  done < "$1"
+}
 
-# 只删脚本自己下载安装的内核（our_bins 里记着）；
-# 用户机器上本来就有的 xray/sing-box 不碰，避免误删
-# 注意：必须在删 /etc/xray-node 之前读
-if [ -f /etc/xray-node/our_bins ]; then
-  while read -r _b; do
-    case "$_b" in
-      xray|sing-box) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
+# _stop_remove_svc <节点id>：停掉并删除该节点的服务，不碰其它节点
+_stop_remove_svc() {
+  _x_id="$1"
+  _x_core=$(tr -d ' \r\n' < "$NODES_DIR/$_x_id/core" 2>/dev/null)
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    case "$_x_core" in
+      sing-box) _x_unit="singbox-node@${_x_id}" ;;
+      *) _x_unit="xray-node@${_x_id}" ;;
     esac
-  done < /etc/xray-node/our_bins
+    systemctl stop "$_x_unit" >/dev/null 2>&1
+    systemctl disable "$_x_unit" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/${_x_unit}.service"
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${_x_id}" stop >/dev/null 2>&1
+    rc-update del "xray-node-${_x_id}" default >/dev/null 2>&1
+    rm -f "/etc/init.d/xray-node-${_x_id}"
+  fi
+  # 兜底：按该节点的配置文件路径精确杀进程，不碰其它节点的进程
+  pkill -f "/etc/xray-node/nodes/${_x_id}/config.json" >/dev/null 2>&1
+  sleep 1
+}
+
+# _del_node <节点id> [skip_confirm]：删除单个节点（服务+防火墙+配置），其它节点不受影响
+_del_node() {
+  _d_id="$1"
+  [ -d "$NODES_DIR/$_d_id" ] || { echo "节点 $_d_id 不存在"; return 1; }
+  if [ "$2" != "skip_confirm" ]; then
+    printf "确定删除节点 %s（%s）吗？删掉后这个节点就不能用了。[y/N]: " "$_d_id" "$(_node_info "$_d_id")"
+    read -r _ans
+    case "$_ans" in y|Y|yes|YES) ;; *) echo "已取消"; return 0 ;; esac
+  fi
+  echo "正在删除节点 $_d_id…"
+  _stop_remove_svc "$_d_id"
+  [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
+  _del_fw_rules "$NODES_DIR/$_d_id/fw_info"
+  rm -rf "$NODES_DIR/$_d_id"
+  echo "节点 $_d_id 已删除，其它节点不受影响。"
+}
+
+# _uninstall_all：删除全部节点并卸载干净（含内核、命令、配置）
+_uninstall_all() {
+  echo "正在删除全部节点并卸载…"
+  for _d in "$NODES_DIR"/*/; do
+    [ -d "$_d" ] || continue
+    _del_node "$(basename "$_d")" skip_confirm
+  done
+  # 兼容老版本：停掉并删掉旧的单服务名残留（xray / sing-box）
+  for _s in xray sing-box; do
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl stop "$_s" >/dev/null 2>&1
+      systemctl disable "$_s" >/dev/null 2>&1
+      rm -f "/etc/systemd/system/${_s}.service"
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+      rc-service "$_s" stop >/dev/null 2>&1
+      rc-update del "$_s" default >/dev/null 2>&1
+      rm -f "/etc/init.d/${_s}"
+    fi
+  done
+  [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
+  pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
+  pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
+  sleep 1
+  # 只删脚本自己下载安装的内核（our_bins 里记着），用户机器上本来就有的不碰
+  # 注意：必须在删 /etc/xray-node 之前读
+  if [ -f /etc/xray-node/our_bins ]; then
+    while read -r _b; do
+      case "$_b" in
+        xray|sing-box) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
+      esac
+    done < /etc/xray-node/our_bins
+  fi
+  # 删掉配置、节点、日志
+  rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
+  rm -f /var/log/xray.log /var/log/sing-box.log /var/log/xray-node-*.log
+  rm -f /usr/local/bin/jiedian
+  rm -f /usr/local/bin/xiezai
+  echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
+}
+
+echo "==================== 节点管理 ===================="
+_n_count=0
+for _d in "$NODES_DIR"/*/; do
+  [ -f "${_d}node.txt" ] || continue
+  _n_count=$((_n_count + 1))
+  _n_id=$(basename "$_d")
+  printf "  %s) 节点 %s：%s\n" "$_n_count" "$_n_id" "$(_node_info "$_n_id")"
+  eval "_nid_$_n_count='$_n_id'"
+done
+if [ "$_n_count" = "0" ]; then
+  echo "没有已安装的节点。"
+  exit 0
 fi
-
-# 删掉配置、节点、日志
-rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
-rm -f /var/log/xray.log /var/log/sing-box.log
-
-rm -f /usr/local/bin/jiedian
-rm -f /usr/local/bin/xiezai
-
-echo "卸载完成：节点、配置、开机自启、防火墙规则都已清除干净。"
+printf "  0) 取消\n"
+printf "  all) 删除全部节点并卸载干净\n"
+printf "请选择要删除的节点编号: "
+read -r _sel
+case "$_sel" in
+  0|"") echo "已取消" ;;
+  all|ALL)
+    printf "确定删除全部 %s 个节点并卸载干净吗？[y/N]: " "$_n_count"
+    read -r _ans2
+    case "$_ans2" in y|Y|yes|YES) _uninstall_all ;; *) echo "已取消" ;; esac
+    ;;
+  *)
+    case "$_sel" in ''|*[!0-9]*) echo "输入不对，已取消" ;;
+      *)
+        if [ "$_sel" -ge 1 ] && [ "$_sel" -le "$_n_count" ]; then
+          eval "_del_node \"\$_nid_$_sel\""
+        else
+          echo "没有这个编号，已取消"
+        fi
+        ;;
+    esac
+    ;;
+esac
 XZEOF
 chmod +x /usr/local/bin/xiezai
 }
 
-_restart_svc() { # _restart_svc <服务名> <二进制路径> <启动参数…>：只重启服务，不写 unit 文件（更新模式用）
-  _rs_svc="$1"; _rs_bin="$2"; shift 2
+_svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机自启服务并启动（systemd 模板实例 / OpenRC 独立脚本 / 兜底后台）
+  _si_id="$1"
+  _si_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_si_id"/core 2>/dev/null)
+  _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.json
+  case "$_si_core" in
+    sing-box) _si_bin="$SB_BIN"; _si_args="run -c $_si_cfg"; _si_tpl=/etc/systemd/system/singbox-node@.service; _si_unit="singbox-node@${_si_id}" ;;
+    *)        _si_bin="$XRAY_BIN"; _si_args="-config $_si_cfg"; _si_tpl=/etc/systemd/system/xray-node@.service; _si_unit="xray-node@${_si_id}" ;;
+  esac
+  _si_svc="xray-node-${_si_id}"
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl restart "$_rs_svc" >/dev/null 2>&1
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service "$_rs_svc" restart >/dev/null 2>&1
-  else
-    pkill -f "${_rs_bin} $*" >/dev/null 2>&1
+    # 模板 unit 只写一次，多个节点共用（%i 即节点 id）
+    if [ ! -f "$_si_tpl" ]; then
+      case "$_si_core" in
+        sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
+        *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
+      esac
+      cat > "$_si_tpl" <<EOF
+[Unit]
+Description=${_si_tpl_desc}
+After=network.target
+[Service]
+Type=simple
+User=root
+ExecStart=${_si_tpl_bin} ${_si_tpl_args}
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    systemctl daemon-reload
+    systemctl enable "$_si_unit" >/dev/null 2>&1
+    systemctl restart "$_si_unit" >/dev/null 2>&1
     sleep 1
-    nohup "$_rs_bin" "$@" >/var/log/"${_rs_svc}".log 2>&1 &
+    if systemctl is-active --quiet "$_si_unit"; then
+      info "节点 $_si_id 服务已启动，并设为开机自启"
+    else
+      warn "节点 $_si_id 服务好像没起来，运行 systemctl status $_si_unit 看看原因"
+    fi
+  elif command -v rc-service >/dev/null 2>&1; then
+    cat > /etc/init.d/${_si_svc} <<RCEOF
+#!/sbin/openrc-run
+name="${_si_svc}"
+description="${_si_svc} proxy service"
+command="${_si_bin}"
+command_args="${_si_args}"
+command_background="yes"
+pidfile="/run/${_si_svc}.pid"
+output_log="/var/log/${_si_svc}.log"
+error_log="/var/log/${_si_svc}.log"
+retry="SIGTERM/5/SIGKILL/5"
+depend() { need net; }
+start_pre() {
+    # 进程已死但 pidfile 还在（比如被 OOM 杀掉），先清理，否则 OpenRC 会误判
+    if [ -f "\$pidfile" ]; then
+        _ppid=\$(cat "\$pidfile" 2>/dev/null)
+        if [ -n "\$_ppid" ] && ! kill -0 "\$_ppid" 2>/dev/null; then
+            rm -f "\$pidfile"
+        fi
+    fi
+    checkpath -f -m 0644 -o root:root "\$output_log"
+}
+RCEOF
+    chmod +x /etc/init.d/${_si_svc}
+    rc-update add "$_si_svc" default >/dev/null 2>&1
+    # 先清掉可能残留的旧状态，再启动（比 restart 更稳）
+    rc-service "$_si_svc" zap >/dev/null 2>&1
+    rc-service "$_si_svc" start >/dev/null 2>&1
+    sleep 1
+    if rc-service "$_si_svc" status >/dev/null 2>&1; then
+      info "节点 $_si_svc 已启动，并设为开机自启"
+    else
+      warn "节点 $_si_svc 好像没起来，运行 rc-service $_si_svc status 看看原因"
+    fi
+  else
+    warn "没找到 systemd/OpenRC，改用后台方式启动（重启后需手动再跑一次脚本）"
+    pkill -f "$_si_cfg" >/dev/null 2>&1
+    # shellcheck disable=SC2086 — _si_args 故意拆成多个参数
+    nohup $_si_bin $_si_args >/var/log/xray-node-${_si_id}.log 2>&1 &
+    sleep 1
+    info "节点 $_si_id 已在后台启动"
+  fi
+}
+
+_svc_restart() { # _svc_restart <节点id>：只重启该节点的服务（更新模式用）
+  _sr_id="$1"
+  _sr_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_sr_id"/core 2>/dev/null)
+  case "$_sr_core" in
+    sing-box) _sr_unit="singbox-node@${_sr_id}" ;;
+    *)        _sr_unit="xray-node@${_sr_id}" ;;
+  esac
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl restart "$_sr_unit" >/dev/null 2>&1
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${_sr_id}" restart >/dev/null 2>&1
+  else
+    _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.json
+    pkill -f "$_sr_cfg" >/dev/null 2>&1
+    sleep 1
+    case "$_sr_core" in
+      sing-box) nohup "$SB_BIN" run -c "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
+      *)        nohup "$XRAY_BIN" -config "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
+    esac
   fi
   sleep 1
+}
+
+_node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
+  read -r _np_port _np_proto _np_rest < /etc/xray-node/nodes/"$1"/fw_info 2>/dev/null
+  [ -n "$_np_port" ] || return 1
+  [ -n "$_np_proto" ] || _np_proto="tcp"
+  printf "%s %s" "$_np_port" "$_np_proto"
 }
 
 _ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "Xray 26.3.27 (…)" -> "26.3.27"
@@ -406,21 +599,102 @@ printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
 printf "${BOLD}==============================================${NC}\n"
 printf "全程中文提问，看不懂就一路回车用默认。\n"
 
-# 已经装过节点：给三个选项 —— 更新（默认，只升级内核、节点不变）/ 重装 / 取消
+# ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
+mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
+XRAY_BIN="/usr/local/bin/xray"
+SB_BIN="/usr/local/bin/sing-box"
+case "$(uname -m)" in
+  x86_64|amd64) MACH="amd64" ;;
+  aarch64|arm64) MACH="arm64" ;;
+  armv7l|armv7) MACH="armv7" ;;
+  *) die "不支持的 CPU 架构：$(uname -m)" ;;
+esac
+
+# ---------- 2c. 老版本迁移：单节点布局 -> 多节点布局 ----------
+# 老版本只有一个节点（/etc/xray-node/node.txt + xray/sing-box 单服务）。
+# 转为"每个节点独立目录 + 独立服务"，旧节点配置原样保留；
+# 先停旧服务、再起新服务，中间只断几秒。
+if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
+  step "[迁移] 检测到老版本单节点，正在转为多节点管理（旧节点保留）…"
+  _m_core=$(tr -d ' \r\n' < /etc/xray-node/core 2>/dev/null)
+  case "$_m_core" in xray|sing-box) ;; *) _m_core="xray" ;; esac
+  if [ "$_m_core" = "xray" ]; then
+    _m_cfg=/usr/local/etc/xray/config.json
+  else
+    _m_cfg=/usr/local/etc/sing-box/config.json
+  fi
+  if [ ! -f "$_m_cfg" ]; then
+    warn "找不到老节点的配置文件（$_m_cfg），跳过迁移，按全新安装处理"
+    rm -f /etc/xray-node/node.txt
+  else
+    mkdir -p /etc/xray-node/nodes/1
+    # 停掉老服务（systemd / OpenRC / 兜底进程都处理）
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl stop "$_m_core" >/dev/null 2>&1
+      systemctl disable "$_m_core" >/dev/null 2>&1
+      rm -f "/etc/systemd/system/${_m_core}.service"
+      systemctl daemon-reload >/dev/null 2>&1
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+      rc-service "$_m_core" stop >/dev/null 2>&1
+      rc-update del "$_m_core" default >/dev/null 2>&1
+      rm -f "/etc/init.d/${_m_core}"
+    fi
+    pkill -f "$_m_cfg" >/dev/null 2>&1
+    sleep 1
+    # 搬家：配置、节点信息、防火墙记录、内核标记
+    mv -f "$_m_cfg" /etc/xray-node/nodes/1/config.json
+    mv -f /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt
+    [ -f /etc/xray-node/fw_info ] && mv -f /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info
+    [ -f /etc/xray-node/core ] && mv -f /etc/xray-node/core /etc/xray-node/nodes/1/core
+    rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
+    # 按新布局起服务
+    _svc_install 1
+    _m_port=""; _m_proto="tcp"
+    if _m_pp=$(_node_port 1); then set -- $_m_pp; _m_port="$1"; _m_proto="$2"; fi
+    if [ -n "$_m_port" ] && wait_for_port "$_m_port" "$_m_proto" 15; then
+      info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+    else
+      warn "老节点服务可能没起来：输入 jiedian 查看，或输入 xiezai 进节点管理检查"
+    fi
+  fi
+fi
+
+# 已经装过节点：更新（默认）/ 添加新节点 / 节点管理 / 取消
+# 注意：选 2 添加新节点不会动旧节点，旧节点继续用；想删节点选 3 或直接输 xiezai
 UPDATE_MODE=0
 FORCE_DL=0
-if [ -f /etc/xray-node/node.txt ]; then
-  printf "\n检测到这台机器已经装过节点。\n"
-  printf "  1) 检查更新并升级（推荐：节点配置不变，只把内核升到最新版）\n"
-  printf "  2) 重新安装（重新回答问题，生成一个全新的节点，旧节点作废）\n"
-  printf "  3) 取消，什么都不做\n"
+_NODE_COUNT=0
+if [ -d /etc/xray-node/nodes ]; then
+  for _nd in /etc/xray-node/nodes/*/; do
+    [ -f "${_nd}node.txt" ] && _NODE_COUNT=$((_NODE_COUNT + 1))
+  done
+fi
+if [ "$_NODE_COUNT" -gt 0 ]; then
+  printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
+  printf "  1) 更新内核（推荐：所有节点配置不变，只把 Xray/sing-box 内核升到最新版）\n"
+  printf "  2) 添加新节点（再搭一个，旧节点不受影响、继续用）\n"
+  printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
+  printf "  4) 取消，什么都不做\n"
   ask "请选择" "1" _um
   case "$_um" in
-    2) info "进入重新安装流程" ;;
-    3|n|N|no|NO) echo "已取消"; exit 0 ;;
+    2) info "进入添加新节点流程（旧节点不受影响）" ;;
+    3) write_helper_cmds; sh /usr/local/bin/xiezai; exit 0 ;;
+    4|n|N|no|NO) echo "已取消"; exit 0 ;;
     *) UPDATE_MODE=1 ;;
   esac
 fi
+
+# 新节点编号：已有最大编号 + 1（删掉的编号不重用，避免和以前的节点搞混）
+NODE_ID=1
+for _nd in /etc/xray-node/nodes/*/; do
+  [ -d "$_nd" ] || continue
+  _nn=$(basename "$_nd")
+  case "$_nn" in ''|*[!0-9]*) continue ;; esac
+  [ "$_nn" -ge "$NODE_ID" ] && NODE_ID=$((_nn + 1))
+done
+NODE_DIR=/etc/xray-node/nodes/$NODE_ID
+mkdir -p "$NODE_DIR"
 
 # ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
 step "[准备] 检查系统工具…"
@@ -483,119 +757,116 @@ command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl �
 command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
 info "系统工具就绪"
 
-# ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
-mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
-XRAY_BIN="/usr/local/bin/xray"
-SB_BIN="/usr/local/bin/sing-box"
-case "$(uname -m)" in
-  x86_64|amd64) MACH="amd64" ;;
-  aarch64|arm64) MACH="arm64" ;;
-  armv7l|armv7) MACH="armv7" ;;
-  *) die "不支持的 CPU 架构：$(uname -m)" ;;
-esac
-
 # ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
-# 重跑一键命令选"1"进到这里：不问问题、不改配置，只把内核升到最新版。
+# 重跑一键命令选"1"进到这里：不问问题、不改配置，只把各节点用的内核升到最新版。
 if [ "$UPDATE_MODE" = "1" ]; then
   step "[更新] 检查已安装的内核版本…"
-  # 确定上次装的是哪个内核
-  UCORE=""
-  if [ -f /etc/xray-node/core ]; then
-    _uc=$(tr -d ' \r\n' < /etc/xray-node/core 2>/dev/null)
-    case "$_uc" in xray|sing-box) UCORE="$_uc" ;; esac
-  fi
-  [ -z "$UCORE" ] && [ -f /usr/local/etc/xray/config.json ] && UCORE="xray"
-  [ -z "$UCORE" ] && [ -f /usr/local/etc/sing-box/config.json ] && UCORE="sing-box"
-  if [ -z "$UCORE" ]; then
-    warn "找不到上次安装的内核信息，改走重新安装流程。"
+  # 收集所有节点用到的内核（去重）
+  _u_cores=""
+  for _ud in /etc/xray-node/nodes/*/; do
+    [ -f "${_ud}core" ] || continue
+    _uc=$(tr -d ' \r\n' < "${_ud}core" 2>/dev/null)
+    case "$_uc" in
+      xray|sing-box)
+        case " $_u_cores " in *" $_uc "*) ;; *) _u_cores="$_u_cores $_uc" ;; esac
+        ;;
+    esac
+  done
+  if [ -z "$_u_cores" ]; then
+    warn "找不到已安装节点用的内核信息，改走添加新节点流程。"
     UPDATE_MODE=0
   else
-    if [ "$UCORE" = "xray" ]; then
-      UREPO="XTLS/Xray-core"; UBIN="$XRAY_BIN"; USVC="xray"
-      UARGS="-config /usr/local/etc/xray/config.json"
-    else
-      UREPO="SagerNet/sing-box"; UBIN="$SB_BIN"; USVC="sing-box"
-      UARGS="run -c /usr/local/etc/sing-box/config.json"
-    fi
-    _u_inst=""
-    [ -x "$UBIN" ] && _u_inst=$(_ver_num "$("$UBIN" version 2>/dev/null | head -1)")
-    _u_latest=$(_latest_tag "$UREPO") || _u_latest=""
-    if [ -z "$_u_latest" ]; then
-      warn "连不上 api.github.com，检查更新失败，稍后再试。节点不受影响，继续正常使用。"
-      cat /etc/xray-node/node.txt
-      exit 0
-    fi
-    if [ -n "$_u_inst" ] && [ "$_u_inst" = "$_u_latest" ]; then
-      info "已经是最新版（v${_u_inst}），无需更新内核。"
-      # 内核虽不用升，但脚本本身可能修过 bug：顺手把 jiedian / xiezai 同步为最新版
-      write_helper_cmds
-      info "jiedian / xiezai 命令已同步为最新版"
-      cat /etc/xray-node/node.txt
-      exit 0
-    fi
-    if [ -n "$_u_inst" ]; then
-      info "当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
-    else
-      warn "内核文件丢失或已损坏，直接下载最新版 v${_u_latest} 重装内核（节点配置保留）。"
-    fi
-    # 备份旧内核：新内核万一跑不起来，回滚后节点不受影响
-    [ -x "$UBIN" ] && cp -a "$UBIN" "${UBIN}.bak" 2>/dev/null
-    FORCE_DL=1
-    if [ "$UCORE" = "xray" ]; then dl_xray; else dl_singbox; fi
-    FORCE_DL=0
-    # 重启服务
-    step "[更新] 重启服务…"
-    # shellcheck disable=SC2086 — UARGS 故意拆成多个参数
-    _restart_svc "$USVC" "$UBIN" $UARGS
-    # 读出节点端口，硬检查服务真的在监听
-    _u_port=""; _u_proto="tcp"
-    if [ "$UCORE" = "xray" ]; then
-      _u_port=$(grep -o '"port": [0-9][0-9]*' /usr/local/etc/xray/config.json 2>/dev/null | head -1 | grep -o '[0-9][0-9]*')
-    else
-      _u_port=$(grep -o '"listen_port": [0-9][0-9]*' /usr/local/etc/sing-box/config.json 2>/dev/null | head -1 | grep -o '[0-9][0-9]*')
-      grep -qE '"type": "(hysteria2|tuic)"' /usr/local/etc/sing-box/config.json 2>/dev/null && _u_proto="udp"
-    fi
-    _u_ok=1
-    if [ -n "$_u_port" ]; then
-      if wait_for_port "$_u_port" "$_u_proto" 15; then
-        info "升级成功：端口 $_u_port/$_u_proto 监听正常，节点配置未变"
+    _u_any_fail=0
+    for _ucore in $_u_cores; do
+      # 每个内核独立处理：一个失败不影响另一个（子 shell 里 die 只退出子 shell）
+      (
+      if [ "$_ucore" = "xray" ]; then
+        _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN"
       else
-        _u_ok=0
+        _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
       fi
-    else
-      warn "读不到节点端口，跳过监听检查（服务已重启）"
-    fi
-    if [ "$_u_ok" = "0" ]; then
-      _u_rb_ok=0
-      if [ -f "${UBIN}.bak" ]; then
-        warn "新内核启动后端口没监听，正在回滚到旧版本…"
-        cp -a "${UBIN}.bak" "$UBIN"
-        # shellcheck disable=SC2086
-        _restart_svc "$USVC" "$UBIN" $UARGS
-        sleep 1
+      _u_inst=""
+      [ -x "$_u_bin" ] && _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
+      _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+      if [ -z "$_u_latest" ]; then
+        warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
+        exit 0
+      fi
+      if [ -n "$_u_inst" ] && [ "$_u_inst" = "$_u_latest" ]; then
+        info "$_ucore 已经是最新版（v${_u_inst}），无需更新。"
+        exit 0
+      fi
+      if [ -n "$_u_inst" ]; then
+        info "$_ucore 当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
+      else
+        warn "$_ucore 内核文件丢失或已损坏，直接下载最新版 v${_u_latest}（节点配置保留）。"
+      fi
+      # 备份旧内核：新内核万一跑不起来，回滚后节点不受影响
+      [ -x "$_u_bin" ] && cp -a "$_u_bin" "${_u_bin}.bak" 2>/dev/null
+      FORCE_DL=1
+      if [ "$_ucore" = "xray" ]; then dl_xray; else dl_singbox; fi
+      FORCE_DL=0
+      # 重启所有用这个内核的节点（子 shell 里改 FORCE_DL 不影响外面）
+      step "[更新] 重启 $_ucore 的节点服务…"
+      _u_failed=""
+      for _ud2 in /etc/xray-node/nodes/*/; do
+        [ -f "${_ud2}core" ] || continue
+        _uc2=$(tr -d ' \r\n' < "${_ud2}core" 2>/dev/null)
+        [ "$_uc2" = "$_ucore" ] || continue
+        _u_id=$(basename "$_ud2")
+        _svc_restart "$_u_id"
+        # 读出该节点端口，硬检查真的在监听
+        _u_port=""; _u_proto="tcp"
+        if _u_pp=$(_node_port "$_u_id"); then set -- $_u_pp; _u_port="$1"; _u_proto="$2"; fi
         if [ -n "$_u_port" ] && wait_for_port "$_u_port" "$_u_proto" 15; then
-          _u_rb_ok=1
-          info "已回滚到旧版本，节点恢复正常"
+          info "节点 $_u_id 升级成功：端口 $_u_port/$_u_proto 监听正常，配置未变"
         else
-          warn "回滚后端口仍未监听，请手动检查：systemctl status $USVC（或 rc-service $USVC status）"
+          warn "节点 $_u_id 更新后端口没监听（端口：${_u_port:-未知}）"
+          _u_failed="$_u_failed $_u_id"
         fi
-      else
-        warn "没有旧内核备份，无法回滚，请手动检查：systemctl status $USVC（或 rc-service $USVC status）"
+      done
+      if [ -n "$_u_failed" ]; then
+        _u_rb_bad=""
+        if [ -f "${_u_bin}.bak" ]; then
+          warn "新内核启动后有节点端口没监听，正在回滚到旧版本…"
+          cp -a "${_u_bin}.bak" "$_u_bin"
+          for _rid in $_u_failed; do
+            _svc_restart "$_rid"
+            sleep 1
+            _r_port=""; _r_proto="tcp"
+            if _r_pp=$(_node_port "$_rid"); then set -- $_r_pp; _r_port="$1"; _r_proto="$2"; fi
+            if [ -n "$_r_port" ] && wait_for_port "$_r_port" "$_r_proto" 15; then
+              info "节点 $_rid 已回滚到旧版本，恢复正常"
+            else
+              _u_rb_bad="$_u_rb_bad $_rid"
+              warn "节点 $_rid 回滚后端口仍未监听，请手动检查该节点的服务状态"
+            fi
+          done
+        else
+          _u_rb_bad="$_u_failed"
+          warn "没有旧内核备份，无法回滚，请手动检查节点${_u_failed}的服务状态"
+        fi
+        rm -f "${_u_bin}.bak"
+        if [ -z "$_u_rb_bad" ]; then
+          die "$_ucore 新版本在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
+        else
+          die "$_ucore 新版本跑不起来，且回滚后节点${_u_rb_bad}仍未恢复监听——节点可能已中断，请按上面的提示手动检查"
+        fi
       fi
-      rm -f "${UBIN}.bak"
-      if [ "$_u_rb_ok" = "1" ]; then
-        die "新版本内核在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
-      else
-        die "新版本内核跑不起来，且回滚后服务仍未恢复监听——节点可能已中断，请按上面的提示手动检查服务状态"
-      fi
-    fi
-    rm -f "${UBIN}.bak"
+      rm -f "${_u_bin}.bak"
+      info "$_ucore 升级完成"
+      ) || _u_any_fail=1
+    done
     # 刷新 jiedian / xiezai（脚本可能修过它们）
     write_helper_cmds
     info "jiedian / xiezai 命令已同步为最新版"
     printf "\n"
-    cat /etc/xray-node/node.txt
-    printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
+    sh /usr/local/bin/jiedian
+    if [ "$_u_any_fail" = "1" ]; then
+      printf "\n${YELLOW}${BOLD}更新结束：部分内核更新失败（上面有说明），其它节点不受影响。${NC}\n"
+    else
+      printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
+    fi
     exit 0
   fi
 fi
@@ -831,7 +1102,7 @@ if [ "$CORE" = "xray" ]; then
 mkdir -p /usr/local/etc/xray
 case "$PROTO" in
   vless)
-    cat > /usr/local/etc/xray/config.json <<EOF
+    cat > "$NODE_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -862,7 +1133,7 @@ case "$PROTO" in
 EOF
     ;;
   trojan)
-    cat > /usr/local/etc/xray/config.json <<EOF
+    cat > "$NODE_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -892,7 +1163,7 @@ EOF
 EOF
     ;;
   vmess)
-    cat > /usr/local/etc/xray/config.json <<EOF
+    cat > "$NODE_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -914,7 +1185,7 @@ EOF
 EOF
     ;;
   ss)
-    cat > /usr/local/etc/xray/config.json <<EOF
+    cat > "$NODE_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -933,14 +1204,14 @@ EOF
 EOF
     ;;
 esac
-"$XRAY_BIN" -test -config /usr/local/etc/xray/config.json >/dev/null 2>&1 \
+"$XRAY_BIN" -test -config "$NODE_DIR/config.json" >/dev/null 2>&1 \
   || die "配置文件校验没通过，请截图发我看看"
 info "配置文件校验通过"
 
 else
 # ---------- sing-box 配置（AnyTLS / Hysteria2 / TUIC） ----------
 mkdir -p /usr/local/etc/sing-box
-SB_CONF="/usr/local/etc/sing-box/config.json"
+SB_CONF="$NODE_DIR/config.json"
 case "$PROTO" in
   anytls)
     cat > "$SB_CONF" <<EOF
@@ -1021,104 +1292,11 @@ esac
 info "配置文件校验通过"
 fi
 
-# ---------- 10b. 换内核重装：先停掉旧内核的服务 ----------
-# 比如上次装的是 vless（xray），这次改装 hy2（sing-box）：旧的 xray 服务
-# 不停掉会一直占着旧端口在后台跑，造成两个节点同时在线的混乱。
-if [ -f /etc/xray-node/core ]; then
-  _old_core=$(cat /etc/xray-node/core 2>/dev/null | tr -d ' \r\n')
-  case "$_old_core" in
-    xray|sing-box) ;;
-    *) _old_core="" ;;  # 文件内容不对就不管，当没记录处理
-  esac
-  if [ -n "$_old_core" ] && [ "$_old_core" != "$CORE" ]; then
-    info "上次用的是 $_old_core，这次换成 $CORE，先停掉旧服务…"
-    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-      systemctl stop "$_old_core" >/dev/null 2>&1
-      systemctl disable "$_old_core" >/dev/null 2>&1
-    fi
-    if command -v rc-service >/dev/null 2>&1; then
-      rc-service "$_old_core" stop >/dev/null 2>&1
-      rc-update del "$_old_core" default >/dev/null 2>&1
-    fi
-    # 兜底：既没 systemd 也没 OpenRC 的机器（比如 docker 里），按我们自己的
-    # 配置文件路径精确杀掉旧进程，不碰用户自己跑的其它同名进程
-    pkill -f "/usr/local/etc/${_old_core}/config.json" >/dev/null 2>&1
-    sleep 1
-  fi
-fi
-
-# ---------- 11. 开机自启 ----------
-if [ "$CORE" = "xray" ]; then
-  SVC="xray"; SVC_BIN="$XRAY_BIN"; SVC_ARGS="-config /usr/local/etc/xray/config.json"
-else
-  SVC="sing-box"; SVC_BIN="$SB_BIN"; SVC_ARGS="run -c /usr/local/etc/sing-box/config.json"
-fi
+# ---------- 11. 开机自启（每个节点独立服务，互不干扰） ----------
+# 先记下这个节点用的内核，_svc_install 要读它
+echo "$CORE" > "$NODE_DIR/core" 2>/dev/null
 step "[服务] 设置开机自启…"
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  cat > /etc/systemd/system/${SVC}.service <<EOF
-[Unit]
-Description=${SVC} Service
-After=network.target
-[Service]
-Type=simple
-User=root
-ExecStart=${SVC_BIN} ${SVC_ARGS}
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable "$SVC" >/dev/null 2>&1
-  systemctl restart "$SVC" >/dev/null 2>&1
-  sleep 1
-  if systemctl is-active --quiet "$SVC"; then
-    info "$SVC 已启动，并设为开机自启"
-  else
-    warn "$SVC 好像没起来，运行 systemctl status $SVC 看看原因"
-  fi
-elif command -v rc-service >/dev/null 2>&1; then
-  cat > /etc/init.d/${SVC} <<RCEOF
-#!/sbin/openrc-run
-name="${SVC}"
-description="${SVC} proxy service"
-command="${SVC_BIN}"
-command_args="${SVC_ARGS}"
-command_background="yes"
-pidfile="/run/${SVC}.pid"
-output_log="/var/log/${SVC}.log"
-error_log="/var/log/${SVC}.log"
-retry="SIGTERM/5/SIGKILL/5"
-depend() { need net; }
-start_pre() {
-    # 进程已死但 pidfile 还在（比如被 OOM 杀掉），先清理，否则 OpenRC 会误判
-    if [ -f "\$pidfile" ]; then
-        _ppid=\$(cat "\$pidfile" 2>/dev/null)
-        if [ -n "\$_ppid" ] && ! kill -0 "\$_ppid" 2>/dev/null; then
-            rm -f "\$pidfile"
-        fi
-    fi
-    checkpath -f -m 0644 -o root:root "\$output_log"
-}
-RCEOF
-  chmod +x /etc/init.d/${SVC}
-  rc-update add "$SVC" default >/dev/null 2>&1
-  # 先清掉可能残留的旧状态，再启动（比 restart 更稳）
-  rc-service "$SVC" zap >/dev/null 2>&1
-  rc-service "$SVC" start >/dev/null 2>&1
-  sleep 1
-  if rc-service "$SVC" status >/dev/null 2>&1; then
-    info "$SVC 已启动，并设为开机自启"
-  else
-    warn "$SVC 好像没起来，运行 rc-service $SVC status 看看原因"
-  fi
-else
-  warn "没找到 systemd/OpenRC，改用后台方式启动（重启后需手动再跑一次脚本）"
-  pkill -f "${SVC_BIN} ${SVC_ARGS}" >/dev/null 2>&1
-  nohup $SVC_BIN $SVC_ARGS >/var/log/${SVC}.log 2>&1 &
-  sleep 1
-  info "$SVC 已在后台启动"
-fi
+_svc_install "$NODE_ID"
 
 # ---------- 11b. 硬检查：端口必须真的在监听 ----------
 # 服务显示"已启动"不代表真在工作，端口没监听节点就是坏的，直接报错不忽悠
@@ -1127,10 +1305,8 @@ case "$PROTO" in hy2|tuic) _SVC_PROTO="udp" ;; esac
 if wait_for_port "$PORT" "$_SVC_PROTO" 15; then
   info "端口 $PORT/$_SVC_PROTO 已在监听，服务真正跑起来了"
 else
-  die "服务没能监听端口 $PORT：节点装坏了。请先运行 rc-service $SVC status（或 systemctl status $SVC）看原因，修好再重跑脚本"
+  die "服务没能监听端口 $PORT：节点装坏了。请先运行 systemctl status 'xray-node@${NODE_ID}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
 fi
-# 记下这次用的内核：下次重装如果换了内核，10b 会先停掉旧的
-echo "$CORE" > /etc/xray-node/core 2>/dev/null
 
 # ---------- 12. 放行端口 ----------
 step "[网络] 放行端口…"
@@ -1141,42 +1317,10 @@ case "$PROTO" in
   hy2|tuic) _FW_PROTOS="udp" ;;
   ss) _FW_PROTOS="tcp udp" ;;
 esac
-mkdir -p /etc/xray-node 2>/dev/null
-# 先按旧记录把上次我们亲手加的规则撤掉（精确到每个后端），再重新放行。
-# 这样做有两个好处：①重装换端口/协议时，旧规则不会一直敞着；
-# ②"规则已存在"一定意味着用户手写的，标记不会错——否则重装一次，
-# 我们加的规则就会被误判成用户手写的，xiezai 以后就删不掉了。
-# 只删我们亲手加过的，用户自己手写的规则不动。
-if [ -f /etc/xray-node/fw_info ]; then
-  while read -r _oport _oproto _oufw _ofwl _oipt; do
-    [ -n "$_oport" ] && [ -n "$_oproto" ] || continue
-    # 老版本 fw_info 只有"端口 协议"两列：没有后端标记，按老行为尽量清干净
-    if [ -z "$_oufw$_ofwl$_oipt" ]; then _oufw=1; _ofwl=1; _oipt=1; _oldfmt=1; else _oldfmt=0; fi
-    _cleaned=0
-    if [ "$_oufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
-      ufw delete allow "$_oport"/"$_oproto" >/dev/null 2>&1 && _cleaned=1
-    fi
-    if [ "$_ofwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
-      firewall-cmd --permanent --remove-port="$_oport"/"$_oproto" >/dev/null 2>&1
-      firewall-cmd --reload >/dev/null 2>&1 && _cleaned=1
-    fi
-    if [ "$_oipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
-      if [ "$_oldfmt" = "1" ]; then
-        # 老格式：这条规则可能是用户手写的，一条一条删干净
-        while iptables -C INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1; do
-          iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1 || break
-        done
-        _cleaned=1
-      else
-        # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
-        iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1 && _cleaned=1
-      fi
-    fi
-    [ "$_cleaned" = "1" ] && info "已清理旧端口 $_oport/$_oproto 的放行规则"
-  done < /etc/xray-node/fw_info
-fi
-# 逐个协议放行，并记下来给 xiezai 用：只删我们亲手加的规则，用户机器上本来就有的不碰
-: > /etc/xray-node/fw_info
+# 逐个协议放行，并记到该节点的 fw_info 里给 xiezai 用：
+# 只删我们亲手加的规则，用户机器上本来就有的不碰。
+# 新节点编号不会重用，不可能有旧规则残留，无需清理。
+: > "$NODE_DIR/fw_info"
 for _np in $_FW_PROTOS; do
   _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
   if command -v ufw >/dev/null 2>&1; then
@@ -1203,7 +1347,7 @@ for _np in $_FW_PROTOS; do
       _IPT_ADDED=1
     fi
   fi
-  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" >> /etc/xray-node/fw_info
+  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" >> "$NODE_DIR/fw_info"
 done
 warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
@@ -1267,11 +1411,11 @@ esac
   printf -- "----------------------------------------------\n"
   printf "以后想看节点，直接输入: jiedian\n"
   printf "==============================================\n"
-} > /etc/xray-node/node.txt
+} > "$NODE_DIR/node.txt"
 
 write_helper_cmds
-info "已安装 jiedian 命令：以后输入 jiedian 就能看节点"
-info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
+info "已安装 jiedian 命令：以后输入 jiedian 就能看所有节点"
+info "已安装 xiezai 命令：输入 xiezai 可管理节点（查看/删除）"
 
 # ---------- 14b. BBR 加速：检测，没开就自动开 ----------
 step "检查 BBR 加速…"
@@ -1325,7 +1469,7 @@ if [ "$_BBR_ON" = "0" ]; then
 fi
 
 # ---------- 15. 显示结果 ----------
-printf "\n"
-cat /etc/xray-node/node.txt
+printf "\n节点 %s 安装完成！\n" "$NODE_ID"
+cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
-printf "以后看节点输入 jiedian，不想要了输入 xiezai 一键卸载。\n"
+printf "以后看所有节点输入 jiedian，管理节点（查看/删除）输入 xiezai。\n"
