@@ -5,7 +5,7 @@
 # 小白用法（root 用户）：
 #   1. SSH 连上你的服务器
 #   2. 粘贴下面这一行，回车：
-#      curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/xray-node/main/install.sh && sh /tmp/xray-install.sh
+#      curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh && sh /tmp/xray-install.sh
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
 # 装完之后，想看所有节点随时输入：  jiedian
