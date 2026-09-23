@@ -157,20 +157,53 @@ _need_install=0
 command -v curl >/dev/null 2>&1 || _need_install=1
 command -v unzip >/dev/null 2>&1 || _need_install=1
 if [ "$_need_install" -eq 1 ]; then
-  printf "缺少 curl / unzip，正在安装（最多等两三分钟）…\n"
+  printf "缺少 curl / unzip，正在自动安装（每一步都有进度提示，不会卡住不动）…\n"
   export DEBIAN_FRONTEND=noninteractive
+  _dep_log="/tmp/xray-dep-apt.log"
+  # _apt_do <描述> <单次超时秒> -- <apt-get 参数…>
+  # 刚开机的机器常被系统自动更新占着 dpkg 锁：不等锁就硬装会白白超时失败。
+  # 这里检测到锁就等 20 秒重试并报进度，而不是静默卡死。
+  _apt_do() {
+    _ad="$1"; _ato="$2"; shift 2
+    [ "$1" = "--" ] && shift
+    _an=0
+    while [ "$_an" -lt 10 ]; do
+      printf "%s…\n" "$_ad"
+      if timeout "$_ato" apt-get "$@" >"$_dep_log" 2>&1; then return 0; fi
+      if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
+        _an=$((_an + 1))
+        printf "系统自动更新正占着软件源，20 秒后重试（%s/10）…\n" "$_an"
+        sleep 20
+      else
+        return 1
+      fi
+    done
+    return 1
+  }
+  # _dep_fail：装失败时把吞掉的报错吐出来，而不是只留一句"装不上"
+  _dep_fail() {
+    warn "这一步没成功，最后看到的报错："
+    tail -n 5 "$_dep_log" 2>/dev/null | sed 's/^/  /'
+  }
   if command -v apt-get >/dev/null 2>&1; then
-    timeout 60 apt-get update -qq >/dev/null 2>&1
-    timeout 120 apt-get install -y -qq curl unzip ca-certificates >/dev/null 2>&1
+    _apt_do "正在更新软件源" 60 -- update -qq \
+      || warn "软件源更新失败，用已有索引继续装（多数情况不影响）"
+    _apt_do "正在安装 curl / unzip" 300 -- install -y -qq curl unzip ca-certificates \
+      || _dep_fail
   elif command -v apk >/dev/null 2>&1; then
-    timeout 120 apk add --no-cache curl unzip ca-certificates >/dev/null 2>&1
+    printf "正在安装 curl / unzip…\n"
+    timeout 300 apk add --no-cache curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v dnf >/dev/null 2>&1; then
-    timeout 120 dnf install -y -q curl unzip ca-certificates >/dev/null 2>&1
+    printf "正在安装 curl / unzip…\n"
+    timeout 300 dnf install -y -q curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v yum >/dev/null 2>&1; then
-    timeout 120 yum install -y -q curl unzip ca-certificates >/dev/null 2>&1
+    printf "正在安装 curl / unzip…\n"
+    timeout 300 yum install -y -q curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v pacman >/dev/null 2>&1; then
-    timeout 120 pacman -Sy --noconfirm --needed curl unzip ca-certificates >/dev/null 2>&1
+    printf "正在安装 curl / unzip…\n"
+    timeout 300 pacman -Sy --noconfirm --needed curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   fi
+  rm -f "$_dep_log"
   unset DEBIAN_FRONTEND
 else
   info "curl / unzip 都有，直接跳过安装"
@@ -905,8 +938,17 @@ if [ "$_BBR_ON" = "0" ]; then
     _bbr_host="github.com"
     _bbr_path="/teddysun/across/raw/master/bbr.sh"
     _bbr_url="https://${_bbr_host}${_bbr_path}"
-    if wget --no-check-certificate -q -O "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
-       && [ -s "$_bbr_dir/bbr.sh" ]; then
+    # wget 默认重试 20 次、单次读超时 900 秒，网络黑洞时会卡十几分钟：必须加超时。
+    # 没 wget 就用 curl（前面已保证装好），都不行就跳过，不挡节点安装。
+    _bbr_ok=0
+    if command -v wget >/dev/null 2>&1; then
+      wget --no-check-certificate --timeout=20 --tries=2 -q -O "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
+        && [ -s "$_bbr_dir/bbr.sh" ] && _bbr_ok=1
+    elif command -v curl >/dev/null 2>&1; then
+      curl -fsSL --max-time 40 -o "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
+        && [ -s "$_bbr_dir/bbr.sh" ] && _bbr_ok=1
+    fi
+    if [ "$_bbr_ok" = "1" ]; then
       chmod +x "$_bbr_dir/bbr.sh"
       info "正在运行 bbr.sh，按它的提示操作（完成后可能需要重启）"
       ( cd "$_bbr_dir" && sh ./bbr.sh )
