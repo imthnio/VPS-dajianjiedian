@@ -48,16 +48,17 @@ xiezai
 
 1. `www.samsung.com` —— 2018–2026 零干扰，最稳
 2. `www.cisco.com` —— 2026 年 0% 干扰，TLS 极稳
-3. `itunes.apple.com` —— 2025–2026 全干净
-4. `www.python.org` —— 技术站，小众不扎眼
-5. `m.media-amazon.com` —— 零干扰记录
-6. `images-na.ssl-images-amazon.com` —— 图片 CDN，流量普通
-7. `download-installer.cdn.mozilla.net` —— 火狐下载站
+3. `www.apple.com` —— 社区验证最多，推荐
+4. `itunes.apple.com` —— 2025–2026 全干净
+5. `www.python.org` —— 技术站，小众不扎眼
+6. `m.media-amazon.com` —— 零干扰记录
+7. `images-na.ssl-images-amazon.com` —— 图片 CDN，流量普通
+8. `download-installer.cdn.mozilla.net` —— 火狐下载站
 
 **小众备选（先自己测一下再用）：**
 
-8. `www.lovelive-anime.jp` —— 日本动画官网，小厂气质
-9. `academy.nvidia.com`
-10. `lol.secure.dyn.riotcdn.net` —— 游戏补丁 CDN
-11. `s0.awsstatic.com`
-12. `www.amd.com` —— 有 3% 干扰率，只当备胎
+9. `www.lovelive-anime.jp` —— 日本动画官网，小厂气质
+10. `academy.nvidia.com`
+11. `lol.secure.dyn.riotcdn.net` —— 游戏补丁 CDN
+12. `s0.awsstatic.com`
+13. `www.amd.com` —— 有 3% 干扰率，只当备胎
