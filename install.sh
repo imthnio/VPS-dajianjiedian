@@ -42,7 +42,14 @@ rand_port() { # 随机一个空闲端口 20000-59999
   _try=0
   while [ "$_try" -lt 50 ]; do
     _try=$((_try + 1))
-    _p=$(awk 'BEGIN{srand(); print int(20000+rand()*40000)}')
+    # 用 /dev/urandom 取随机数：awk 的 srand() 在 gawk 等实现里按秒播种，
+    # 一秒内连调 50 次会拿到 50 个相同的"随机"端口，重试就形同虚设了
+    _p=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' ')
+    if [ -n "$_p" ]; then
+      _p=$((20000 + _p % 40000))
+    else
+      _p=$(awk 'BEGIN{srand(); print int(20000+rand()*40000)}')
+    fi
     _used=0
     if command -v ss >/dev/null 2>&1; then
       ss -ltn 2>/dev/null | grep -q ":${_p} " && _used=1
@@ -185,9 +192,10 @@ pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
 sleep 1
 
 # 撤销安装时加的防火墙规则（只删我们亲手加过的，用户自己手写的不碰）
+# fw_info 现在可能有多行（ss 会同时放行 tcp 和 udp），逐行处理
 if [ -f /etc/xray-node/fw_info ]; then
-  read -r _fport _fproto _fufw _ffwl _fipt < /etc/xray-node/fw_info
-  if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
+  while read -r _fport _fproto _fufw _ffwl _fipt; do
+    [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
     # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
     _oldfmt=0
     if [ -z "$_fufw$_ffwl$_fipt" ]; then _fufw=1; _ffwl=1; _fipt=1; _oldfmt=1; fi
@@ -201,7 +209,7 @@ if [ -f /etc/xray-node/fw_info ]; then
     if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
       if [ "$_oldfmt" = "1" ]; then
         while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
-          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
         done
       else
         # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
@@ -209,7 +217,7 @@ if [ -f /etc/xray-node/fw_info ]; then
       fi
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
-  fi
+  done < /etc/xray-node/fw_info
 fi
 
 # 只删脚本自己下载安装的内核（our_bins 里记着）；
@@ -605,7 +613,20 @@ esac
 printf "正在检测公网 IP…\n"
 if ! SERVER_IP=$(get_ip "$IPVER"); then
   warn "自动检测 IP 失败，请手动输入。"
-  ask "请输入你的服务器公网 IP" "" SERVER_IP
+  _iptry=0
+  SERVER_IP=""
+  while [ "$_iptry" -lt 3 ]; do
+    _iptry=$((_iptry + 1))
+    ask "请输入你的服务器公网 IPv$IPVER 地址" "" SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+      warn "IP 不能为空"
+    elif _valid_ip "$IPVER" "$SERVER_IP"; then
+      break
+    else
+      warn "「$SERVER_IP」不像个 IPv$IPVER 地址，检查一下再输"
+    fi
+    SERVER_IP=""
+  done
   [ -z "$SERVER_IP" ] && die "没有 IP 装不了，先去查一下你的服务器 IP 再来"
 fi
 info "服务器 IP：$SERVER_IP"
@@ -647,6 +668,9 @@ ask "请输入端口（1-65535）" "$_DEF_PORT" PORT
 case "$PORT" in
   ''|*[!0-9]*) warn "端口不是数字，用默认 $_DEF_PORT"; PORT="$_DEF_PORT" ;;
 esac
+# 去掉前导 0（比如 08080）：JSON 数字不允许前导 0，留着后面配置文件校验过不了
+PORT=$(printf "%s" "$PORT" | sed 's/^0*//')
+[ -z "$PORT" ] && PORT=0
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   warn "端口超出范围，用默认 $_DEF_PORT"; PORT="$_DEF_PORT"
 fi
@@ -1110,52 +1134,77 @@ echo "$CORE" > /etc/xray-node/core 2>/dev/null
 
 # ---------- 12. 放行端口 ----------
 step "[网络] 放行端口…"
-_FW_PROTO="tcp"
-case "$PROTO" in hy2|tuic) _FW_PROTO="udp" ;; esac
+# 各协议要放行的端口类型：ss 的 network 配的是 tcp,udp，两个都得放；
+# hy2/tuic 走 UDP；其余走 TCP
+_FW_PROTOS="tcp"
+case "$PROTO" in
+  hy2|tuic) _FW_PROTOS="udp" ;;
+  ss) _FW_PROTOS="tcp udp" ;;
+esac
 mkdir -p /etc/xray-node 2>/dev/null
-# 重装换了端口：先把旧端口的放行规则清掉（只清上次我们亲手加的，
-# 用户自己手写的规则不动），避免旧端口一直敞着
+# 先按旧记录把上次我们亲手加的规则撤掉（精确到每个后端），再重新放行。
+# 这样做有两个好处：①重装换端口/协议时，旧规则不会一直敞着；
+# ②"规则已存在"一定意味着用户手写的，标记不会错——否则重装一次，
+# 我们加的规则就会被误判成用户手写的，xiezai 以后就删不掉了。
+# 只删我们亲手加过的，用户自己手写的规则不动。
 if [ -f /etc/xray-node/fw_info ]; then
-  read -r _oport _oproto _oufw _ofwl _oipt < /etc/xray-node/fw_info
-  if [ -n "$_oport" ] && [ -n "$_oproto" ] && { [ "$_oport" != "$PORT" ] || [ "$_oproto" != "$_FW_PROTO" ]; }; then
-    [ "$_oufw" = "1" ] && command -v ufw >/dev/null 2>&1 \
-      && ufw delete allow "$_oport"/"$_oproto" >/dev/null 2>&1
+  while read -r _oport _oproto _oufw _ofwl _oipt; do
+    [ -n "$_oport" ] && [ -n "$_oproto" ] || continue
+    # 老版本 fw_info 只有"端口 协议"两列：没有后端标记，按老行为尽量清干净
+    if [ -z "$_oufw$_ofwl$_oipt" ]; then _oufw=1; _ofwl=1; _oipt=1; _oldfmt=1; else _oldfmt=0; fi
+    _cleaned=0
+    if [ "$_oufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_oport"/"$_oproto" >/dev/null 2>&1 && _cleaned=1
+    fi
     if [ "$_ofwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
       firewall-cmd --permanent --remove-port="$_oport"/"$_oproto" >/dev/null 2>&1
-      firewall-cmd --reload >/dev/null 2>&1
+      firewall-cmd --reload >/dev/null 2>&1 && _cleaned=1
     fi
-    [ "$_oipt" = "1" ] && command -v iptables >/dev/null 2>&1 \
-      && iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1
-    info "已清理旧端口 $_oport/$_oproto 的放行规则"
-  fi
+    if [ "$_oipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
+      if [ "$_oldfmt" = "1" ]; then
+        # 老格式：这条规则可能是用户手写的，一条一条删干净
+        while iptables -C INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1; do
+          iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1 || break
+        done
+        _cleaned=1
+      else
+        # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
+        iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1 && _cleaned=1
+      fi
+    fi
+    [ "$_cleaned" = "1" ] && info "已清理旧端口 $_oport/$_oproto 的放行规则"
+  done < /etc/xray-node/fw_info
 fi
-# 记下来给 xiezai 用：只删我们亲手加的规则，用户机器上本来就有的不碰
-_UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
-if command -v ufw >/dev/null 2>&1; then
-  if ufw status 2>/dev/null | grep -qE "^${PORT}/${_FW_PROTO}[[:space:]]"; then
-    : # 这条规则本来就存在（用户自己加的），我们不动它
-  elif ufw allow "$PORT"/"$_FW_PROTO" >/dev/null 2>&1; then
-    _UFW_ADDED=1
-    info "ufw 已放行 $PORT/$_FW_PROTO"
+# 逐个协议放行，并记下来给 xiezai 用：只删我们亲手加的规则，用户机器上本来就有的不碰
+: > /etc/xray-node/fw_info
+for _np in $_FW_PROTOS; do
+  _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qE "^${PORT}/${_np}[[:space:]]"; then
+      : # 这条规则本来就存在（用户自己加的），我们不动它
+    elif ufw allow "$PORT"/"$_np" >/dev/null 2>&1; then
+      _UFW_ADDED=1
+      info "ufw 已放行 $PORT/$_np"
+    fi
   fi
-fi
-if command -v firewall-cmd >/dev/null 2>&1; then
-  if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${PORT}/${_FW_PROTO}"; then
-    : # 这条规则本来就存在（用户自己加的），我们不动它
-  elif firewall-cmd --permanent --add-port="$PORT"/"$_FW_PROTO" >/dev/null 2>&1 \
-    && firewall-cmd --reload >/dev/null 2>&1; then
-    _FWL_ADDED=1
-    info "firewalld 已放行 $PORT/$_FW_PROTO"
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${PORT}/${_np}"; then
+      : # 这条规则本来就存在（用户自己加的），我们不动它
+    elif firewall-cmd --permanent --add-port="$PORT"/"$_np" >/dev/null 2>&1 \
+      && firewall-cmd --reload >/dev/null 2>&1; then
+      _FWL_ADDED=1
+      info "firewalld 已放行 $PORT/$_np"
+    fi
   fi
-fi
-if command -v iptables >/dev/null 2>&1; then
-  if iptables -C INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
-    : # 这条规则本来就存在（用户自己加的），我们不动它
-  elif iptables -I INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
-    _IPT_ADDED=1
+  if command -v iptables >/dev/null 2>&1; then
+    if iptables -C INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+      : # 这条规则本来就存在（用户自己加的），我们不动它
+    elif iptables -I INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+      _IPT_ADDED=1
+    fi
   fi
-fi
-echo "$PORT $_FW_PROTO $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" > /etc/xray-node/fw_info
+  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" >> /etc/xray-node/fw_info
+done
 warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
 # ---------- 13. 生成节点链接 ----------
