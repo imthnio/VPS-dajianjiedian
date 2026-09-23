@@ -91,7 +91,23 @@ _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
     case "$2" in *:*) return 0 ;; *) return 1 ;; esac
   else
     case "$2" in *:*|''|*[!0-9.]*|.*|*.) return 1 ;; esac
-    [ "$(printf "%s" "$2" | tr -cd '.' | wc -c)" -eq 3 ]
+    [ "$(printf "%s" "$2" | tr -cd '.' | wc -c)" -eq 3 ] || return 1
+    # 每段必须是 0-255 的数字：之前 999.1.1.1、1.2.3.256 这种也能通过，
+    # 手动输错 IP 会直接写进节点链接，节点就废了
+    _v4_rest="$2."
+    _v4_n=0
+    while [ -n "$_v4_rest" ]; do
+      _v4_o=${_v4_rest%%.*}; _v4_rest=${_v4_rest#*.}
+      _v4_n=$((_v4_n + 1))
+      [ "$_v4_n" -gt 4 ] && return 1
+      case "$_v4_o" in ''|*[!0-9]*) return 1 ;; esac
+      [ "${#_v4_o}" -gt 3 ] && return 1
+      # 去掉前导 0 再比大小（"08" 在 sh 算术里会被当成非法八进制）
+      _v4_on=$(printf "%s" "$_v4_o" | sed 's/^0*//')
+      [ -z "$_v4_on" ] && _v4_on=0
+      if [ "$_v4_on" -gt 255 ] 2>/dev/null; then return 1; fi
+    done
+    [ "$_v4_n" -eq 4 ]
   fi
 }
 
@@ -458,9 +474,25 @@ _ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "
 
 _latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
   _lt_tag=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-  [ -n "$_lt_tag" ] || return 1
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s/^v//')
+  # 必须是版本号的样子：tag 格式万一变了（比如 "nightly"），
+  # 不能把整行垃圾当版本号吐出去，否则版本比较永远对不上、每次更新都重复下载
+  case "$_lt_tag" in ''|*[!0-9a-zA-Z.-]*) return 1 ;; esac
   printf "%s" "$_lt_tag"
+}
+
+# _cached_ver_ok <二进制路径> <owner/repo> [已知最新版本]：
+# 缓存安装包里的内核已是最新版返回 0；连不上 API 拿不到"最新"时返回 0
+# （不断网折腾，照旧用缓存）；包里版本读不出来返回 1（重新下载）
+_cached_ver_ok() {
+  _cvo_ver=$(_ver_num "$("$1" version 2>/dev/null | head -1)")
+  [ -n "$_cvo_ver" ] || return 1
+  if [ -n "$3" ]; then
+    _cvo_latest="$3"
+  else
+    _cvo_latest=$(_latest_tag "$2") || return 0
+  fi
+  [ "$_cvo_ver" = "$_cvo_latest" ]
 }
 
 dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
@@ -475,10 +507,22 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
   else
     DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
     # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
-    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版
+    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版。
+    # 但缓存的包可能是几个月前的旧版本：验一下版本，旧了就重新下，别装个过期内核
+    _reuse=0
     if [ "$FORCE_DL" != "1" ] && [ -s "$DL_DIR/xray.zip" ] && unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1; then
-      info "安装包已在本地，直接使用（跳过下载）"
-    else
+      rm -rf "$DL_DIR/xray-ver" && mkdir -p "$DL_DIR/xray-ver"
+      if unzip -o -q "$DL_DIR/xray.zip" -d "$DL_DIR/xray-ver" xray 2>/dev/null \
+         && [ -x "$DL_DIR/xray-ver/xray" ] \
+         && _cached_ver_ok "$DL_DIR/xray-ver/xray" "XTLS/Xray-core"; then
+        _reuse=1
+        info "安装包已在本地且是最新版，直接使用（跳过下载）"
+      else
+        info "本地安装包不是最新版，重新下载…"
+      fi
+      rm -rf "$DL_DIR/xray-ver"
+    fi
+    if [ "$_reuse" = "0" ]; then
       rm -f "$DL_DIR/xray.zip"
       _xasset="Xray-linux-${XARCH}.zip"
       _dl_ok=0
@@ -490,8 +534,7 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
         warn "API 路线失败，换 github.com 直链试试…"
         rm -f "$DL_DIR/xray.zip"
         # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底）
-        _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
-          | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+        _xver=$(_latest_tag "XTLS/Xray-core") || _xver=""
         for _url in \
           ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
           "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
@@ -532,14 +575,27 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
     info "sing-box 已存在，直接用现有的：$($SB_BIN version 2>/dev/null | head -1)"
   else
     DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
-    _ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-      | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-    [ -z "$_ver" ] && die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
+    _ver=$(_latest_tag "SagerNet/sing-box") \
+      || die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
     # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
-    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版
+    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版。
+    # 但缓存的包可能是几个月前的旧版本：验一下版本，旧了就重新下，别装个过期内核
+    _reuse=0
     if [ "$FORCE_DL" != "1" ] && [ -s "$DL_DIR/sb.tar.gz" ] && tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1; then
-      info "安装包已在本地，直接使用（跳过下载）"
-    else
+      rm -rf "$DL_DIR/sb-ver" && mkdir -p "$DL_DIR/sb-ver"
+      _sb_ver_inner=$(tar tzf "$DL_DIR/sb.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)
+      if [ -n "$_sb_ver_inner" ] \
+         && tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-ver" 2>/dev/null \
+         && [ -x "$DL_DIR/sb-ver/${_sb_ver_inner}/sing-box" ] \
+         && _cached_ver_ok "$DL_DIR/sb-ver/${_sb_ver_inner}/sing-box" "SagerNet/sing-box" "$_ver"; then
+        _reuse=1
+        info "安装包已在本地且是最新版，直接使用（跳过下载）"
+      else
+        info "本地安装包不是最新版，重新下载…"
+      fi
+      rm -rf "$DL_DIR/sb-ver"
+    fi
+    if [ "$_reuse" = "0" ]; then
       rm -f "$DL_DIR/sb.tar.gz"
       _dl_ok=0
       # 候选包名：Alpine 先 musl 再 generic；其它系统先 generic 再 glibc。
@@ -696,7 +752,8 @@ for _nd in /etc/xray-node/nodes/*/; do
   [ "$_nn" -ge "$NODE_ID" ] && NODE_ID=$((_nn + 1))
 done
 NODE_DIR=/etc/xray-node/nodes/$NODE_ID
-mkdir -p "$NODE_DIR"
+# 注意：目录在这里先不建，留到更新模式之后——更新模式不需要新目录，
+# 提前建会在每次更新时留下一个空编号目录，节点编号越跳越大
 
 # ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
 step "[准备] 检查系统工具…"
@@ -872,6 +929,8 @@ if [ "$UPDATE_MODE" = "1" ]; then
     exit 0
   fi
 fi
+# 更新模式上面已经 exit 0 了，到这里的一定是"全新安装/添加新节点"，这时才建目录
+mkdir -p "$NODE_DIR"
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
 step "[1/4] 节点里填你服务器的哪个公网地址？"
@@ -1101,7 +1160,6 @@ step "[配置] 写入配置…"
 mkdir -p /etc/xray-node
 
 if [ "$CORE" = "xray" ]; then
-mkdir -p /usr/local/etc/xray
 case "$PROTO" in
   vless)
     cat > "$NODE_DIR/config.json" <<EOF
@@ -1445,17 +1503,28 @@ if [ "$_BBR_ON" = "0" ]; then
     _bbr_dir="$(mktemp -d 2>/dev/null || echo /tmp)"
     _bbr_host="github.com"
     _bbr_path="/teddysun/across/raw/master/bbr.sh"
-    _bbr_url="https://${_bbr_host}${_bbr_path}"
-    # wget 默认重试 20 次、单次读超时 900 秒，网络黑洞时会卡十几分钟：必须加超时。
-    # 没 wget 就用 curl（前面已保证装好），都不行就跳过，不挡节点安装。
+    _bbr_jd_h="cdn.jsdelivr.net"
+    _bbr_jd_p="/gh/teddysun/across@master/bbr.sh"
+    # 下载地址：github.com 优先，jsdelivr 兜底（有的机器到 github.com 不通）
+    _bbr_urls="https://${_bbr_host}${_bbr_path} https://${_bbr_jd_h}${_bbr_jd_p}"
+    _bbr_dl() { # _bbr_dl <url>：用 wget 或 curl 下载 bbr.sh，成功返回 0
+      # wget 默认重试 20 次、单次读超时 900 秒，网络黑洞时会卡十几分钟：必须加超时。
+      # 没 wget 就用 curl（前面已保证装好），都不行就跳过，不挡节点安装。
+      if command -v wget >/dev/null 2>&1; then
+        wget --no-check-certificate --timeout=20 --tries=2 -q -O "$_bbr_dir/bbr.sh" "$1" 2>/dev/null
+      elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 40 -o "$_bbr_dir/bbr.sh" "$1" 2>/dev/null
+      else
+        return 1
+      fi
+      # 代理有时返回错误页面（200 状态码）：内容像 HTML 就当没下到，换下一个地址
+      [ -s "$_bbr_dir/bbr.sh" ] && ! grep -qi "<html" "$_bbr_dir/bbr.sh" 2>/dev/null
+    }
     _bbr_ok=0
-    if command -v wget >/dev/null 2>&1; then
-      wget --no-check-certificate --timeout=20 --tries=2 -q -O "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
-        && [ -s "$_bbr_dir/bbr.sh" ] && _bbr_ok=1
-    elif command -v curl >/dev/null 2>&1; then
-      curl -fsSL --max-time 40 -o "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
-        && [ -s "$_bbr_dir/bbr.sh" ] && _bbr_ok=1
-    fi
+    for _bbr_url in $_bbr_urls; do
+      if _bbr_dl "$_bbr_url"; then _bbr_ok=1; break; fi
+      rm -f "$_bbr_dir/bbr.sh"
+    done
     if [ "$_bbr_ok" = "1" ]; then
       chmod +x "$_bbr_dir/bbr.sh"
       info "正在运行 bbr.sh，按它的提示操作（完成后可能需要重启）"
