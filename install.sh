@@ -150,6 +150,244 @@ wait_for_port() {
   return 1
 }
 
+write_helper_cmds() { # 写入/刷新 jiedian 和 xiezai 两个命令（安装和更新都会调）
+cat > /usr/local/bin/jiedian <<'JDEOF'
+#!/bin/sh
+# 输入 jiedian，立刻显示你的节点
+if [ -f /etc/xray-node/node.txt ]; then
+  cat /etc/xray-node/node.txt
+else
+  echo "还没安装节点，请先运行一键安装脚本"
+fi
+JDEOF
+chmod +x /usr/local/bin/jiedian
+cat > /usr/local/bin/xiezai <<'XZEOF'
+#!/bin/sh
+# 输入 xiezai，一键卸载 xray-node：停掉服务，删掉节点和所有相关配置
+echo "正在卸载 xray-node…"
+
+# 停掉并移除开机自启（xray / sing-box 都处理）
+for _s in xray sing-box; do
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl stop "$_s" >/dev/null 2>&1
+    systemctl disable "$_s" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/${_s}.service"
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "$_s" stop >/dev/null 2>&1
+    rc-update del "$_s" default >/dev/null 2>&1
+    rm -f "/etc/init.d/${_s}"
+  fi
+done
+[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
+pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
+pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
+sleep 1
+
+# 撤销安装时加的防火墙规则（只删我们亲手加过的，用户自己手写的不碰）
+if [ -f /etc/xray-node/fw_info ]; then
+  read -r _fport _fproto _fufw _ffwl _fipt < /etc/xray-node/fw_info
+  if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
+    # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
+    _oldfmt=0
+    if [ -z "$_fufw$_ffwl$_fipt" ]; then _fufw=1; _ffwl=1; _fipt=1; _oldfmt=1; fi
+    if [ "$_fufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1
+    fi
+    if [ "$_ffwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
+      firewall-cmd --reload >/dev/null 2>&1
+    fi
+    if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
+      if [ "$_oldfmt" = "1" ]; then
+        while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+        done
+      else
+        # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
+        iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+      fi
+    fi
+    echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
+  fi
+fi
+
+# 只删脚本自己下载安装的内核（our_bins 里记着）；
+# 用户机器上本来就有的 xray/sing-box 不碰，避免误删
+# 注意：必须在删 /etc/xray-node 之前读
+if [ -f /etc/xray-node/our_bins ]; then
+  while read -r _b; do
+    case "$_b" in
+      xray|sing-box) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
+    esac
+  done < /etc/xray-node/our_bins
+fi
+
+# 删掉配置、节点、日志
+rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
+rm -f /var/log/xray.log /var/log/sing-box.log
+
+rm -f /usr/local/bin/jiedian
+rm -f /usr/local/bin/xiezai
+
+echo "卸载完成：节点、配置、开机自启、防火墙规则都已清除干净。"
+XZEOF
+chmod +x /usr/local/bin/xiezai
+}
+
+_restart_svc() { # _restart_svc <服务名> <二进制路径> <启动参数…>：只重启服务，不写 unit 文件（更新模式用）
+  _rs_svc="$1"; _rs_bin="$2"; shift 2
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl restart "$_rs_svc" >/dev/null 2>&1
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "$_rs_svc" restart >/dev/null 2>&1
+  else
+    pkill -f "${_rs_bin} $*" >/dev/null 2>&1
+    sleep 1
+    nohup "$_rs_bin" "$@" >/var/log/"${_rs_svc}".log 2>&1 &
+  fi
+  sleep 1
+}
+
+_ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "Xray 26.3.27 (…)" -> "26.3.27"
+  printf "%s" "$1" | sed 's/^[^0-9]*//; s/[^0-9.].*//; s/\.*$//'
+}
+
+_latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
+  _lt_tag=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+  [ -n "$_lt_tag" ] || return 1
+  printf "%s" "$_lt_tag"
+}
+
+dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
+  step "[下载] 获取 Xray 内核…"
+  case "$MACH" in
+    amd64) XARCH="64" ;;
+    arm64) XARCH="arm64-v8a" ;;
+    armv7) XARCH="arm32-v7a" ;;
+  esac
+  if [ "$FORCE_DL" != "1" ] && [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version >/dev/null 2>&1; then
+    info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
+  else
+    DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
+    # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
+    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版
+    if [ "$FORCE_DL" != "1" ] && [ -s "$DL_DIR/xray.zip" ] && unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1; then
+      info "安装包已在本地，直接使用（跳过下载）"
+    else
+      rm -f "$DL_DIR/xray.zip"
+      _xasset="Xray-linux-${XARCH}.zip"
+      _dl_ok=0
+      # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
+      info "尝试下载：GitHub API"
+      if gh_api_dl "XTLS/Xray-core" "$_xasset" "$DL_DIR/xray.zip"; then
+        _dl_ok=1
+      else
+        warn "API 路线失败，换 github.com 直链试试…"
+        rm -f "$DL_DIR/xray.zip"
+        # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底）
+        _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+          | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+        for _url in \
+          ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
+          "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
+        ; do
+          [ -z "$_url" ] && continue
+          info "尝试下载：$_url"
+          if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/xray.zip" "$_url"; then
+            _dl_ok=1
+            break
+          fi
+          warn "这个地址下载失败，换下一个地址试试…"
+          rm -f "$DL_DIR/xray.zip"
+        done
+      fi
+      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+    fi
+    # 完整性校验：包坏了直接报错，不往下装半截文件
+    unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
+    rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
+    unzip -o "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || die "解压失败"
+    [ -s "$DL_DIR/xray-dl/xray" ] || die "解压后没找到 xray 文件"
+    # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
+    install -m 0755 "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" || die "安装 Xray 失败"
+    if ! "${XRAY_BIN}.new" version >/dev/null 2>&1; then
+      rm -f "${XRAY_BIN}.new"
+      die "下载的 Xray 内核跑不起来，安装包可能有问题"
+    fi
+    mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
+    mark_our_bin "xray"
+    rm -rf "$DL_DIR"
+    info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
+  fi
+}
+
+dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在也强制下载最新版
+  step "[下载] 获取 sing-box 内核…"
+  if [ "$FORCE_DL" != "1" ] && [ -x "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1; then
+    info "sing-box 已存在，直接用现有的：$($SB_BIN version 2>/dev/null | head -1)"
+  else
+    DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
+    _ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+      | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+    [ -z "$_ver" ] && die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
+    # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
+    # 更新模式（FORCE_DL=1）不走这里，必须拉最新版
+    if [ "$FORCE_DL" != "1" ] && [ -s "$DL_DIR/sb.tar.gz" ] && tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1; then
+      info "安装包已在本地，直接使用（跳过下载）"
+    else
+      rm -f "$DL_DIR/sb.tar.gz"
+      _dl_ok=0
+      # 候选包名：Alpine 先 musl 再 generic；其它系统先 generic 再 glibc。
+      # generic 是官方长期提供的传统包，兼容性最稳；显式 libc 后缀包作兜底
+      # （防官方某天改名或下掉某一版）
+      if [ -f /etc/alpine-release ]; then
+        _sb_cands="sing-box-${_ver}-linux-${MACH}-musl.tar.gz sing-box-${_ver}-linux-${MACH}.tar.gz"
+      else
+        _sb_cands="sing-box-${_ver}-linux-${MACH}.tar.gz sing-box-${_ver}-linux-${MACH}-glibc.tar.gz"
+      fi
+      for _cand in $_sb_cands; do
+        info "尝试下载：${_cand}"
+        # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
+        if gh_api_dl "SagerNet/sing-box" "$_cand" "$DL_DIR/sb.tar.gz"; then
+          _dl_ok=1
+          break
+        fi
+        warn "API 路线失败，换 github.com 直链试试…"
+        rm -f "$DL_DIR/sb.tar.gz"
+        # 路线 B：github.com 版本直链兜底
+        _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/${_cand}"
+        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/sb.tar.gz" "$_url"; then
+          _dl_ok=1
+          break
+        fi
+        warn "这个包名下载失败，换下一个包名试试…"
+        rm -f "$DL_DIR/sb.tar.gz"
+      done
+      [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+    fi
+    # 完整性校验：包坏了直接报错，不往下装半截文件
+    tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
+    rm -rf "$DL_DIR/sb-dl" && mkdir -p "$DL_DIR/sb-dl"
+    tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || die "解压失败"
+    # 包内顶层目录名跟包名走（不同候选包名目录名不同），动态探测，不写死
+    _sb_inner=$(tar tzf "$DL_DIR/sb.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)
+    [ -n "$_sb_inner" ] && [ -s "$DL_DIR/sb-dl/${_sb_inner}/sing-box" ] \
+      || die "解压后没找到 sing-box 文件"
+    # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
+    install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" || die "安装 sing-box 失败"
+    if ! "${SB_BIN}.new" version >/dev/null 2>&1; then
+      rm -f "${SB_BIN}.new"
+      die "下载的 sing-box 内核跑不起来，安装包可能有问题"
+    fi
+    mv -f "${SB_BIN}.new" "$SB_BIN"
+    mark_our_bin "sing-box"
+    rm -rf "$DL_DIR"
+    info "sing-box 安装成功：$($SB_BIN version 2>/dev/null | head -1)"
+  fi
+}
+
 # ---------- 1. 必须是 root ----------
 if [ "$(id -u)" -ne 0 ]; then
   die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
@@ -160,10 +398,20 @@ printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
 printf "${BOLD}==============================================${NC}\n"
 printf "全程中文提问，看不懂就一路回车用默认。\n"
 
+# 已经装过节点：给三个选项 —— 更新（默认，只升级内核、节点不变）/ 重装 / 取消
+UPDATE_MODE=0
+FORCE_DL=0
 if [ -f /etc/xray-node/node.txt ]; then
-  warn "检测到已经安装过节点，继续会覆盖重装。"
-  ask "继续重装吗？(y/n)" "y" _re
-  case "$_re" in y|Y|yes|YES) ;; *) echo "已取消"; exit 0;; esac
+  printf "\n检测到这台机器已经装过节点。\n"
+  printf "  1) 检查更新并升级（推荐：节点配置不变，只把内核升到最新版）\n"
+  printf "  2) 重新安装（重新回答问题，生成一个全新的节点，旧节点作废）\n"
+  printf "  3) 取消，什么都不做\n"
+  ask "请选择" "1" _um
+  case "$_um" in
+    2) info "进入重新安装流程" ;;
+    3|n|N|no|NO) echo "已取消"; exit 0 ;;
+    *) UPDATE_MODE=1 ;;
+  esac
 fi
 
 # ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
@@ -226,6 +474,123 @@ fi
 command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl 后重试"
 command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
 info "系统工具就绪"
+
+# ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
+mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
+XRAY_BIN="/usr/local/bin/xray"
+SB_BIN="/usr/local/bin/sing-box"
+case "$(uname -m)" in
+  x86_64|amd64) MACH="amd64" ;;
+  aarch64|arm64) MACH="arm64" ;;
+  armv7l|armv7) MACH="armv7" ;;
+  *) die "不支持的 CPU 架构：$(uname -m)" ;;
+esac
+
+# ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
+# 重跑一键命令选"1"进到这里：不问问题、不改配置，只把内核升到最新版。
+if [ "$UPDATE_MODE" = "1" ]; then
+  step "[更新] 检查已安装的内核版本…"
+  # 确定上次装的是哪个内核
+  UCORE=""
+  if [ -f /etc/xray-node/core ]; then
+    _uc=$(tr -d ' \r\n' < /etc/xray-node/core 2>/dev/null)
+    case "$_uc" in xray|sing-box) UCORE="$_uc" ;; esac
+  fi
+  [ -z "$UCORE" ] && [ -f /usr/local/etc/xray/config.json ] && UCORE="xray"
+  [ -z "$UCORE" ] && [ -f /usr/local/etc/sing-box/config.json ] && UCORE="sing-box"
+  if [ -z "$UCORE" ]; then
+    warn "找不到上次安装的内核信息，改走重新安装流程。"
+    UPDATE_MODE=0
+  else
+    if [ "$UCORE" = "xray" ]; then
+      UREPO="XTLS/Xray-core"; UBIN="$XRAY_BIN"; USVC="xray"
+      UARGS="-config /usr/local/etc/xray/config.json"
+    else
+      UREPO="SagerNet/sing-box"; UBIN="$SB_BIN"; USVC="sing-box"
+      UARGS="run -c /usr/local/etc/sing-box/config.json"
+    fi
+    _u_inst=""
+    [ -x "$UBIN" ] && _u_inst=$(_ver_num "$("$UBIN" version 2>/dev/null | head -1)")
+    _u_latest=$(_latest_tag "$UREPO") || _u_latest=""
+    if [ -z "$_u_latest" ]; then
+      warn "连不上 api.github.com，检查更新失败，稍后再试。节点不受影响，继续正常使用。"
+      cat /etc/xray-node/node.txt
+      exit 0
+    fi
+    if [ -n "$_u_inst" ] && [ "$_u_inst" = "$_u_latest" ]; then
+      info "已经是最新版（v${_u_inst}），无需更新内核。"
+      # 内核虽不用升，但脚本本身可能修过 bug：顺手把 jiedian / xiezai 同步为最新版
+      write_helper_cmds
+      info "jiedian / xiezai 命令已同步为最新版"
+      cat /etc/xray-node/node.txt
+      exit 0
+    fi
+    if [ -n "$_u_inst" ]; then
+      info "当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
+    else
+      warn "内核文件丢失或已损坏，直接下载最新版 v${_u_latest} 重装内核（节点配置保留）。"
+    fi
+    # 备份旧内核：新内核万一跑不起来，回滚后节点不受影响
+    [ -x "$UBIN" ] && cp -a "$UBIN" "${UBIN}.bak" 2>/dev/null
+    FORCE_DL=1
+    if [ "$UCORE" = "xray" ]; then dl_xray; else dl_singbox; fi
+    FORCE_DL=0
+    # 重启服务
+    step "[更新] 重启服务…"
+    # shellcheck disable=SC2086 — UARGS 故意拆成多个参数
+    _restart_svc "$USVC" "$UBIN" $UARGS
+    # 读出节点端口，硬检查服务真的在监听
+    _u_port=""; _u_proto="tcp"
+    if [ "$UCORE" = "xray" ]; then
+      _u_port=$(grep -o '"port": [0-9][0-9]*' /usr/local/etc/xray/config.json 2>/dev/null | head -1 | grep -o '[0-9][0-9]*')
+    else
+      _u_port=$(grep -o '"listen_port": [0-9][0-9]*' /usr/local/etc/sing-box/config.json 2>/dev/null | head -1 | grep -o '[0-9][0-9]*')
+      grep -qE '"type": "(hysteria2|tuic)"' /usr/local/etc/sing-box/config.json 2>/dev/null && _u_proto="udp"
+    fi
+    _u_ok=1
+    if [ -n "$_u_port" ]; then
+      if wait_for_port "$_u_port" "$_u_proto" 15; then
+        info "升级成功：端口 $_u_port/$_u_proto 监听正常，节点配置未变"
+      else
+        _u_ok=0
+      fi
+    else
+      warn "读不到节点端口，跳过监听检查（服务已重启）"
+    fi
+    if [ "$_u_ok" = "0" ]; then
+      _u_rb_ok=0
+      if [ -f "${UBIN}.bak" ]; then
+        warn "新内核启动后端口没监听，正在回滚到旧版本…"
+        cp -a "${UBIN}.bak" "$UBIN"
+        # shellcheck disable=SC2086
+        _restart_svc "$USVC" "$UBIN" $UARGS
+        sleep 1
+        if [ -n "$_u_port" ] && wait_for_port "$_u_port" "$_u_proto" 15; then
+          _u_rb_ok=1
+          info "已回滚到旧版本，节点恢复正常"
+        else
+          warn "回滚后端口仍未监听，请手动检查：systemctl status $USVC（或 rc-service $USVC status）"
+        fi
+      else
+        warn "没有旧内核备份，无法回滚，请手动检查：systemctl status $USVC（或 rc-service $USVC status）"
+      fi
+      rm -f "${UBIN}.bak"
+      if [ "$_u_rb_ok" = "1" ]; then
+        die "新版本内核在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
+      else
+        die "新版本内核跑不起来，且回滚后服务仍未恢复监听——节点可能已中断，请按上面的提示手动检查服务状态"
+      fi
+    fi
+    rm -f "${UBIN}.bak"
+    # 刷新 jiedian / xiezai（脚本可能修过它们）
+    write_helper_cmds
+    info "jiedian / xiezai 命令已同步为最新版"
+    printf "\n"
+    cat /etc/xray-node/node.txt
+    printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
+    exit 0
+  fi
+fi
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
 step "[1/4] 节点里填你服务器的哪个公网地址？"
@@ -339,118 +704,10 @@ WS_PATH="/$(rand_hex 4)"
 info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
 
 # ---------- 8. 下载内核 ----------
-mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
-case "$(uname -m)" in
-  x86_64|amd64) MACH="amd64" ;;
-  aarch64|arm64) MACH="arm64" ;;
-  armv7l|armv7) MACH="armv7" ;;
-  *) die "不支持的 CPU 架构：$(uname -m)" ;;
-esac
-
 if [ "$CORE" = "xray" ]; then
-  step "[下载] 获取 Xray 内核…"
-  case "$MACH" in
-    amd64) XARCH="64" ;;
-    arm64) XARCH="arm64-v8a" ;;
-    armv7) XARCH="arm32-v7a" ;;
-  esac
-  XRAY_BIN="/usr/local/bin/xray"
-  if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version >/dev/null 2>&1; then
-    info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
-  else
-    DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
-    # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）
-    if [ -s "$DL_DIR/xray.zip" ] && unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1; then
-      info "安装包已在本地，直接使用（跳过下载）"
-    else
-      rm -f "$DL_DIR/xray.zip"
-      _xasset="Xray-linux-${XARCH}.zip"
-      _dl_ok=0
-      # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
-      info "尝试下载：GitHub API"
-      if gh_api_dl "XTLS/Xray-core" "$_xasset" "$DL_DIR/xray.zip"; then
-        _dl_ok=1
-      else
-        warn "API 路线失败，换 github.com 直链试试…"
-        rm -f "$DL_DIR/xray.zip"
-        # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底）
-        _xver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
-          | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-        for _url in \
-          ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
-          "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
-        ; do
-          [ -z "$_url" ] && continue
-          info "尝试下载：$_url"
-          if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/xray.zip" "$_url"; then
-            _dl_ok=1
-            break
-          fi
-          warn "这个地址下载失败，换下一个地址试试…"
-          rm -f "$DL_DIR/xray.zip"
-        done
-      fi
-      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
-    fi
-    # 完整性校验：包坏了直接报错，不往下装半截文件
-    unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
-    rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
-    unzip -o "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || die "解压失败"
-    [ -s "$DL_DIR/xray-dl/xray" ] || die "解压后没找到 xray 文件"
-    install -m 0755 "$DL_DIR/xray-dl/xray" "$XRAY_BIN" || die "安装 Xray 失败"
-    "$XRAY_BIN" version >/dev/null 2>&1 || die "装完的 Xray 跑不起来，安装包可能有问题"
-    mark_our_bin "xray"
-    rm -rf "$DL_DIR"
-    info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
-  fi
+  dl_xray
 else
-  step "[下载] 获取 sing-box 内核…"
-  # Alpine 是 musl，其它系统用默认版本
-  _suffix=""
-  [ -f /etc/alpine-release ] && _suffix="-musl"
-  SB_BIN="/usr/local/bin/sing-box"
-  if [ -x "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1; then
-    info "sing-box 已存在，直接用现有的：$($SB_BIN version 2>/dev/null | head -1)"
-  else
-    DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
-    _ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-      | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-    [ -z "$_ver" ] && die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
-    _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
-    # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）
-    if [ -s "$DL_DIR/sb.tar.gz" ] && tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1; then
-      info "安装包已在本地，直接使用（跳过下载）"
-    else
-      rm -f "$DL_DIR/sb.tar.gz"
-      _sasset="sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
-      _dl_ok=0
-      # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
-      info "尝试下载：GitHub API"
-      if gh_api_dl "SagerNet/sing-box" "$_sasset" "$DL_DIR/sb.tar.gz"; then
-        _dl_ok=1
-      else
-        warn "API 路线失败，换 github.com 直链试试…"
-        rm -f "$DL_DIR/sb.tar.gz"
-        # 路线 B：github.com 版本直链兜底
-        _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/sing-box-${_ver}-linux-${MACH}${_suffix}.tar.gz"
-        info "尝试下载：$_url"
-        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/sb.tar.gz" "$_url"; then
-          _dl_ok=1
-        fi
-      fi
-      [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
-    fi
-    # 完整性校验：包坏了直接报错，不往下装半截文件
-    tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
-    rm -rf "$DL_DIR/sb-dl" && mkdir -p "$DL_DIR/sb-dl"
-    tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || die "解压失败"
-    [ -s "$DL_DIR/sb-dl/sing-box-${_ver}-linux-${MACH}${_suffix}/sing-box" ] || die "解压后没找到 sing-box 文件"
-    install -m 0755 "$DL_DIR/sb-dl/sing-box-${_ver}-linux-${MACH}${_suffix}/sing-box" "$SB_BIN" || die "安装 sing-box 失败"
-    "$SB_BIN" version >/dev/null 2>&1 || die "装完的 sing-box 跑不起来，安装包可能有问题"
-    mark_our_bin "sing-box"
-    rm -rf "$DL_DIR"
-    info "sing-box 安装成功：$($SB_BIN version 2>/dev/null | head -1)"
-  fi
+  dl_singbox
 fi
 
 # ---------- 9. REALITY 密钥对 ----------
@@ -458,8 +715,9 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   step "[密钥] 生成 REALITY 密钥…"
   if [ "$CORE" = "xray" ]; then
     _out=$("$XRAY_BIN" x25519 2>/dev/null)
-    REALITY_PRIV=$(printf "%s" "$_out" | grep -i "private" | awk '{print $NF}' | tr -d '\r\n')
-    REALITY_PUB=$(printf "%s" "$_out" | grep -i "public" | awk '{print $NF}' | tr -d '\r\n')
+    REALITY_PRIV=$(printf "%s" "$_out" | grep -i "private" | head -1 | awk '{print $NF}' | tr -d '\r\n')
+    # 公钥行：老版叫 "Public key"，v26.3.27 起叫 "Password (PublicKey)"——两个关键字都认
+    REALITY_PUB=$(printf "%s" "$_out" | grep -iE "public|password" | head -1 | awk '{print $NF}' | tr -d '\r\n')
   else
     # sing-box 自带 reality-keypair 生成，不需要 openssl
     _out=$("$SB_BIN" generate reality-keypair 2>/dev/null)
@@ -962,90 +1220,8 @@ esac
   printf "==============================================\n"
 } > /etc/xray-node/node.txt
 
-cat > /usr/local/bin/jiedian <<'JDEOF'
-#!/bin/sh
-# 输入 jiedian，立刻显示你的节点
-if [ -f /etc/xray-node/node.txt ]; then
-  cat /etc/xray-node/node.txt
-else
-  echo "还没安装节点，请先运行一键安装脚本"
-fi
-JDEOF
-chmod +x /usr/local/bin/jiedian
+write_helper_cmds
 info "已安装 jiedian 命令：以后输入 jiedian 就能看节点"
-
-cat > /usr/local/bin/xiezai <<'XZEOF'
-#!/bin/sh
-# 输入 xiezai，一键卸载 xray-node：停掉服务，删掉节点和所有相关配置
-echo "正在卸载 xray-node…"
-
-# 停掉并移除开机自启（xray / sing-box 都处理）
-for _s in xray sing-box; do
-  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl stop "$_s" >/dev/null 2>&1
-    systemctl disable "$_s" >/dev/null 2>&1
-    rm -f "/etc/systemd/system/${_s}.service"
-  fi
-  if command -v rc-service >/dev/null 2>&1; then
-    rc-service "$_s" stop >/dev/null 2>&1
-    rc-update del "$_s" default >/dev/null 2>&1
-    rm -f "/etc/init.d/${_s}"
-  fi
-done
-[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
-pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
-pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
-sleep 1
-
-# 撤销安装时加的防火墙规则（只删我们亲手加过的，用户自己手写的不碰）
-if [ -f /etc/xray-node/fw_info ]; then
-  read -r _fport _fproto _fufw _ffwl _fipt < /etc/xray-node/fw_info
-  if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
-    # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
-    _oldfmt=0
-    if [ -z "$_fufw$_ffwl$_fipt" ]; then _fufw=1; _ffwl=1; _fipt=1; _oldfmt=1; fi
-    if [ "$_fufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
-      ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1
-    fi
-    if [ "$_ffwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
-      firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
-      firewall-cmd --reload >/dev/null 2>&1
-    fi
-    if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
-      if [ "$_oldfmt" = "1" ]; then
-        while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
-          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
-        done
-      else
-        # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
-        iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
-      fi
-    fi
-    echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
-  fi
-fi
-
-# 只删脚本自己下载安装的内核（our_bins 里记着）；
-# 用户机器上本来就有的 xray/sing-box 不碰，避免误删
-# 注意：必须在删 /etc/xray-node 之前读
-if [ -f /etc/xray-node/our_bins ]; then
-  while read -r _b; do
-    case "$_b" in
-      xray|sing-box) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
-    esac
-  done < /etc/xray-node/our_bins
-fi
-
-# 删掉配置、节点、日志
-rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
-rm -f /var/log/xray.log /var/log/sing-box.log
-
-rm -f /usr/local/bin/jiedian
-rm -f /usr/local/bin/xiezai
-
-echo "卸载完成：节点、配置、开机自启、防火墙规则都已清除干净。"
-XZEOF
-chmod +x /usr/local/bin/xiezai
 info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
 
 # ---------- 14b. BBR 加速：检测，没开就自动开 ----------
