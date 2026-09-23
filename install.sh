@@ -878,6 +878,45 @@ XZEOF
 chmod +x /usr/local/bin/xiezai
 info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
 
+# ---------- 14b. BBR 加速：检测，没开就自动开 ----------
+step "检查 BBR 加速…"
+_BBR_ON=0
+if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+  _BBR_ON=1
+  info "BBR 已经开启，不用动"
+fi
+if [ "$_BBR_ON" = "0" ]; then
+  # 内核本身支持 BBR：直接 sysctl 打开，立即生效、不用重启、不用下载
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
+       sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+      printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-bbr.conf
+      sysctl --system >/dev/null 2>&1 || true
+      if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        _BBR_ON=1
+        info "BBR 已自动开启（立即生效，已写入开机配置）"
+      fi
+    fi
+    [ "$_BBR_ON" = "0" ] && warn "BBR 开启失败（可能是容器内无权改内核参数），不影响节点使用"
+  else
+    # 内核太老不支持 BBR：用 teddysun 的 bbr.sh 升级内核来开
+    warn "当前内核不支持 BBR，尝试用 bbr.sh 升级内核开启…"
+    _bbr_dir="$(mktemp -d 2>/dev/null || echo /tmp)"
+    _bbr_host="github.com"
+    _bbr_path="/teddysun/across/raw/master/bbr.sh"
+    _bbr_url="https://${_bbr_host}${_bbr_path}"
+    if wget --no-check-certificate -q -O "$_bbr_dir/bbr.sh" "$_bbr_url" 2>/dev/null \
+       && [ -s "$_bbr_dir/bbr.sh" ]; then
+      chmod +x "$_bbr_dir/bbr.sh"
+      info "正在运行 bbr.sh，按它的提示操作（完成后可能需要重启）"
+      ( cd "$_bbr_dir" && sh ./bbr.sh )
+    else
+      warn "bbr.sh 下载失败，BBR 没开成，不影响节点使用；以后可手动下载 bbr.sh 运行"
+    fi
+    rm -rf "$_bbr_dir"
+  fi
+fi
+
 # ---------- 15. 显示结果 ----------
 printf "\n"
 cat /etc/xray-node/node.txt
