@@ -18,7 +18,7 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/xra
 1. **IPv4 还是 IPv6**（默认 IPv4）
 2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks / AnyTLS+REALITY / Hysteria2 / TUIC
 3. **端口**（默认随机一个空闲端口）
-4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：10 个实测备选，默认 www.samsung.com（完整清单见下方"REALITY 伪装域名推荐"）
+4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：11 个备选，默认 www.samsung.com（完整清单见下方"REALITY 伪装域名推荐"）
 
 UUID 和密码全部随机生成，不用你操心。
 
@@ -71,5 +71,3 @@ xiezai
 9. `www.lovelive-anime.jp` —— 日本动画官网，小厂气质
 10. `academy.nvidia.com`
 11. `lol.secure.dyn.riotcdn.net` —— 游戏补丁 CDN
-12. `s0.awsstatic.com`
-13. `www.amd.com` —— 有 3% 干扰率，只当备胎
