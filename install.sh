@@ -28,7 +28,10 @@ ask() { # ask "提示文字" "默认值" 变量名
   fi
   read -r _a
   if [ -z "$_a" ]; then _a="$_d"; fi
-  eval "$_v=\$_a"
+  # 不能直接 eval "$_v=$_a"：输入里的 $(...) 或反引号会被执行。
+  # 用单引号包裹并转义输入里的单引号，保证原样赋值、什么都不执行。
+  _a_esc=$(printf "%s" "$_a" | sed "s/'/'\\\\''/g")
+  eval "$_v='$_a_esc'"
 }
 
 rand_hex() { # rand_hex 字节数 -> 十六进制串
@@ -68,9 +71,21 @@ get_ip() { # get_ip 4|6 -> 打印公网 IP，失败返回非零
   if [ "$_v" = "6" ]; then _f="-6"; else _f="-4"; fi
   for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
     _ip=$(curl -fsSL --max-time 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
-    if [ -n "$_ip" ]; then printf "%s" "$_ip"; return 0; fi
+    # 检测网站偶尔返回非 IP 的垃圾（比如限流提示页）：长得不像 IP 就换下一个
+    if [ -n "$_ip" ] && _valid_ip "$_v" "$_ip"; then
+      printf "%s" "$_ip"; return 0
+    fi
   done
   return 1
+}
+
+_valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
+  if [ "$1" = "6" ]; then
+    case "$2" in *:*) return 0 ;; *) return 1 ;; esac
+  else
+    case "$2" in *:*|''|*[!0-9.]*|.*|*.) return 1 ;; esac
+    [ "$(printf "%s" "$2" | tr -cd '.' | wc -c)" -eq 3 ]
+  fi
 }
 
 # gh_api_dl <仓库> <文件名> <输出路径>
@@ -322,6 +337,7 @@ WS_PATH="/$(rand_hex 4)"
 info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
 
 # ---------- 8. 下载内核 ----------
+mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
 case "$(uname -m)" in
   x86_64|amd64) MACH="amd64" ;;
   aarch64|arm64) MACH="arm64" ;;
@@ -666,6 +682,32 @@ esac
 info "配置文件校验通过"
 fi
 
+# ---------- 10b. 换内核重装：先停掉旧内核的服务 ----------
+# 比如上次装的是 vless（xray），这次改装 hy2（sing-box）：旧的 xray 服务
+# 不停掉会一直占着旧端口在后台跑，造成两个节点同时在线的混乱。
+if [ -f /etc/xray-node/core ]; then
+  _old_core=$(cat /etc/xray-node/core 2>/dev/null | tr -d ' \r\n')
+  case "$_old_core" in
+    xray|sing-box) ;;
+    *) _old_core="" ;;  # 文件内容不对就不管，当没记录处理
+  esac
+  if [ -n "$_old_core" ] && [ "$_old_core" != "$CORE" ]; then
+    info "上次用的是 $_old_core，这次换成 $CORE，先停掉旧服务…"
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl stop "$_old_core" >/dev/null 2>&1
+      systemctl disable "$_old_core" >/dev/null 2>&1
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+      rc-service "$_old_core" stop >/dev/null 2>&1
+      rc-update del "$_old_core" default >/dev/null 2>&1
+    fi
+    # 兜底：既没 systemd 也没 OpenRC 的机器（比如 docker 里），按我们自己的
+    # 配置文件路径精确杀掉旧进程，不碰用户自己跑的其它同名进程
+    pkill -f "/usr/local/etc/${_old_core}/config.json" >/dev/null 2>&1
+    sleep 1
+  fi
+fi
+
 # ---------- 11. 开机自启 ----------
 if [ "$CORE" = "xray" ]; then
   SVC="xray"; SVC_BIN="$XRAY_BIN"; SVC_ARGS="-config /usr/local/etc/xray/config.json"
@@ -748,25 +790,57 @@ if wait_for_port "$PORT" "$_SVC_PROTO" 15; then
 else
   die "服务没能监听端口 $PORT：节点装坏了。请先运行 rc-service $SVC status（或 systemctl status $SVC）看原因，修好再重跑脚本"
 fi
+# 记下这次用的内核：下次重装如果换了内核，10b 会先停掉旧的
+echo "$CORE" > /etc/xray-node/core 2>/dev/null
 
 # ---------- 12. 放行端口 ----------
 step "[网络] 放行端口…"
 _FW_PROTO="tcp"
 case "$PROTO" in hy2|tuic) _FW_PROTO="udp" ;; esac
-# 记下来给 xiezai 用：卸载时把加过的规则原样删掉
 mkdir -p /etc/xray-node 2>/dev/null
-echo "$PORT $_FW_PROTO" > /etc/xray-node/fw_info
+# 重装换了端口：先把旧端口的放行规则清掉（只清上次我们亲手加的，
+# 用户自己手写的规则不动），避免旧端口一直敞着
+if [ -f /etc/xray-node/fw_info ]; then
+  read -r _oport _oproto _oufw _ofwl _oipt < /etc/xray-node/fw_info
+  if [ -n "$_oport" ] && [ -n "$_oproto" ] && { [ "$_oport" != "$PORT" ] || [ "$_oproto" != "$_FW_PROTO" ]; }; then
+    [ "$_oufw" = "1" ] && command -v ufw >/dev/null 2>&1 \
+      && ufw delete allow "$_oport"/"$_oproto" >/dev/null 2>&1
+    if [ "$_ofwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_oport"/"$_oproto" >/dev/null 2>&1
+      firewall-cmd --reload >/dev/null 2>&1
+    fi
+    [ "$_oipt" = "1" ] && command -v iptables >/dev/null 2>&1 \
+      && iptables -D INPUT -p "$_oproto" --dport "$_oport" -j ACCEPT >/dev/null 2>&1
+    info "已清理旧端口 $_oport/$_oproto 的放行规则"
+  fi
+fi
+# 记下来给 xiezai 用：只删我们亲手加的规则，用户机器上本来就有的不碰
+_UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow "$PORT"/"$_FW_PROTO" >/dev/null 2>&1 && info "ufw 已放行 $PORT/$_FW_PROTO"
+  if ufw status 2>/dev/null | grep -qE "^${PORT}/${_FW_PROTO}[[:space:]]"; then
+    : # 这条规则本来就存在（用户自己加的），我们不动它
+  elif ufw allow "$PORT"/"$_FW_PROTO" >/dev/null 2>&1; then
+    _UFW_ADDED=1
+    info "ufw 已放行 $PORT/$_FW_PROTO"
+  fi
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
-  firewall-cmd --permanent --add-port="$PORT"/"$_FW_PROTO" >/dev/null 2>&1
-  firewall-cmd --reload >/dev/null 2>&1 && info "firewalld 已放行 $PORT/$_FW_PROTO"
+  if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${PORT}/${_FW_PROTO}"; then
+    : # 这条规则本来就存在（用户自己加的），我们不动它
+  elif firewall-cmd --permanent --add-port="$PORT"/"$_FW_PROTO" >/dev/null 2>&1 \
+    && firewall-cmd --reload >/dev/null 2>&1; then
+    _FWL_ADDED=1
+    info "firewalld 已放行 $PORT/$_FW_PROTO"
+  fi
 fi
 if command -v iptables >/dev/null 2>&1; then
-  iptables -C INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1 \
-    || iptables -I INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1
+  if iptables -C INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+    : # 这条规则本来就存在（用户自己加的），我们不动它
+  elif iptables -I INPUT -p "$_FW_PROTO" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+    _IPT_ADDED=1
+  fi
 fi
+echo "$PORT $_FW_PROTO $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" > /etc/xray-node/fw_info
 warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
 # ---------- 13. 生成节点链接 ----------
@@ -864,25 +938,31 @@ done
 [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
 pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
 pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
-pkill -x xray >/dev/null 2>&1
-pkill -x sing-box >/dev/null 2>&1
 sleep 1
 
-# 撤销安装时加的防火墙规则（只删我们加过的那条）
+# 撤销安装时加的防火墙规则（只删我们亲手加过的，用户自己手写的不碰）
 if [ -f /etc/xray-node/fw_info ]; then
-  read -r _fport _fproto < /etc/xray-node/fw_info
+  read -r _fport _fproto _fufw _ffwl _fipt < /etc/xray-node/fw_info
   if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
-    if command -v ufw >/dev/null 2>&1; then
+    # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
+    _oldfmt=0
+    if [ -z "$_fufw$_ffwl$_fipt" ]; then _fufw=1; _ffwl=1; _fipt=1; _oldfmt=1; fi
+    if [ "$_fufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
       ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1
     fi
-    if command -v firewall-cmd >/dev/null 2>&1; then
+    if [ "$_ffwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
       firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
       firewall-cmd --reload >/dev/null 2>&1
     fi
-    if command -v iptables >/dev/null 2>&1; then
-      while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+    if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
+      if [ "$_oldfmt" = "1" ]; then
+        while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+        done
+      else
+        # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
         iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
-      done
+      fi
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
   fi
@@ -955,7 +1035,10 @@ if [ "$_BBR_ON" = "0" ]; then
     else
       warn "bbr.sh 下载失败，BBR 没开成，不影响节点使用；以后可手动下载 bbr.sh 运行"
     fi
-    rm -rf "$_bbr_dir"
+    # _bbr_dir 可能是 mktemp 建的临时目录，也可能是 mktemp 失败时回退的 /tmp：
+    # 只删我们下载的那个文件；回退到 /tmp 时绝不能 rm -rf 整个目录
+    rm -f "$_bbr_dir/bbr.sh"
+    [ "$_bbr_dir" != "/tmp" ] && rm -rf "$_bbr_dir"
   fi
 fi
 
