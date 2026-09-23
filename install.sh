@@ -823,7 +823,32 @@ _apt_do() {
   _an=0
   while [ "$_an" -lt 10 ]; do
     printf "%s…\n" "$_ad"
-    if timeout "$_ato" apt-get "$@" >"$_dep_log" 2>&1; then return 0; fi
+    # DPkg::Lock::Timeout=120：锁被系统自动更新占着时，120 秒拿不到就快速失败，
+    # 走下面的排队重试。不设的话老版本 apt 会静默等锁（-qq 还把等待提示吞了），
+    # 单次尝试卡满整个超时、重试逻辑还检测不到——看着就像"卡住不动"。
+    # 心跳：apt 的输出被吞掉了，单次尝试最长 $_ato 秒；每 30 秒报一次"还在装"，
+    # 免得小白以为卡死。
+    ( timeout "$_ato" apt-get -o DPkg::Lock::Timeout=120 "$@" >"$_dep_log" 2>&1
+      echo "$?" >"$_dep_log.rc" ) &
+    _apt_pid=$!
+    _apt_waited=0
+    while kill -0 "$_apt_pid" 2>/dev/null; do
+      sleep 2
+      _apt_waited=$((_apt_waited + 2))
+      if kill -0 "$_apt_pid" 2>/dev/null && [ "$((_apt_waited % 30))" = "0" ]; then
+        printf "还在安装中，已等待 %s 秒（机器慢时会久一点，正常）…\n" "$_apt_waited"
+      fi
+    done
+    wait "$_apt_pid" 2>/dev/null
+    _apt_rc=$(cat "$_dep_log.rc" 2>/dev/null); rm -f "$_dep_log.rc"
+    if [ "$_apt_rc" = "0" ]; then return 0; fi
+    # 上一次 apt 可能被超时杀在 dpkg 中间：先修复 dpkg 状态再重试，
+    # 否则后面所有 apt 都会报"dpkg was interrupted"直接失败。
+    if grep -qi "dpkg was interrupted" "$_dep_log" 2>/dev/null; then
+      printf "检测到上次安装被打断，正在修复…\n"
+      timeout 120 dpkg --configure -a >"$_dep_log" 2>&1
+      continue
+    fi
     if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
       _an=$((_an + 1))
       printf "系统自动更新正占着软件源，20 秒后重试（%s/10）…\n" "$_an"
