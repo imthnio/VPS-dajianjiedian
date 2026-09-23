@@ -9,7 +9,7 @@
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
 # 装完之后，想看所有节点随时输入：  jiedian
-# 输入 xiezai 进入节点管理：查看节点、删除单个节点，或全部卸载
+# 输入 shanjiedian 进入节点管理：查看节点、删除单个节点，或全部卸载
 # ============================================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -157,7 +157,7 @@ wait_for_port() {
   return 1
 }
 
-write_helper_cmds() { # 写入/刷新 jiedian 和 xiezai 两个命令（安装和更新都会调）
+write_helper_cmds() { # 写入/刷新 jiedian 和 shanjiedian 两个命令（安装和更新都会调）
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
 # 输入 jiedian，显示所有已安装节点的信息和链接
@@ -174,9 +174,9 @@ fi
 exit 0
 JDEOF
 chmod +x /usr/local/bin/jiedian
-cat > /usr/local/bin/xiezai <<'XZEOF'
+cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
-# 输入 xiezai，进入节点管理：查看节点、删除单个节点，或全部卸载
+# 输入 shanjiedian，进入节点管理：查看节点、删除单个节点，或全部卸载
 NODES_DIR=/etc/xray-node/nodes
 
 # _node_info <节点id>：从 node.txt 里读出"协议，端口"
@@ -292,7 +292,7 @@ _uninstall_all() {
   rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
   rm -f /var/log/xray.log /var/log/sing-box.log /var/log/xray-node-*.log
   rm -f /usr/local/bin/jiedian
-  rm -f /usr/local/bin/xiezai
+  rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
 }
 
@@ -333,7 +333,9 @@ case "$_sel" in
     ;;
 esac
 XZEOF
-chmod +x /usr/local/bin/xiezai
+chmod +x /usr/local/bin/shanjiedian
+# 旧版的 xiezai 是"一键全删"，改名后把它删掉，免得留着误导人
+rm -f /usr/local/bin/xiezai
 }
 
 _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机自启服务并启动（systemd 模板实例 / OpenRC 独立脚本 / 兜底后台）
@@ -655,13 +657,13 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     if [ -n "$_m_port" ] && wait_for_port "$_m_port" "$_m_proto" 15; then
       info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
     else
-      warn "老节点服务可能没起来：输入 jiedian 查看，或输入 xiezai 进节点管理检查"
+      warn "老节点服务可能没起来：输入 jiedian 查看，或输入 shanjiedian 进节点管理检查"
     fi
   fi
 fi
 
 # 已经装过节点：更新（默认）/ 添加新节点 / 节点管理 / 取消
-# 注意：选 2 添加新节点不会动旧节点，旧节点继续用；想删节点选 3 或直接输 xiezai
+# 注意：选 2 添加新节点不会动旧节点，旧节点继续用；想删节点选 3 或直接输 shanjiedian
 UPDATE_MODE=0
 FORCE_DL=0
 _NODE_COUNT=0
@@ -679,7 +681,7 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
   ask "请选择" "1" _um
   case "$_um" in
     2) info "进入添加新节点流程（旧节点不受影响）" ;;
-    3) write_helper_cmds; sh /usr/local/bin/xiezai; exit 0 ;;
+    3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
     *) UPDATE_MODE=1 ;;
   esac
@@ -857,9 +859,9 @@ if [ "$UPDATE_MODE" = "1" ]; then
       info "$_ucore 升级完成"
       ) || _u_any_fail=1
     done
-    # 刷新 jiedian / xiezai（脚本可能修过它们）
+    # 刷新 jiedian / shanjiedian（脚本可能修过它们）
     write_helper_cmds
-    info "jiedian / xiezai 命令已同步为最新版"
+    info "jiedian / shanjiedian 命令已同步为最新版"
     printf "\n"
     sh /usr/local/bin/jiedian
     if [ "$_u_any_fail" = "1" ]; then
@@ -1317,7 +1319,7 @@ case "$PROTO" in
   hy2|tuic) _FW_PROTOS="udp" ;;
   ss) _FW_PROTOS="tcp udp" ;;
 esac
-# 逐个协议放行，并记到该节点的 fw_info 里给 xiezai 用：
+# 逐个协议放行，并记到该节点的 fw_info 里给 shanjiedian 用：
 # 只删我们亲手加的规则，用户机器上本来就有的不碰。
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
@@ -1415,7 +1417,7 @@ esac
 
 write_helper_cmds
 info "已安装 jiedian 命令：以后输入 jiedian 就能看所有节点"
-info "已安装 xiezai 命令：输入 xiezai 可管理节点（查看/删除）"
+info "已安装 shanjiedian 命令：输入 shanjiedian 可管理节点（查看/删除）"
 
 # ---------- 14b. BBR 加速：检测，没开就自动开 ----------
 step "检查 BBR 加速…"
@@ -1472,4 +1474,4 @@ fi
 printf "\n节点 %s 安装完成！\n" "$NODE_ID"
 cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
-printf "以后看所有节点输入 jiedian，管理节点（查看/删除）输入 xiezai。\n"
+printf "以后看所有节点输入 jiedian，管理节点（查看/删除）输入 shanjiedian。\n"
