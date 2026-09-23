@@ -173,6 +173,42 @@ wait_for_port() {
   return 1
 }
 
+_save_fw() { # _save_fw：把刚加的 iptables 规则存盘，重启后还在
+  # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
+  # 尽力而为：实在存不了就明确告诉用户，不拦主流程。
+  if [ -f /etc/alpine-release ] && [ -f /etc/init.d/iptables ]; then
+    # Alpine：iptables 服务负责存盘和开机恢复
+    rc-update add iptables default >/dev/null 2>&1
+    if /etc/init.d/iptables save >/dev/null 2>&1; then
+      info "iptables 规则已存盘（重启后仍有效）"
+    fi
+    return 0
+  fi
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    if netfilter-persistent save >/dev/null 2>&1; then
+      info "iptables 规则已存盘（重启后仍有效）"
+    fi
+    return 0
+  fi
+  if command -v iptables-save >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    # Debian/Ubuntu：装 iptables-persistent 来存盘（_apt_do 会处理 dpkg 锁占用）
+    # DEBIAN_FRONTEND 必须设：iptables-persistent 装时会弹 debconf 提问（是否保存当前规则），
+    # 不设的话在小白的终端上会突然蹦出个看不懂的提问，把人卡住
+    export DEBIAN_FRONTEND=noninteractive
+    if _apt_do "正在安装 iptables-persistent（让防火墙规则重启后还在）" 300 -- install -y -qq iptables-persistent; then
+      if command -v netfilter-persistent >/dev/null 2>&1 \
+        && netfilter-persistent save >/dev/null 2>&1; then
+        info "iptables 规则已存盘（重启后仍有效）"
+      fi
+    else
+      warn "iptables-persistent 没装上：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
+    fi
+    unset DEBIAN_FRONTEND
+    return 0
+  fi
+  warn "这台机器只有纯 iptables 且无法自动存盘：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
+}
+
 write_helper_cmds() { # 写入/刷新 jiedian 和 shanjiedian 两个命令（安装和更新都会调）
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
@@ -202,9 +238,20 @@ _node_info() {
   printf "%s，端口 %s" "$_ni_proto" "$_ni_port"
 }
 
+# _fw_save：iptables 规则改动后存盘（删规则后也要存，否则重启后删掉的规则又回来了）
+# 安装时如果装过 iptables-persistent，这里 netfilter-persistent 肯定在；Alpine 走自带服务
+_fw_save() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1
+  elif [ -f /etc/alpine-release ] && [ -f /etc/init.d/iptables ]; then
+    /etc/init.d/iptables save >/dev/null 2>&1
+  fi
+}
+
 # _del_fw_rules <fw_info路径>：撤销该节点我们亲手加的防火墙规则（用户手写的不碰）
 _del_fw_rules() {
   [ -f "$1" ] || return 0
+  _fipt_touched=0
   while read -r _fport _fproto _fufw _ffwl _fipt; do
     [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
     # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
@@ -218,6 +265,7 @@ _del_fw_rules() {
       firewall-cmd --reload >/dev/null 2>&1
     fi
     if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
+      _fipt_touched=1
       if [ "$_oldfmt" = "1" ]; then
         while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
           iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
@@ -229,6 +277,8 @@ _del_fw_rules() {
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
   done < "$1"
+  # iptables 删了规则也要存盘，不然重启后删掉的规则又回来了
+  [ "$_fipt_touched" = "1" ] && _fw_save
 }
 
 # _stop_remove_svc <节点id>：停掉并删除该节点的服务，不碰其它节点
@@ -291,6 +341,10 @@ _uninstall_all() {
       rm -f "/etc/init.d/${_s}"
     fi
   done
+  [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
+  # _svc_install 建的 systemd 模板（xray-node@.service / singbox-node@.service）
+  # 不是按节点实例建的，上面的循环删不掉，不清会残留在系统里
+  rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
   pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
@@ -757,38 +811,40 @@ NODE_DIR=/etc/xray-node/nodes/$NODE_ID
 
 # ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
 step "[准备] 检查系统工具…"
+_dep_log="/tmp/xray-dep-apt.log"
+# _apt_do <描述> <单次超时秒> -- <apt-get 参数…>
+# 刚开机的机器常被系统自动更新占着 dpkg 锁：不等锁就硬装会白白超时失败。
+# 这里检测到锁就等 20 秒重试并报进度，而不是静默卡死。
+# 注意：这个函数定义在 if 外面——后面存 iptables 规则时也要用它装 iptables-persistent，
+# 放里面会导致"依赖本来就齐"时函数根本没定义、调用直接报错。
+_apt_do() {
+  _ad="$1"; _ato="$2"; shift 2
+  [ "$1" = "--" ] && shift
+  _an=0
+  while [ "$_an" -lt 10 ]; do
+    printf "%s…\n" "$_ad"
+    if timeout "$_ato" apt-get "$@" >"$_dep_log" 2>&1; then return 0; fi
+    if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
+      _an=$((_an + 1))
+      printf "系统自动更新正占着软件源，20 秒后重试（%s/10）…\n" "$_an"
+      sleep 20
+    else
+      return 1
+    fi
+  done
+  return 1
+}
+# _dep_fail：装失败时把吞掉的报错吐出来，而不是只留一句"装不上"
+_dep_fail() {
+  warn "这一步没成功，最后看到的报错："
+  tail -n 5 "$_dep_log" 2>/dev/null | sed 's/^/  /'
+}
 _need_install=0
 command -v curl >/dev/null 2>&1 || _need_install=1
 command -v unzip >/dev/null 2>&1 || _need_install=1
 if [ "$_need_install" -eq 1 ]; then
   printf "缺少 curl / unzip，正在自动安装（每一步都有进度提示，不会卡住不动）…\n"
   export DEBIAN_FRONTEND=noninteractive
-  _dep_log="/tmp/xray-dep-apt.log"
-  # _apt_do <描述> <单次超时秒> -- <apt-get 参数…>
-  # 刚开机的机器常被系统自动更新占着 dpkg 锁：不等锁就硬装会白白超时失败。
-  # 这里检测到锁就等 20 秒重试并报进度，而不是静默卡死。
-  _apt_do() {
-    _ad="$1"; _ato="$2"; shift 2
-    [ "$1" = "--" ] && shift
-    _an=0
-    while [ "$_an" -lt 10 ]; do
-      printf "%s…\n" "$_ad"
-      if timeout "$_ato" apt-get "$@" >"$_dep_log" 2>&1; then return 0; fi
-      if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
-        _an=$((_an + 1))
-        printf "系统自动更新正占着软件源，20 秒后重试（%s/10）…\n" "$_an"
-        sleep 20
-      else
-        return 1
-      fi
-    done
-    return 1
-  }
-  # _dep_fail：装失败时把吞掉的报错吐出来，而不是只留一句"装不上"
-  _dep_fail() {
-    warn "这一步没成功，最后看到的报错："
-    tail -n 5 "$_dep_log" 2>/dev/null | sed 's/^/  /'
-  }
   if command -v apt-get >/dev/null 2>&1; then
     _apt_do "正在更新软件源" 60 -- update -qq \
       || warn "软件源更新失败，用已有索引继续装（多数情况不影响）"
@@ -1360,10 +1416,20 @@ _svc_install "$NODE_ID"
 
 # ---------- 11b. 硬检查：端口必须真的在监听 ----------
 # 服务显示"已启动"不代表真在工作，端口没监听节点就是坏的，直接报错不忽悠
-_SVC_PROTO="tcp"
-case "$PROTO" in hy2|tuic) _SVC_PROTO="udp" ;; esac
-if wait_for_port "$PORT" "$_SVC_PROTO" 15; then
-  info "端口 $PORT/$_SVC_PROTO 已在监听，服务真正跑起来了"
+_SVC_PROTOS="tcp"
+case "$PROTO" in
+  hy2|tuic) _SVC_PROTOS="udp" ;;
+  ss)       _SVC_PROTOS="tcp udp" ;;  # ss 配了 tcp,udp：只查 TCP 的话，UDP 没起来也发现不了
+esac
+_svc_listen_ok=1
+for _sp in $_SVC_PROTOS; do
+  if ! wait_for_port "$PORT" "$_sp" 15; then
+    warn "端口 $PORT/$_sp 没在监听"
+    _svc_listen_ok=0
+  fi
+done
+if [ "$_svc_listen_ok" = "1" ]; then
+  info "端口 $PORT 已在监听，服务真正跑起来了"
 else
   die "服务没能监听端口 $PORT：节点装坏了。请先运行 systemctl status 'xray-node@${NODE_ID}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
 fi
@@ -1381,6 +1447,7 @@ esac
 # 只删我们亲手加的规则，用户机器上本来就有的不碰。
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
+_FW_IPT_TOUCHED=0
 for _np in $_FW_PROTOS; do
   _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
   if command -v ufw >/dev/null 2>&1; then
@@ -1405,10 +1472,16 @@ for _np in $_FW_PROTOS; do
       : # 这条规则本来就存在（用户自己加的），我们不动它
     elif iptables -I INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
       _IPT_ADDED=1
+      _FW_IPT_TOUCHED=1
     fi
   fi
   echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" >> "$NODE_DIR/fw_info"
 done
+# 纯 iptables 的规则默认重启就丢：刚才亲手加了规则就存盘，
+# 否则机器一重启端口又被墙、节点连不上（ufw/firewalld 自己会持久化，不用管）
+if [ "$_FW_IPT_TOUCHED" = "1" ]; then
+  _save_fw
+fi
 warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
 # ---------- 13. 生成节点链接 ----------
