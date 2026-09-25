@@ -10,15 +10,18 @@
 # 1. SSH 连上你的服务器（root 用户）
 # 2. 粘贴下面这一行，回车：
 curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh && sh /tmp/xray-install.sh
-# 3. 按提示回答 4 个问题，装完自动显示节点链接
+# 3. 按提示回答问题，装完自动显示节点链接
 ```
 
-4 个问题分别是：
+安装时会询问：
 
 1. **IPv4 还是 IPv6**（默认 IPv4）
 2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks / AnyTLS+REALITY / Hysteria2 / TUIC
 3. **端口**（默认随机一个空闲端口）
-4. **REALITY 伪装域名**（只有选 REALITY 协议才问）：11 个备选，默认 www.samsung.com
+4. **公网映射端口**（普通 VPS 直接回车；NAT VPS 填服务商分配、映射到上一步端口的公网端口）
+5. **REALITY 伪装域名**（只有选 REALITY 协议才问）：11 个备选，默认 www.samsung.com
+
+NAT VPS 要先在服务商面板确认端口映射。脚本只能检查本机端口在监听，无法替服务商创建映射或验证公网入口。Hysteria2 和 TUIC 需要 UDP 映射，其余协议需要 TCP；Shadowsocks 需要 TCP 和 UDP。
 
 UUID 和密码全部随机生成，不用你操心。
 
@@ -36,7 +39,7 @@ jiedian
 
 节点装好之后，想升级内核或修复脚本 bug，不用重装：**直接重跑上面那条一键命令**，看到菜单选 `1`（默认，直接回车就行）：
 
-- 只把 Xray / sing-box 内核升到最新版
+- 只把脚本自己安装的 Xray / sing-box 内核升到最新版；机器原有的内核会跳过，以免影响其他服务
 - 节点配置、端口、密码、链接**全部不变**，照常用
 - 内核已经是最新时，会顺手把 `jiedian` / `shanjiedian` 两个命令同步成最新版
 - 升级后自动检查每个节点的端口真的在监听；新内核万一起不来会自动回滚到旧版，节点不受影响

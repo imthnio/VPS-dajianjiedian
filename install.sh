@@ -38,7 +38,20 @@ rand_hex() { # rand_hex 字节数 -> 十六进制串
   od -An -tx1 -N"$1" /dev/urandom 2>/dev/null | tr -d ' \n'
 }
 
-rand_port() { # 随机一个空闲端口 20000-59999
+port_in_use() { # port_in_use <端口> <tcp|udp>
+  _pi_port="$1"; _pi_proto="$2"
+  if command -v ss >/dev/null 2>&1; then
+    if [ "$_pi_proto" = "udp" ]; then _pi_list=$(ss -uln 2>/dev/null); else _pi_list=$(ss -ltn 2>/dev/null); fi
+  elif command -v netstat >/dev/null 2>&1; then
+    if [ "$_pi_proto" = "udp" ]; then _pi_list=$(netstat -uln 2>/dev/null); else _pi_list=$(netstat -ltn 2>/dev/null); fi
+  else
+    return 2
+  fi
+  printf '%s\n' "$_pi_list" | grep -Eq ":${_pi_port}[[:space:]]"
+}
+
+rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
+  _rp_proto="$1"
   _try=0
   while [ "$_try" -lt 50 ]; do
     _try=$((_try + 1))
@@ -51,14 +64,15 @@ rand_port() { # 随机一个空闲端口 20000-59999
       _p=$(awk 'BEGIN{srand(); print int(20000+rand()*40000)}')
     fi
     _used=0
-    if command -v ss >/dev/null 2>&1; then
-      ss -ltn 2>/dev/null | grep -q ":${_p} " && _used=1
-    elif command -v netstat >/dev/null 2>&1; then
-      netstat -ltn 2>/dev/null | grep -q ":${_p} " && _used=1
-    fi
+    case "$_rp_proto" in
+      tcp|both) port_in_use "$_p" tcp && _used=1 ;;
+    esac
+    case "$_rp_proto" in
+      udp|both) port_in_use "$_p" udp && _used=1 ;;
+    esac
     if [ "$_used" -eq 0 ]; then printf "%s" "$_p"; return 0; fi
   done
-  printf "%s" "$_p"
+  return 1
 }
 
 gen_uuid() {
@@ -173,13 +187,15 @@ wait_for_port() {
   return 1
 }
 
-_save_fw() { # _save_fw：把刚加的 iptables 规则存盘，重启后还在
+_save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后还在
   # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
   # 尽力而为：实在存不了就明确告诉用户，不拦主流程。
-  if [ -f /etc/alpine-release ] && [ -f /etc/init.d/iptables ]; then
-    # Alpine：iptables 服务负责存盘和开机恢复
-    rc-update add iptables default >/dev/null 2>&1
-    if /etc/init.d/iptables save >/dev/null 2>&1; then
+  if [ "$1" = "6" ]; then _fw_svc=ip6tables; _fw_save_bin=ip6tables-save
+  else _fw_svc=iptables; _fw_save_bin=iptables-save; fi
+  if [ -f /etc/alpine-release ] && [ -f "/etc/init.d/$_fw_svc" ]; then
+    # Alpine：IPv4 和 IPv6 分别由对应的 OpenRC 服务恢复
+    rc-update add "$_fw_svc" default >/dev/null 2>&1
+    if "/etc/init.d/$_fw_svc" save >/dev/null 2>&1; then
       info "iptables 规则已存盘（重启后仍有效）"
     fi
     return 0
@@ -190,7 +206,7 @@ _save_fw() { # _save_fw：把刚加的 iptables 规则存盘，重启后还在
     fi
     return 0
   fi
-  if command -v iptables-save >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  if command -v "$_fw_save_bin" >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     # Debian/Ubuntu：装 iptables-persistent 来存盘（_apt_do 会处理 dpkg 锁占用）
     # DEBIAN_FRONTEND 必须设：iptables-persistent 装时会弹 debconf 提问（是否保存当前规则），
     # 不设的话在小白的终端上会突然蹦出个看不懂的提问，把人卡住
@@ -225,7 +241,7 @@ if [ "$_n" = "0" ]; then
 fi
 exit 0
 JDEOF
-chmod +x /usr/local/bin/jiedian
+chmod 700 /usr/local/bin/jiedian
 cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
 # 输入 shanjiedian，进入节点管理：查看节点、删除单个节点，或全部卸载
@@ -243,8 +259,9 @@ _node_info() {
 _fw_save() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1
-  elif [ -f /etc/alpine-release ] && [ -f /etc/init.d/iptables ]; then
-    /etc/init.d/iptables save >/dev/null 2>&1
+  elif [ -f /etc/alpine-release ]; then
+    if [ "$1" = "6" ]; then _fs_svc=ip6tables; else _fs_svc=iptables; fi
+    [ -f "/etc/init.d/$_fs_svc" ] && "/etc/init.d/$_fs_svc" save >/dev/null 2>&1
   fi
 }
 
@@ -252,7 +269,7 @@ _fw_save() {
 _del_fw_rules() {
   [ -f "$1" ] || return 0
   _fipt_touched=0
-  while read -r _fport _fproto _fufw _ffwl _fipt; do
+  while read -r _fport _fproto _fufw _ffwl _fipt _ffamily; do
     [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
     # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
     _oldfmt=0
@@ -264,21 +281,23 @@ _del_fw_rules() {
       firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
       firewall-cmd --reload >/dev/null 2>&1
     fi
-    if [ "$_fipt" = "1" ] && command -v iptables >/dev/null 2>&1; then
+    if [ "$_ffamily" = "6" ]; then _fipbin=ip6tables; else _fipbin=iptables; fi
+    if [ "$_fipt" = "1" ] && command -v "$_fipbin" >/dev/null 2>&1; then
       _fipt_touched=1
+      _fipt_family="${_ffamily:-4}"
       if [ "$_oldfmt" = "1" ]; then
-        while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
-          iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
+        while "$_fipbin" -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+          "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
         done
       else
         # 新格式：这条规则是我们加的，只删一条；用户后来手加的相同规则不动
-        iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+        "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
       fi
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
   done < "$1"
   # iptables 删了规则也要存盘，不然重启后删掉的规则又回来了
-  [ "$_fipt_touched" = "1" ] && _fw_save
+  [ "$_fipt_touched" = "1" ] && _fw_save "$_fipt_family"
 }
 
 # _stop_remove_svc <节点id>：停掉并删除该节点的服务，不碰其它节点
@@ -328,27 +347,10 @@ _uninstall_all() {
     [ -d "$_d" ] || continue
     _del_node "$(basename "$_d")" skip_confirm
   done
-  # 兼容老版本：停掉并删掉旧的单服务名残留（xray / sing-box）
-  for _s in xray sing-box; do
-    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-      systemctl stop "$_s" >/dev/null 2>&1
-      systemctl disable "$_s" >/dev/null 2>&1
-      rm -f "/etc/systemd/system/${_s}.service"
-    fi
-    if command -v rc-service >/dev/null 2>&1; then
-      rc-service "$_s" stop >/dev/null 2>&1
-      rc-update del "$_s" default >/dev/null 2>&1
-      rm -f "/etc/init.d/${_s}"
-    fi
-  done
-  [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   # _svc_install 建的 systemd 模板（xray-node@.service / singbox-node@.service）
   # 不是按节点实例建的，上面的循环删不掉，不清会残留在系统里
   rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
-  pkill -f "xray -config /usr/local/etc/xray/config.json" >/dev/null 2>&1
-  pkill -f "sing-box run -c /usr/local/etc/sing-box/config.json" >/dev/null 2>&1
-  sleep 1
   # 只删脚本自己下载安装的内核（our_bins 里记着），用户机器上本来就有的不碰
   # 注意：必须在删 /etc/xray-node 之前读
   if [ -f /etc/xray-node/our_bins ]; then
@@ -359,8 +361,9 @@ _uninstall_all() {
     done < /etc/xray-node/our_bins
   fi
   # 删掉配置、节点、日志
-  rm -rf /usr/local/etc/xray /usr/local/etc/sing-box /etc/xray-node
-  rm -f /var/log/xray.log /var/log/sing-box.log /var/log/xray-node-*.log
+  rm -rf /etc/xray-node
+  rm -f /var/log/xray-node-*.log
+  rm -f /etc/sysctl.d/99-xray-node-bbr.conf
   rm -f /usr/local/bin/jiedian
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
@@ -403,7 +406,7 @@ case "$_sel" in
     ;;
 esac
 XZEOF
-chmod +x /usr/local/bin/shanjiedian
+chmod 700 /usr/local/bin/shanjiedian
 # 旧版的 xiezai 是"一键全删"，改名后把它删掉，免得留着误导人
 rm -f /usr/local/bin/xiezai
 }
@@ -705,6 +708,17 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
 if [ "$(id -u)" -ne 0 ]; then
   die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
 fi
+umask 077
+# 旧版本可能把节点链接和密码写成全机可读；升级时也一并收紧。
+for _sec_dir in /etc/xray-node /etc/xray-node/nodes /etc/xray-node/nodes/*/; do
+  [ -d "$_sec_dir" ] && chmod 700 "$_sec_dir"
+done
+for _sec_file in /etc/xray-node/nodes/*/config.json /etc/xray-node/nodes/*/node.txt \
+  /etc/xray-node/nodes/*/fw_info /etc/xray-node/nodes/*/core \
+  /etc/xray-node/nodes/*/key.pem /etc/xray-node/nodes/*/cert.pem \
+  /etc/xray-node/our_bins /etc/xray-node/node.txt /etc/xray-node/core /etc/xray-node/fw_info; do
+  [ -f "$_sec_file" ] && chmod 600 "$_sec_file"
+done
 
 printf "\n${BOLD}==============================================${NC}\n"
 printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
@@ -759,6 +773,7 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     mv -f /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt
     [ -f /etc/xray-node/fw_info ] && mv -f /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info
     [ -f /etc/xray-node/core ] && mv -f /etc/xray-node/core /etc/xray-node/nodes/1/core
+    chmod 600 /etc/xray-node/nodes/1/config.json /etc/xray-node/nodes/1/node.txt
     rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
     # 按新布局起服务
     _svc_install 1
@@ -925,6 +940,11 @@ if [ "$UPDATE_MODE" = "1" ]; then
       else
         _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
       fi
+      # 首次安装时会复用机器上已有的内核；那可能属于其他服务，不能覆盖升级。
+      if ! grep -qx "$_ucore" /etc/xray-node/our_bins 2>/dev/null; then
+        warn "$_ucore 是机器上原有的内核，跳过升级，避免影响其他服务"
+        exit 0
+      fi
       _u_inst=""
       [ -x "$_u_bin" ] && _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
       _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
@@ -1004,14 +1024,14 @@ if [ "$UPDATE_MODE" = "1" ]; then
     sh /usr/local/bin/jiedian
     if [ "$_u_any_fail" = "1" ]; then
       printf "\n${YELLOW}${BOLD}更新结束：部分内核更新失败（上面有说明），其它节点不受影响。${NC}\n"
+      exit 1
     else
       printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
     fi
     exit 0
   fi
 fi
-# 更新模式上面已经 exit 0 了，到这里的一定是"全新安装/添加新节点"，这时才建目录
-mkdir -p "$NODE_DIR"
+# 更新模式上面已经退出；新节点目录在完成输入和下载后再建，避免失败时留下空编号。
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
 step "[1/4] 节点里填你服务器的哪个公网地址？"
@@ -1076,7 +1096,12 @@ esac
 
 # ---------- 5. 问：端口 ----------
 step "[3/4] 节点用哪个端口？"
-_DEF_PORT=$(rand_port)
+case "$PROTO" in
+  hy2|tuic) _PORT_PROTO=udp ;;
+  ss) _PORT_PROTO=both ;;
+  *) _PORT_PROTO=tcp ;;
+esac
+_DEF_PORT=$(rand_port "$_PORT_PROTO") || die "找不到空闲端口，请检查这台机器的端口占用情况"
 ask "请输入端口（1-65535）" "$_DEF_PORT" PORT
 case "$PORT" in
   ''|*[!0-9]*) warn "端口不是数字，用默认 $_DEF_PORT"; PORT="$_DEF_PORT" ;;
@@ -1084,10 +1109,28 @@ esac
 # 去掉前导 0（比如 08080）：JSON 数字不允许前导 0，留着后面配置文件校验过不了
 PORT=$(printf "%s" "$PORT" | sed 's/^0*//')
 [ -z "$PORT" ] && PORT=0
-if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   warn "端口超出范围，用默认 $_DEF_PORT"; PORT="$_DEF_PORT"
 fi
+case "$_PORT_PROTO" in
+  tcp|both) port_in_use "$PORT" tcp && die "端口 $PORT/TCP 已被其他程序占用，请重跑脚本换一个端口" ;;
+esac
+case "$_PORT_PROTO" in
+  udp|both) port_in_use "$PORT" udp && die "端口 $PORT/UDP 已被其他程序占用，请重跑脚本换一个端口" ;;
+esac
 info "端口：$PORT"
+printf "如果是 NAT VPS，且服务商分配的公网端口与上面的端口不同，请填公网端口；普通 VPS 直接回车。\n"
+ask "公网映射端口" "$PORT" LINK_PORT
+case "$LINK_PORT" in
+  ''|*[!0-9]*) die "公网映射端口必须是 1-65535 的数字" ;;
+esac
+LINK_PORT=$(printf '%s' "$LINK_PORT" | sed 's/^0*//')
+[ -n "$LINK_PORT" ] && [ "${#LINK_PORT}" -le 5 ] \
+  && [ "$LINK_PORT" -ge 1 ] && [ "$LINK_PORT" -le 65535 ] \
+  || die "公网映射端口必须是 1-65535 的数字"
+if [ "$LINK_PORT" != "$PORT" ]; then
+  info "节点链接会使用公网端口 $LINK_PORT；请确认服务商已把它映射到本机 $PORT"
+fi
 
 # ---------- 6. REALITY 伪装域名 ----------
 NEED_REALITY=0
@@ -1221,17 +1264,20 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   fi
 fi
 
+# 前面的输入和下载都成功后才创建新节点目录。
+mkdir -p "$NODE_DIR" || die "无法创建节点目录 $NODE_DIR"
+
 # ---------- 9b. 自签证书（Hysteria2 / TUIC 需要） ----------
 if [ "$PROTO" = "hy2" ] || [ "$PROTO" = "tuic" ]; then
   step "[证书] 生成自签证书…"
-  mkdir -p /usr/local/etc/sing-box
+  umask 077
   # sing-box 自带 tls-keypair 生成自签证书，不需要 openssl；有效期 120 个月
-  "$SB_BIN" generate tls-keypair www.samsung.com --months 120 > /tmp/sb-tls.pem 2>/dev/null \
+  "$SB_BIN" generate tls-keypair www.samsung.com --months 120 > "$NODE_DIR/tls.pem" 2>/dev/null \
     || die "自签证书生成失败"
-  awk '/BEGIN PRIVATE KEY/{p=1} p{print} /END PRIVATE KEY/{p=0}' /tmp/sb-tls.pem > /usr/local/etc/sing-box/key.pem
-  awk '/BEGIN CERTIFICATE/{p=1} p{print} /END CERTIFICATE/{p=0}' /tmp/sb-tls.pem > /usr/local/etc/sing-box/cert.pem
-  rm -f /tmp/sb-tls.pem
-  [ -s /usr/local/etc/sing-box/key.pem ] && [ -s /usr/local/etc/sing-box/cert.pem ] \
+  awk '/BEGIN PRIVATE KEY/{p=1} p{print} /END PRIVATE KEY/{p=0}' "$NODE_DIR/tls.pem" > "$NODE_DIR/key.pem"
+  awk '/BEGIN CERTIFICATE/{p=1} p{print} /END CERTIFICATE/{p=0}' "$NODE_DIR/tls.pem" > "$NODE_DIR/cert.pem"
+  rm -f "$NODE_DIR/tls.pem"
+  [ -s "$NODE_DIR/key.pem" ] && [ -s "$NODE_DIR/cert.pem" ] \
     || die "自签证书生成失败"
   info "自签证书已生成"
 fi
@@ -1351,8 +1397,8 @@ info "配置文件校验通过"
 
 else
 # ---------- sing-box 配置（AnyTLS / Hysteria2 / TUIC） ----------
-mkdir -p /usr/local/etc/sing-box
 SB_CONF="$NODE_DIR/config.json"
+if [ "$IPVER" = "6" ]; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   anytls)
     cat > "$SB_CONF" <<EOF
@@ -1361,7 +1407,7 @@ case "$PROTO" in
   "inbounds": [
     {
       "type": "anytls",
-      "listen": "::",
+      "listen": "$SB_LISTEN",
       "listen_port": $PORT,
       "users": [ { "name": "xray-node", "password": "$ANYTLS_PASS" } ],
       "tls": {
@@ -1387,15 +1433,15 @@ EOF
   "inbounds": [
     {
       "type": "hysteria2",
-      "listen": "::",
+      "listen": "$SB_LISTEN",
       "listen_port": $PORT,
       "users": [ { "name": "xray-node", "password": "$HY2_PASS" } ],
       "masquerade": "https://www.samsung.com/",
       "tls": {
         "enabled": true,
         "server_name": "www.samsung.com",
-        "certificate_path": "/usr/local/etc/sing-box/cert.pem",
-        "key_path": "/usr/local/etc/sing-box/key.pem"
+        "certificate_path": "$NODE_DIR/cert.pem",
+        "key_path": "$NODE_DIR/key.pem"
       }
     }
   ],
@@ -1410,7 +1456,7 @@ EOF
   "inbounds": [
     {
       "type": "tuic",
-      "listen": "::",
+      "listen": "$SB_LISTEN",
       "listen_port": $PORT,
       "users": [ { "name": "xray-node", "uuid": "$UUID", "password": "$TUIC_PASS" } ],
       "congestion_control": "bbr",
@@ -1418,8 +1464,8 @@ EOF
         "enabled": true,
         "server_name": "www.samsung.com",
         "alpn": [ "h3" ],
-        "certificate_path": "/usr/local/etc/sing-box/cert.pem",
-        "key_path": "/usr/local/etc/sing-box/key.pem"
+        "certificate_path": "$NODE_DIR/cert.pem",
+        "key_path": "$NODE_DIR/key.pem"
       }
     }
   ],
@@ -1473,6 +1519,7 @@ esac
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
 _FW_IPT_TOUCHED=0
+if [ "$IPVER" = "6" ]; then _IPT_BIN=ip6tables; else _IPT_BIN=iptables; fi
 for _np in $_FW_PROTOS; do
   _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
   if command -v ufw >/dev/null 2>&1; then
@@ -1492,20 +1539,20 @@ for _np in $_FW_PROTOS; do
       info "firewalld 已放行 $PORT/$_np"
     fi
   fi
-  if command -v iptables >/dev/null 2>&1; then
-    if iptables -C INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+  if command -v "$_IPT_BIN" >/dev/null 2>&1; then
+    if "$_IPT_BIN" -C INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
       : # 这条规则本来就存在（用户自己加的），我们不动它
-    elif iptables -I INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+    elif "$_IPT_BIN" -I INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
       _IPT_ADDED=1
       _FW_IPT_TOUCHED=1
     fi
   fi
-  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED" >> "$NODE_DIR/fw_info"
+  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED $IPVER" >> "$NODE_DIR/fw_info"
 done
 # 纯 iptables 的规则默认重启就丢：刚才亲手加了规则就存盘，
 # 否则机器一重启端口又被墙、节点连不上（ufw/firewalld 自己会持久化，不用管）
 if [ "$_FW_IPT_TOUCHED" = "1" ]; then
-  _save_fw
+  _save_fw "$IPVER"
 fi
 warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
@@ -1513,32 +1560,32 @@ warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台�
 step "[完成] 生成你的节点…"
 case "$PROTO" in
   vless)
-    LINK="vless://${UUID}@${LINK_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
+    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
     PROTO_NAME="VLESS + REALITY + Vision"
     ;;
   trojan)
-    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
+    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
     PROTO_NAME="Trojan + REALITY"
     ;;
   vmess)
-    _json="{\"v\":\"2\",\"ps\":\"xray-node\",\"add\":\"${SERVER_IP}\",\"port\":\"${PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
+    _json="{\"v\":\"2\",\"ps\":\"xray-node\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
     LINK="vmess://$(printf "%s" "$_json" | b64url)"
     PROTO_NAME="VMess + WebSocket"
     ;;
   ss)
-    LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${PORT}#xray-node"
+    LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#xray-node"
     PROTO_NAME="Shadowsocks"
     ;;
   anytls)
-    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
+    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
     PROTO_NAME="AnyTLS + REALITY"
     ;;
   hy2)
-    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${PORT}/?sni=www.samsung.com&insecure=1#xray-node"
+    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?sni=www.samsung.com&insecure=1#xray-node"
     PROTO_NAME="Hysteria2"
     ;;
   tuic)
-    LINK="tuic://${UUID}:${TUIC_PASS}@${LINK_IP}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.samsung.com&allow_insecure=1#xray-node"
+    LINK="tuic://${UUID}:${TUIC_PASS}@${LINK_IP}:${LINK_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.samsung.com&allow_insecure=1#xray-node"
     PROTO_NAME="TUIC"
     ;;
 esac
@@ -1552,7 +1599,8 @@ esac
   printf -- "----------------------------------------------\n"
   printf "协议: %s\n" "$PROTO_NAME"
   printf "地址: %s\n" "$SERVER_IP"
-  printf "端口: %s\n" "$PORT"
+  printf "端口: %s\n" "$LINK_PORT"
+  if [ "$LINK_PORT" != "$PORT" ]; then printf "本机监听端口: %s\n" "$PORT"; fi
   case "$PROTO" in
     vless|vmess) printf "UUID: %s\n" "$UUID" ;;
     trojan)      printf "密码: %s\n" "$TROJAN_PASS" ;;
@@ -1587,8 +1635,8 @@ if [ "$_BBR_ON" = "0" ]; then
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
     if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
-      printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-bbr.conf
-      sysctl --system >/dev/null 2>&1 || true
+      mkdir -p /etc/sysctl.d
+      printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-xray-node-bbr.conf
       if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
         _BBR_ON=1
         info "BBR 已自动开启（立即生效，已写入开机配置）"
@@ -1596,44 +1644,7 @@ if [ "$_BBR_ON" = "0" ]; then
     fi
     [ "$_BBR_ON" = "0" ] && warn "BBR 开启失败（可能是容器内无权改内核参数），不影响节点使用"
   else
-    # 内核太老不支持 BBR：用 teddysun 的 bbr.sh 升级内核来开
-    warn "当前内核不支持 BBR，尝试用 bbr.sh 升级内核开启…"
-    _bbr_dir="$(mktemp -d 2>/dev/null || echo /tmp)"
-    _bbr_host="github.com"
-    _bbr_path="/teddysun/across/raw/master/bbr.sh"
-    _bbr_jd_h="cdn.jsdelivr.net"
-    _bbr_jd_p="/gh/teddysun/across@master/bbr.sh"
-    # 下载地址：github.com 优先，jsdelivr 兜底（有的机器到 github.com 不通）
-    _bbr_urls="https://${_bbr_host}${_bbr_path} https://${_bbr_jd_h}${_bbr_jd_p}"
-    _bbr_dl() { # _bbr_dl <url>：用 wget 或 curl 下载 bbr.sh，成功返回 0
-      # wget 默认重试 20 次、单次读超时 900 秒，网络黑洞时会卡十几分钟：必须加超时。
-      # 没 wget 就用 curl（前面已保证装好），都不行就跳过，不挡节点安装。
-      if command -v wget >/dev/null 2>&1; then
-        wget --no-check-certificate --timeout=20 --tries=2 -q -O "$_bbr_dir/bbr.sh" "$1" 2>/dev/null
-      elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 40 -o "$_bbr_dir/bbr.sh" "$1" 2>/dev/null
-      else
-        return 1
-      fi
-      # 代理有时返回错误页面（200 状态码）：内容像 HTML 就当没下到，换下一个地址
-      [ -s "$_bbr_dir/bbr.sh" ] && ! grep -qi "<html" "$_bbr_dir/bbr.sh" 2>/dev/null
-    }
-    _bbr_ok=0
-    for _bbr_url in $_bbr_urls; do
-      if _bbr_dl "$_bbr_url"; then _bbr_ok=1; break; fi
-      rm -f "$_bbr_dir/bbr.sh"
-    done
-    if [ "$_bbr_ok" = "1" ]; then
-      chmod +x "$_bbr_dir/bbr.sh"
-      info "正在运行 bbr.sh，按它的提示操作（完成后可能需要重启）"
-      ( cd "$_bbr_dir" && sh ./bbr.sh )
-    else
-      warn "bbr.sh 下载失败，BBR 没开成，不影响节点使用；以后可手动下载 bbr.sh 运行"
-    fi
-    # _bbr_dir 可能是 mktemp 建的临时目录，也可能是 mktemp 失败时回退的 /tmp：
-    # 只删我们下载的那个文件；回退到 /tmp 时绝不能 rm -rf 整个目录
-    rm -f "$_bbr_dir/bbr.sh"
-    [ "$_bbr_dir" != "/tmp" ] && rm -rf "$_bbr_dir"
+    warn "当前内核不支持 BBR，跳过加速；节点仍可正常使用"
   fi
 fi
 
