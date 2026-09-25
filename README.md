@@ -21,6 +21,14 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS
 4. **公网映射端口**（普通 VPS 直接回车；NAT VPS 填服务商分配、映射到上一步端口的公网端口）
 5. **REALITY 伪装域名**（只有选 REALITY 协议才问）：11 个备选，默认 www.samsung.com
 
+NAT VPS 要先在服务商面板确认端口映射。脚本只能检查本机端口在监听，无法替服务商创建映射或验证公网入口。Hysteria2 和 TUIC 需要 UDP 映射，其余协议需要 TCP；Shadowsocks 需要 TCP 和 UDP。
+
+64MB 内存、1GB 硬盘的小 NAT 也可以装 Hysteria2。脚本会自动加一块虚拟内存，并改用大约 22MB 的官方 Hysteria 程序。新版 sing-box 解压后大约 80MB，这种小机器会在下载或启动时失败。
+
+Hysteria2 用的是自签证书。链接里会带上 SNI `www.samsung.com` 和证书指纹。导入客户端后不要打开“跳过证书验证”；如果“证书锁定”是空的，把脚本打印出来的指纹填进去。新版 Xray 已经不接受“跳过证书验证”。
+
+UUID 和密码全部随机生成，不用你操心。
+
 ## 看节点
 
 装完之后，随时想看节点链接，SSH 上输入：
