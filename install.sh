@@ -1708,6 +1708,23 @@ if [ "$PROTO" = "hy2" ]; then
     die "自签证书生成失败。$(printf '%s' "$_hy_cert_err" | tr '\n' ' ' | cut -c1-300)"
   fi
   chmod 600 "$NODE_DIR/key.pem" "$NODE_DIR/cert.pem" 2>/dev/null
+  # 新版 Xray 已经取消“跳过证书验证”，客户端必须带这张证书的指纹才能连。
+  HY2_PIN=$(printf '%s\n' "$_hy_cert_err" | sed -n 's/.*pinSHA256:[[:space:]]*//p' | head -1 | tr -d ' \r\n' | tr 'a-f' 'A-F')
+  case "$HY2_PIN" in
+    *[!0-9A-F]*|"") HY2_PIN="" ;;
+  esac
+  if [ -z "$HY2_PIN" ] && command -v openssl >/dev/null 2>&1; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      HY2_PIN=$(openssl x509 -in "$NODE_DIR/cert.pem" -outform der 2>/dev/null | sha256sum 2>/dev/null | awk '{print toupper($1)}')
+    elif command -v shasum >/dev/null 2>&1; then
+      HY2_PIN=$(openssl x509 -in "$NODE_DIR/cert.pem" -outform der 2>/dev/null | shasum -a 256 2>/dev/null | awk '{print toupper($1)}')
+    fi
+  fi
+  case "$HY2_PIN" in
+    *[!0-9A-F]*|"") HY2_PIN="" ;;
+  esac
+  [ "${#HY2_PIN}" -eq 64 ] || HY2_PIN=""
+  [ -n "$HY2_PIN" ] || die "自签证书做好了，但没有算出证书指纹。没有指纹的话，新版客户端会拒绝连接。"
   info "自签证书已生成"
 elif [ "$PROTO" = "tuic" ]; then
   step "[证书] 生成自签证书…"
@@ -2049,7 +2066,8 @@ case "$PROTO" in
     PROTO_NAME="AnyTLS + REALITY"
     ;;
   hy2)
-    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?sni=www.samsung.com&insecure=1#xray-node"
+    # 不写 insecure=1：新版 Xray 看到“跳过验证”会直接起不来。用证书指纹代替。
+    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
     PROTO_NAME="Hysteria2"
     ;;
   tuic)
@@ -2080,7 +2098,15 @@ esac
   case "$PROTO" in
     vless|trojan|anytls) printf "伪装域名: %s\n" "$REALITY_DOMAIN" ;;
     vmess)        printf "WS 路径: %s\n" "$WS_PATH" ;;
-    hy2|tuic)     printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
+    hy2)
+      printf "SNI: www.samsung.com\n"
+      printf "证书指纹: %s\n" "$HY2_PIN"
+      printf "客户端不要打开“跳过证书验证”。如果导入后证书锁定是空的，把上面的指纹填进去。\n"
+      printf "Loon 可粘贴这一行:\n"
+      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
+        "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN"
+      ;;
+    tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
   esac
   printf -- "----------------------------------------------\n"
   printf "以后想看节点，直接输入: jiedian\n"
