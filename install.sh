@@ -187,9 +187,69 @@ wait_for_port() {
   return 1
 }
 
+# 64MB 级别的 NAT 机器上 apt 装 iptables-persistent 会把内存吃光，节点一起被杀掉。
+# 这种机器直接把当前规则记到文件，开机用一条很轻的服务恢复。
+_save_fw_light() {
+  mkdir -p /etc/xray-node 2>/dev/null
+  if [ "$1" = "6" ]; then
+    _sv=/etc/xray-node/rules.v6; _sv_bin=ip6tables-save
+  else
+    _sv=/etc/xray-node/rules.v4; _sv_bin=iptables-save
+  fi
+  if ! command -v "$_sv_bin" >/dev/null 2>&1; then
+    warn "内存很小，没有安装额外的防火墙组件。规则这次有效；重启后如果端口不通，重跑一次脚本即可"
+    return 0
+  fi
+  if ! "$_sv_bin" > "$_sv" 2>/dev/null; then
+    warn "防火墙规则没能存盘。重启后如果端口不通，重跑一次脚本即可"
+    return 0
+  fi
+  chmod 600 "$_sv" 2>/dev/null
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat > /etc/systemd/system/xray-node-fw.service <<'FWEOF'
+[Unit]
+Description=Restore xray-node firewall rules
+After=network-pre.target
+Before=network.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ -f /etc/xray-node/rules.v4 ] && iptables-restore < /etc/xray-node/rules.v4; [ -f /etc/xray-node/rules.v6 ] && ip6tables-restore < /etc/xray-node/rules.v6; exit 0'
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+FWEOF
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable xray-node-fw.service >/dev/null 2>&1
+    info "防火墙规则已存盘（重启后仍有效）"
+    return 0
+  fi
+  if command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
+    cat > /etc/init.d/xray-node-fw <<'FWEOF'
+#!/sbin/openrc-run
+description="Restore xray-node firewall rules"
+depend() { before net; }
+start() {
+  [ -f /etc/xray-node/rules.v4 ] && iptables-restore < /etc/xray-node/rules.v4
+  [ -f /etc/xray-node/rules.v6 ] && ip6tables-restore < /etc/xray-node/rules.v6
+  return 0
+}
+FWEOF
+    chmod +x /etc/init.d/xray-node-fw
+    rc-update add xray-node-fw default >/dev/null 2>&1
+    info "防火墙规则已存盘（重启后仍有效）"
+    return 0
+  fi
+  warn "防火墙规则这次已加上。小内存机器没有额外组件可装，重启后如果端口不通，重跑一次脚本即可"
+}
+
 _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后还在
   # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
   # 尽力而为：实在存不了就明确告诉用户，不拦主流程。
+  # 小内存机器走轻量存盘，避免 apt 把仅有的几十 MB 内存吃光。
+  if [ "$LOW_MEM" = "1" ]; then
+    _save_fw_light "$1"
+    return 0
+  fi
   if [ "$1" = "6" ]; then _fw_svc=ip6tables; _fw_save_bin=ip6tables-save
   else _fw_svc=iptables; _fw_save_bin=iptables-save; fi
   if [ -f /etc/alpine-release ] && [ -f "/etc/init.d/$_fw_svc" ]; then
@@ -263,6 +323,14 @@ _fw_save() {
     if [ "$1" = "6" ]; then _fs_svc=ip6tables; else _fs_svc=iptables; fi
     [ -f "/etc/init.d/$_fs_svc" ] && "/etc/init.d/$_fs_svc" save >/dev/null 2>&1
   fi
+  # 小内存机器没有装 iptables-persistent，规则在 /etc/xray-node/rules.v4
+  if [ -f /etc/xray-node/rules.v4 ] || [ -f /etc/xray-node/rules.v6 ]; then
+    if [ "$1" = "6" ]; then
+      command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/xray-node/rules.v6 2>/dev/null
+    else
+      command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/xray-node/rules.v4 2>/dev/null
+    fi
+  fi
 }
 
 # _del_fw_rules <fw_info路径>：撤销该节点我们亲手加的防火墙规则（用户手写的不碰）
@@ -307,6 +375,7 @@ _stop_remove_svc() {
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     case "$_x_core" in
       sing-box) _x_unit="singbox-node@${_x_id}" ;;
+      hysteria) _x_unit="hysteria-node@${_x_id}" ;;
       *) _x_unit="xray-node@${_x_id}" ;;
     esac
     systemctl stop "$_x_unit" >/dev/null 2>&1
@@ -320,6 +389,7 @@ _stop_remove_svc() {
   fi
   # 兜底：按该节点的配置文件路径精确杀进程，不碰其它节点的进程
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.json" >/dev/null 2>&1
+  pkill -f "/etc/xray-node/nodes/${_x_id}/config.yaml" >/dev/null 2>&1
   sleep 1
 }
 
@@ -349,14 +419,32 @@ _uninstall_all() {
   done
   # _svc_install 建的 systemd 模板（xray-node@.service / singbox-node@.service）
   # 不是按节点实例建的，上面的循环删不掉，不清会残留在系统里
-  rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service
+  if [ -d /run/systemd/system ]; then
+    systemctl disable xray-node-fw.service >/dev/null 2>&1
+    systemctl stop xray-node-fw.service >/dev/null 2>&1
+  fi
+  if command -v rc-update >/dev/null 2>&1; then
+    rc-service xray-node-fw stop >/dev/null 2>&1
+    rc-update del xray-node-fw default >/dev/null 2>&1
+  fi
+  rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service \
+    /etc/systemd/system/hysteria-node@.service /etc/systemd/system/xray-node-fw.service
+  rm -f /etc/init.d/xray-node-fw /etc/sysctl.d/99-xray-node-overcommit.conf
+  if [ -f /xray-node.swap ]; then
+    swapoff /xray-node.swap >/dev/null 2>&1
+    rm -f /xray-node.swap
+    if [ -f /etc/fstab ]; then
+      grep -v '/xray-node.swap' /etc/fstab > /etc/fstab.xray-node.tmp 2>/dev/null || true
+      mv -f /etc/fstab.xray-node.tmp /etc/fstab
+    fi
+  fi
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   # 只删脚本自己下载安装的内核（our_bins 里记着），用户机器上本来就有的不碰
   # 注意：必须在删 /etc/xray-node 之前读
   if [ -f /etc/xray-node/our_bins ]; then
     while read -r _b; do
       case "$_b" in
-        xray|sing-box) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
+        xray|sing-box|hysteria) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
       esac
     done < /etc/xray-node/our_bins
   fi
@@ -411,19 +499,63 @@ chmod 700 /usr/local/bin/shanjiedian
 rm -f /usr/local/bin/xiezai
 }
 
+_hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
+  export HYSTERIA_DISABLE_UPDATE_CHECK=1
+  export HYSTERIA_LOG_LEVEL=warn
+  if [ "$LOW_MEM" = "1" ]; then
+    export GOGC=30
+    if [ "$SWAP_OK" != "1" ] && [ -n "$MEM_MB" ]; then
+      _hy_gomem=$((MEM_MB / 3))
+      [ "$_hy_gomem" -lt 16 ] && _hy_gomem=16
+      [ "$_hy_gomem" -gt 32 ] && _hy_gomem=32
+      export GOMEMLIMIT="${_hy_gomem}MiB"
+    fi
+  fi
+}
+
 _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机自启服务并启动（systemd 模板实例 / OpenRC 独立脚本 / 兜底后台）
   _si_id="$1"
   _si_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_si_id"/core 2>/dev/null)
   _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.json
+  _si_unit_env=""
+  _si_openrc_env=""
   case "$_si_core" in
+    hysteria)
+      _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.yaml
+      _si_bin="$HY_BIN"; _si_args="server -c $_si_cfg"
+      _si_tpl=/etc/systemd/system/hysteria-node@.service; _si_unit="hysteria-node@${_si_id}"
+      # 关掉官方程序的更新检查，小内存机器上这一下会多占内存、还可能卡住启动
+      _si_unit_env="Environment=HYSTERIA_DISABLE_UPDATE_CHECK=1
+Environment=HYSTERIA_LOG_LEVEL=warn"
+      _si_openrc_env="export HYSTERIA_DISABLE_UPDATE_CHECK=1
+export HYSTERIA_LOG_LEVEL=warn"
+      if [ "$LOW_MEM" = "1" ]; then
+        _si_unit_env="${_si_unit_env}
+Environment=GOGC=30"
+        _si_openrc_env="${_si_openrc_env}
+export GOGC=30"
+        if [ "$SWAP_OK" != "1" ] && [ -n "$MEM_MB" ]; then
+          _hy_gomem=$((MEM_MB / 3))
+          [ "$_hy_gomem" -lt 16 ] && _hy_gomem=16
+          [ "$_hy_gomem" -gt 32 ] && _hy_gomem=32
+          _si_unit_env="${_si_unit_env}
+Environment=GOMEMLIMIT=${_hy_gomem}MiB"
+          _si_openrc_env="${_si_openrc_env}
+export GOMEMLIMIT=${_hy_gomem}MiB"
+        fi
+      fi
+      ;;
     sing-box) _si_bin="$SB_BIN"; _si_args="run -c $_si_cfg"; _si_tpl=/etc/systemd/system/singbox-node@.service; _si_unit="singbox-node@${_si_id}" ;;
     *)        _si_bin="$XRAY_BIN"; _si_args="-config $_si_cfg"; _si_tpl=/etc/systemd/system/xray-node@.service; _si_unit="xray-node@${_si_id}" ;;
   esac
+  SVC_UNIT="$_si_unit"
   _si_svc="xray-node-${_si_id}"
+  [ "$LOW_MEM" = "1" ] && drop_page_cache
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     # 模板 unit 只写一次，多个节点共用（%i 即节点 id）
     if [ ! -f "$_si_tpl" ]; then
       case "$_si_core" in
+        hysteria) _si_tpl_bin="$HY_BIN"; _si_tpl_args="server -c /etc/xray-node/nodes/%i/config.yaml"; _si_tpl_desc="Hysteria2 node %i" ;;
         sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
         *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
       esac
@@ -434,6 +566,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
+${_si_unit_env}
 ExecStart=${_si_tpl_bin} ${_si_tpl_args}
 Restart=on-failure
 RestartSec=5
@@ -453,6 +586,7 @@ EOF
   elif command -v rc-service >/dev/null 2>&1; then
     cat > /etc/init.d/${_si_svc} <<RCEOF
 #!/sbin/openrc-run
+${_si_openrc_env}
 name="${_si_svc}"
 description="${_si_svc} proxy service"
 command="${_si_bin}"
@@ -487,6 +621,9 @@ RCEOF
     fi
   else
     warn "没找到 systemd/OpenRC，改用后台方式启动（重启后需手动再跑一次脚本）"
+    if [ "$_si_core" = "hysteria" ]; then
+      _hy_export_env
+    fi
     pkill -f "$_si_cfg" >/dev/null 2>&1
     # shellcheck disable=SC2086 — _si_args 故意拆成多个参数
     nohup $_si_bin $_si_args >/var/log/xray-node-${_si_id}.log 2>&1 &
@@ -498,19 +635,28 @@ RCEOF
 _svc_restart() { # _svc_restart <节点id>：只重启该节点的服务（更新模式用）
   _sr_id="$1"
   _sr_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_sr_id"/core 2>/dev/null)
+  _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.json
   case "$_sr_core" in
+    hysteria)
+      _sr_unit="hysteria-node@${_sr_id}"
+      _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.yaml
+      ;;
     sing-box) _sr_unit="singbox-node@${_sr_id}" ;;
     *)        _sr_unit="xray-node@${_sr_id}" ;;
   esac
+  if [ "$_sr_core" = "hysteria" ]; then
+    _hy_export_env
+  fi
+  [ "$LOW_MEM" = "1" ] && drop_page_cache
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl restart "$_sr_unit" >/dev/null 2>&1
   elif command -v rc-service >/dev/null 2>&1; then
     rc-service "xray-node-${_sr_id}" restart >/dev/null 2>&1
   else
-    _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.json
     pkill -f "$_sr_cfg" >/dev/null 2>&1
     sleep 1
     case "$_sr_core" in
+      hysteria) nohup "$HY_BIN" server -c "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
       sing-box) nohup "$SB_BIN" run -c "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
       *)        nohup "$XRAY_BIN" -config "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
     esac
@@ -552,8 +698,257 @@ _cached_ver_ok() {
   [ "$_cvo_ver" = "$_cvo_latest" ]
 }
 
+_read_meminfo_kb() { # _read_meminfo_kb MemTotal: -> 数字（kB）
+  awk -v k="$1" '$1==k {print $2; exit}' /proc/meminfo 2>/dev/null
+}
+
+# 容器里的 MemTotal 经常是宿主机的内存，真正的上限在 cgroup。
+# 不限制时这个文件是一个超大整数或 max，不能拿去运算（shell 算术会溢出）。
+_cgroup_mem_mb() {
+  for _cgf in /sys/fs/cgroup/memory.max \
+              /sys/fs/cgroup/memory/memory.limit_in_bytes \
+              /sys/fs/cgroup/memory.limit_in_bytes; do
+    [ -r "$_cgf" ] || continue
+    _cgv=$(tr -d ' \r\n' < "$_cgf" 2>/dev/null)
+    case "$_cgv" in ''|max|*[!0-9]*) continue ;; esac
+    [ "${#_cgv}" -le 12 ] || continue
+    [ "$_cgv" -ge 1048576 ] || continue
+    printf '%s' $((_cgv / 1024 / 1024))
+    return 0
+  done
+  return 1
+}
+
+_disk_free_mb() { # _disk_free_mb <路径> -> 该路径所在磁盘剩余 MB
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}'
+}
+
+_fstype() { # _fstype <挂载点>
+  awk -v m="$1" '$2==m {print $3; exit}' /proc/mounts 2>/dev/null
+}
+
+drop_page_cache() {
+  sync
+  if [ -w /proc/sys/vm/drop_caches ]; then
+    printf '3\n' > /proc/sys/vm/drop_caches 2>/dev/null
+  fi
+}
+
+# 上次安装失败会把几十 MB 的安装包留在临时目录。1GB 硬盘上这些残留会让下一次装直接写满。
+recover_disk_space() {
+  rm -rf /var/tmp/xray-node-dl "$HOME/xray-node-dl" /tmp/xray-node-dl 2>/dev/null
+  rm -f /usr/local/bin/sing-box.new /usr/local/bin/xray.new /usr/local/bin/hysteria.new 2>/dev/null
+  _rdf=$(_disk_free_mb /)
+  if [ "$LOW_MEM" = "1" ] || { [ -n "$_rdf" ] && [ "$_rdf" -lt 200 ]; }; then
+    rm -f /var/cache/apt/archives/*.deb 2>/dev/null
+    if command -v journalctl >/dev/null 2>&1; then
+      journalctl --vacuum-size=1M >/dev/null 2>&1
+    fi
+  fi
+}
+
+# 64MB / 128MB 的 NAT：Go 程序启动时会多申请一段内存，默认策略直接拒绝；
+# 再加一块放在硬盘上的虚拟内存，Hysteria2 才起得来。tmpfs 上的 swap 等于拿内存当内存，不用。
+prepare_low_memory() {
+  LOW_MEM=0
+  SWAP_OK=0
+  MEM_MB=""
+  _tot_kb=$(_read_meminfo_kb "MemTotal:")
+  _cg_mb=$(_cgroup_mem_mb) || _cg_mb=""
+  if [ -n "$_tot_kb" ]; then
+    MEM_MB=$((_tot_kb / 1024))
+  fi
+  if [ -n "$_cg_mb" ]; then
+    if [ -z "$MEM_MB" ] || [ "$_cg_mb" -lt "$MEM_MB" ]; then
+      MEM_MB="$_cg_mb"
+    fi
+  fi
+  # 只看机器的内存上限。临时剩下的可用内存很少时，不去改大机器的系统设置。
+  if [ -n "$MEM_MB" ] && [ "$MEM_MB" -le 192 ]; then LOW_MEM=1; fi
+  # 先清残留安装包，再决定要不要做 swap（磁盘数字才准）
+  recover_disk_space
+  [ "$LOW_MEM" = "1" ] || return 0
+  info "这台机器大约 ${MEM_MB:-很少}MB 内存。先准备虚拟内存，否则 Hysteria2 起不来。"
+  if [ -w /proc/sys/vm/overcommit_memory ]; then
+    _oc=$(tr -d ' \r\n' < /proc/sys/vm/overcommit_memory 2>/dev/null)
+    if [ "$_oc" != "1" ]; then
+      if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
+        || printf '1\n' > /proc/sys/vm/overcommit_memory 2>/dev/null; then
+        mkdir -p /etc/sysctl.d 2>/dev/null
+        printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null
+        info "已放开内存申请限制（小内存机器需要这一步）"
+      fi
+    fi
+  fi
+  _swap_kb=$(_read_meminfo_kb "SwapTotal:")
+  _swap_kb=${_swap_kb:-0}
+  if [ "$_swap_kb" -ge 65536 ]; then
+    SWAP_OK=1
+    info "虚拟内存已经有了，直接用"
+    return 0
+  fi
+  _root_type=$(_fstype /)
+  case "$_root_type" in
+    tmpfs|devtmpfs)
+      warn "系统盘在内存里，没法再加虚拟内存"
+      return 0
+      ;;
+  esac
+  _free=$(_disk_free_mb /)
+  [ -n "$_free" ] || _free=0
+  _sw=0
+  if [ "$_free" -ge 220 ]; then _sw=128
+  elif [ "$_free" -ge 120 ]; then _sw=64
+  fi
+  if [ "$_sw" -eq 0 ]; then
+    warn "磁盘只剩大约 ${_free}MB，腾不出虚拟内存。安装会继续，内存实在不够时会失败。"
+    return 0
+  fi
+  _swapf=/xray-node.swap
+  if [ -f "$_swapf" ]; then
+    if swapon "$_swapf" >/dev/null 2>&1; then
+      SWAP_OK=1
+      info "已启用原来的虚拟内存文件"
+      return 0
+    fi
+    swapoff "$_swapf" >/dev/null 2>&1
+    rm -f "$_swapf"
+  fi
+  info "正在做 ${_sw}MB 虚拟内存（做完就能装 Hysteria2）…"
+  _made=0
+  if command -v fallocate >/dev/null 2>&1 && fallocate -l "${_sw}M" "$_swapf" 2>/dev/null; then
+    _made=1
+  else
+    rm -f "$_swapf"
+    _i=0
+    _made=1
+    while [ "$_i" -lt "$_sw" ]; do
+      if ! dd if=/dev/zero of="$_swapf" bs=1048576 count=1 seek="$_i" conv=notrunc >/dev/null 2>&1; then
+        _made=0
+        break
+      fi
+      _i=$((_i + 1))
+      if [ $((_i % 8)) -eq 0 ]; then sync; fi
+    done
+  fi
+  if [ "$_made" != "1" ]; then
+    rm -f "$_swapf"
+    warn "虚拟内存文件没做成，继续安装"
+    return 0
+  fi
+  chmod 600 "$_swapf" 2>/dev/null
+  if mkswap "$_swapf" >/dev/null 2>&1 && swapon "$_swapf" >/dev/null 2>&1; then
+    SWAP_OK=1
+    if [ -f /etc/fstab ] || [ -w /etc ]; then
+      touch /etc/fstab 2>/dev/null
+      if ! grep -q '/xray-node.swap' /etc/fstab 2>/dev/null; then
+        printf '/xray-node.swap none swap sw 0 0\n' >> /etc/fstab 2>/dev/null
+      fi
+    fi
+    info "虚拟内存已开启（${_sw}MB），重启后也会自动挂上"
+  else
+    rm -f "$_swapf"
+    warn "这台机器不允许开启虚拟内存（不少 NAT 容器都这样）。继续安装，程序会尽量省着内存用。"
+  fi
+}
+
+_latest_hysteria_ver() { # 打印 hysteria 最新版本号（不带 v），失败返回非零
+  _hv=$(curl -fsSL --max-time 20 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s|.*/||; s/^v//')
+  case "$_hv" in ''|*[!0-9A-Za-z.-]*) return 1 ;; esac
+  printf '%s' "$_hv"
+}
+
+_hysteria_local_ver() { # _hysteria_local_ver <二进制>
+  "$1" version 2>/dev/null | sed -n 's/^Version:[[:space:]]*v\{0,1\}//p' | head -1 | tr -d ' \r\n'
+}
+
+_hy_asset() {
+  case "$MACH" in
+    amd64) printf '%s' hysteria-linux-amd64 ;;
+    arm64) printf '%s' hysteria-linux-arm64 ;;
+    armv7) printf '%s' hysteria-linux-arm ;;
+    *) return 1 ;;
+  esac
+}
+
+dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内存装得下；sing-box 1.14 解压后约 80MB，装不上。
+  step "[下载] 获取 Hysteria2 内核…"
+  _hy_asset=$(_hy_asset) || die "这个 CPU 架构没有对应的 Hysteria2 程序：$(uname -m)"
+  _hy_latest=$(_latest_hysteria_ver) || _hy_latest=""
+  if [ "$FORCE_DL" != "1" ] && [ -x "$HY_BIN" ]; then
+    _hy_have=$(_hysteria_local_ver "$HY_BIN")
+    if [ -n "$_hy_have" ] && { [ -z "$_hy_latest" ] || [ "$_hy_have" = "$_hy_latest" ]; }; then
+      info "Hysteria2 已存在，直接用现有的：v${_hy_have}"
+      return 0
+    fi
+  fi
+  recover_disk_space
+  _hy_free=$(_disk_free_mb /usr/local)
+  if [ -z "$_hy_free" ]; then _hy_free=$(_disk_free_mb /); fi
+  if [ -n "$_hy_free" ] && [ "$_hy_free" -lt 40 ]; then
+    die "磁盘剩余大约 ${_hy_free}MB，装不下 Hysteria2（大约还要 40MB）。1GB 硬盘请先删掉不用的文件再重跑。"
+  fi
+  rm -f "${HY_BIN}.new"
+  _dl_ok=0
+  info "尝试下载：${_hy_asset}"
+  if gh_api_dl "apernet/hysteria" "$_hy_asset" "${HY_BIN}.new"; then
+    _dl_ok=1
+  else
+    warn "API 路线失败，换 github.com 直链试试…"
+    rm -f "${HY_BIN}.new"
+    _url="https://github.com/apernet/hysteria/releases/latest/download/${_hy_asset}"
+    info "尝试下载：$_url"
+    if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "${HY_BIN}.new" "$_url"; then
+      _dl_ok=1
+    fi
+  fi
+  if [ "$_dl_ok" != "1" ]; then
+    rm -f "${HY_BIN}.new"
+    die "Hysteria2 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+  fi
+  # 小于 1MB 的多半是错误页，不是内核
+  _hy_sz=$(wc -c < "${HY_BIN}.new" 2>/dev/null | tr -d ' ')
+  if [ -z "$_hy_sz" ] || [ "$_hy_sz" -lt 1000000 ]; then
+    rm -f "${HY_BIN}.new"
+    die "下载到的 Hysteria2 文件不完整，请重跑脚本"
+  fi
+  chmod 0755 "${HY_BIN}.new" || { rm -f "${HY_BIN}.new"; die "安装 Hysteria2 失败"; }
+  drop_page_cache
+  _hy_run=$("${HY_BIN}.new" version 2>&1)
+  _hy_rc=$?
+  if [ "$_hy_rc" -ne 0 ]; then
+    rm -f "${HY_BIN}.new"
+    die "下载的 Hysteria2 内核跑不起来（退出码 ${_hy_rc}）。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_hy_run" | tr '\n' ' ' | cut -c1-300)"
+  fi
+  mv -f "${HY_BIN}.new" "$HY_BIN"
+  mark_our_bin "hysteria"
+  _hy_have=$(_hysteria_local_ver "$HY_BIN")
+  info "Hysteria2 安装成功：v${_hy_have:-未知}"
+}
+
+_ensure_unzip() {
+  command -v unzip >/dev/null 2>&1 && return 0
+  warn "缺少 unzip，正在安装…"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    _apt_do "正在安装 unzip" 300 -- install -y -qq unzip || true
+    unset DEBIAN_FRONTEND
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache unzip >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q unzip >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q unzip >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm --needed unzip >/dev/null 2>&1 || true
+  fi
+  command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
+}
+
 dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
   step "[下载] 获取 Xray 内核…"
+  _ensure_unzip
   case "$MACH" in
     amd64) XARCH="64" ;;
     arm64) XARCH="arm64-v8a" ;;
@@ -628,6 +1023,9 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
 
 dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在也强制下载最新版
   step "[下载] 获取 sing-box 内核…"
+  if [ "$LOW_MEM" = "1" ]; then
+    warn "sing-box 解压后大约 80MB，这台机器大约 ${MEM_MB:-很少}MB 内存，有可能装不上。装不上的话，协议请选 6（Hysteria2）。"
+  fi
   if [ "$FORCE_DL" != "1" ] && [ -x "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1; then
     info "sing-box 已存在，直接用现有的：$($SB_BIN version 2>/dev/null | head -1)"
   else
@@ -693,9 +1091,12 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
       || die "解压后没找到 sing-box 文件"
     # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
     install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" || die "安装 sing-box 失败"
-    if ! "${SB_BIN}.new" version >/dev/null 2>&1; then
+    drop_page_cache
+    _sb_run=$("${SB_BIN}.new" version 2>&1)
+    if [ $? -ne 0 ]; then
       rm -f "${SB_BIN}.new"
-      die "下载的 sing-box 内核跑不起来，安装包可能有问题"
+      rm -rf "$DL_DIR"
+      die "下载的 sing-box 内核跑不起来。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_sb_run" | tr '\n' ' ' | cut -c1-300)"
     fi
     mv -f "${SB_BIN}.new" "$SB_BIN"
     mark_our_bin "sing-box"
@@ -729,12 +1130,20 @@ printf "全程中文提问，看不懂就一路回车用默认。\n"
 mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
 XRAY_BIN="/usr/local/bin/xray"
 SB_BIN="/usr/local/bin/sing-box"
+HY_BIN="/usr/local/bin/hysteria"
+LOW_MEM=0
+SWAP_OK=0
+MEM_MB=""
+SVC_UNIT=""
 case "$(uname -m)" in
   x86_64|amd64) MACH="amd64" ;;
   aarch64|arm64) MACH="arm64" ;;
   armv7l|armv7) MACH="armv7" ;;
   *) die "不支持的 CPU 架构：$(uname -m)" ;;
 esac
+
+# 64MB NAT 要在装任何大程序之前做完：放开内存申请，并尽量加一块虚拟内存
+prepare_low_memory
 
 # ---------- 2c. 老版本迁移：单节点布局 -> 多节点布局 ----------
 # 老版本只有一个节点（/etc/xray-node/node.txt + xray/sing-box 单服务）。
@@ -799,7 +1208,7 @@ if [ -d /etc/xray-node/nodes ]; then
 fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐：所有节点配置不变，只把 Xray/sing-box 内核升到最新版）\n"
+  printf "  1) 更新内核（推荐：所有节点配置不变，只把 Xray/sing-box/Hysteria2 内核升到最新版）\n"
   printf "  2) 添加新节点（再搭一个，旧节点不受影响、继续用）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
@@ -879,37 +1288,37 @@ _dep_fail() {
   warn "这一步没成功，最后看到的报错："
   tail -n 5 "$_dep_log" 2>/dev/null | sed 's/^/  /'
 }
+# unzip 只有 Xray 的 zip 包才要。小内存机器上为了 Hysteria2 先 apt 装 unzip，
+# 很容易在选协议之前就把内存吃光。缺 unzip 时留到下载 Xray 再装。
 _need_install=0
 command -v curl >/dev/null 2>&1 || _need_install=1
-command -v unzip >/dev/null 2>&1 || _need_install=1
 if [ "$_need_install" -eq 1 ]; then
-  printf "缺少 curl / unzip，正在自动安装（每一步都有进度提示，不会卡住不动）…\n"
+  printf "缺少 curl，正在自动安装（每一步都有进度提示，不会卡住不动）…\n"
   export DEBIAN_FRONTEND=noninteractive
   if command -v apt-get >/dev/null 2>&1; then
     _apt_do "正在更新软件源" 60 -- update -qq \
       || warn "软件源更新失败，用已有索引继续装（多数情况不影响）"
-    _apt_do "正在安装 curl / unzip" 300 -- install -y -qq curl unzip ca-certificates \
+    _apt_do "正在安装 curl" 300 -- install -y -qq curl ca-certificates \
       || _dep_fail
   elif command -v apk >/dev/null 2>&1; then
-    printf "正在安装 curl / unzip…\n"
-    timeout 300 apk add --no-cache curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    printf "正在安装 curl…\n"
+    timeout 300 apk add --no-cache curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v dnf >/dev/null 2>&1; then
-    printf "正在安装 curl / unzip…\n"
-    timeout 300 dnf install -y -q curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    printf "正在安装 curl…\n"
+    timeout 300 dnf install -y -q curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v yum >/dev/null 2>&1; then
-    printf "正在安装 curl / unzip…\n"
-    timeout 300 yum install -y -q curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    printf "正在安装 curl…\n"
+    timeout 300 yum install -y -q curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   elif command -v pacman >/dev/null 2>&1; then
-    printf "正在安装 curl / unzip…\n"
-    timeout 300 pacman -Sy --noconfirm --needed curl unzip ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    printf "正在安装 curl…\n"
+    timeout 300 pacman -Sy --noconfirm --needed curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
   fi
   rm -f "$_dep_log"
   unset DEBIAN_FRONTEND
 else
-  info "curl / unzip 都有，直接跳过安装"
+  info "curl 已有，直接跳过安装"
 fi
 command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl 后重试"
-command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
 info "系统工具就绪"
 
 # ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
@@ -922,7 +1331,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     [ -f "${_ud}core" ] || continue
     _uc=$(tr -d ' \r\n' < "${_ud}core" 2>/dev/null)
     case "$_uc" in
-      xray|sing-box)
+      xray|sing-box|hysteria)
         case " $_u_cores " in *" $_uc "*) ;; *) _u_cores="$_u_cores $_uc" ;; esac
         ;;
     esac
@@ -937,6 +1346,8 @@ if [ "$UPDATE_MODE" = "1" ]; then
       (
       if [ "$_ucore" = "xray" ]; then
         _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN"
+      elif [ "$_ucore" = "hysteria" ]; then
+        _u_repo="apernet/hysteria"; _u_bin="$HY_BIN"
       else
         _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
       fi
@@ -946,8 +1357,18 @@ if [ "$UPDATE_MODE" = "1" ]; then
         exit 0
       fi
       _u_inst=""
-      [ -x "$_u_bin" ] && _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
-      _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+      if [ -x "$_u_bin" ]; then
+        if [ "$_ucore" = "hysteria" ]; then
+          _u_inst=$(_hysteria_local_ver "$_u_bin")
+        else
+          _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
+        fi
+      fi
+      if [ "$_ucore" = "hysteria" ]; then
+        _u_latest=$(_latest_hysteria_ver) || _u_latest=""
+      else
+        _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+      fi
       if [ -z "$_u_latest" ]; then
         warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
         exit 0
@@ -964,7 +1385,10 @@ if [ "$UPDATE_MODE" = "1" ]; then
       # 备份旧内核：新内核万一跑不起来，回滚后节点不受影响
       [ -x "$_u_bin" ] && cp -a "$_u_bin" "${_u_bin}.bak" 2>/dev/null
       FORCE_DL=1
-      if [ "$_ucore" = "xray" ]; then dl_xray; else dl_singbox; fi
+      if [ "$_ucore" = "xray" ]; then dl_xray
+      elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
+      else dl_singbox
+      fi
       FORCE_DL=0
       # 重启所有用这个内核的节点（子 shell 里改 FORCE_DL 不影响外面）
       step "[更新] 重启 $_ucore 的节点服务…"
@@ -1088,9 +1512,11 @@ case "$_proto" in
   7) PROTO="tuic" ;;
   *) PROTO="vless" ;;
 esac
-# 1-4 用 Xray 内核，5-7 用 sing-box 内核
+# 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。
+# Hysteria2 用官方 hysteria：sing-box 1.14 解压后约 80MB，64MB 内存的 NAT 会在下载或启动时被撑死。
 case "$PROTO" in
-  anytls|hy2|tuic) CORE="sing-box" ;;
+  hy2) CORE="hysteria" ;;
+  anytls|tuic) CORE="sing-box" ;;
   *) CORE="xray" ;;
 esac
 
@@ -1186,6 +1612,8 @@ info "账号密码已随机生成（装完会显示，平时输入 jiedian 也�
 # ---------- 8. 下载内核 ----------
 if [ "$CORE" = "xray" ]; then
   dl_xray
+elif [ "$CORE" = "hysteria" ]; then
+  dl_hysteria
 else
   dl_singbox
 fi
@@ -1268,13 +1696,27 @@ fi
 mkdir -p "$NODE_DIR" || die "无法创建节点目录 $NODE_DIR"
 
 # ---------- 9b. 自签证书（Hysteria2 / TUIC 需要） ----------
-if [ "$PROTO" = "hy2" ] || [ "$PROTO" = "tuic" ]; then
+if [ "$PROTO" = "hy2" ]; then
+  step "[证书] 生成自签证书…"
+  umask 077
+  drop_page_cache
+  # 官方 hysteria 自己会写证书和私钥，不用再拆 PEM，也不用装 openssl
+  _hy_cert_err=$("$HY_BIN" cert --host www.samsung.com \
+    --cert "$NODE_DIR/cert.pem" --key "$NODE_DIR/key.pem" \
+    --valid-for 87600h --overwrite 2>&1)
+  if [ $? -ne 0 ] || [ ! -s "$NODE_DIR/cert.pem" ] || [ ! -s "$NODE_DIR/key.pem" ]; then
+    die "自签证书生成失败。$(printf '%s' "$_hy_cert_err" | tr '\n' ' ' | cut -c1-300)"
+  fi
+  chmod 600 "$NODE_DIR/key.pem" "$NODE_DIR/cert.pem" 2>/dev/null
+  info "自签证书已生成"
+elif [ "$PROTO" = "tuic" ]; then
   step "[证书] 生成自签证书…"
   umask 077
   # sing-box 自带 tls-keypair 生成自签证书，不需要 openssl；有效期 120 个月
+  # 私钥可能是 "PRIVATE KEY" 或 "EC PRIVATE KEY"，两种都要认
   "$SB_BIN" generate tls-keypair www.samsung.com --months 120 > "$NODE_DIR/tls.pem" 2>/dev/null \
     || die "自签证书生成失败"
-  awk '/BEGIN PRIVATE KEY/{p=1} p{print} /END PRIVATE KEY/{p=0}' "$NODE_DIR/tls.pem" > "$NODE_DIR/key.pem"
+  awk '/-----BEGIN / && /PRIVATE KEY-----/{p=1} p{print} /-----END / && /PRIVATE KEY-----/{p=0}' "$NODE_DIR/tls.pem" > "$NODE_DIR/key.pem"
   awk '/BEGIN CERTIFICATE/{p=1} p{print} /END CERTIFICATE/{p=0}' "$NODE_DIR/tls.pem" > "$NODE_DIR/cert.pem"
   rm -f "$NODE_DIR/tls.pem"
   [ -s "$NODE_DIR/key.pem" ] && [ -s "$NODE_DIR/cert.pem" ] \
@@ -1391,12 +1833,54 @@ EOF
 EOF
     ;;
 esac
-"$XRAY_BIN" -test -config "$NODE_DIR/config.json" >/dev/null 2>&1 \
-  || die "配置文件校验没通过，请截图发我看看"
+_xray_test=$("$XRAY_BIN" -test -config "$NODE_DIR/config.json" 2>&1) \
+  || die "配置文件校验没通过。$(printf '%s' "$_xray_test" | tr '\n' ' ' | cut -c1-300)"
 info "配置文件校验通过"
 
+elif [ "$CORE" = "hysteria" ]; then
+# ---------- 官方 Hysteria2 配置 ----------
+# 伪装用内置 404，不反向代理外网：NAT 上解析不了伪装站时，节点照样能起。
+HY_CONF="$NODE_DIR/config.yaml"
+if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
+_hy_quic=""
+if [ "$LOW_MEM" = "1" ]; then
+  # 官方默认接收窗口是 8MB/20MB，64MB 机器上容易把进程打爆。内存小就收紧。
+  if [ "$SWAP_OK" = "1" ]; then
+    _hy_qs=2097152; _hy_qc=4194304
+  else
+    _hy_qs=1048576; _hy_qc=2097152
+  fi
+  _hy_quic="
+quic:
+  initStreamReceiveWindow: $_hy_qs
+  maxStreamReceiveWindow: $_hy_qs
+  initConnReceiveWindow: $_hy_qc
+  maxConnReceiveWindow: $_hy_qc
+  maxIncomingStreams: 16"
+fi
+cat > "$HY_CONF" <<EOF
+listen: "$HY_LISTEN"
+
+tls:
+  cert: $NODE_DIR/cert.pem
+  key: $NODE_DIR/key.pem
+  sniGuard: disable
+
+auth:
+  type: password
+  password: "$HY2_PASS"
+
+ignoreClientBandwidth: true
+
+masquerade:
+  type: "404"
+$_hy_quic
+EOF
+chmod 600 "$HY_CONF" 2>/dev/null
+info "配置文件已写入"
+
 else
-# ---------- sing-box 配置（AnyTLS / Hysteria2 / TUIC） ----------
+# ---------- sing-box 配置（AnyTLS / TUIC） ----------
 SB_CONF="$NODE_DIR/config.json"
 if [ "$IPVER" = "6" ]; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
@@ -1419,29 +1903,6 @@ case "$PROTO" in
           "private_key": "$REALITY_PRIV",
           "short_id": [ "$REALITY_SID" ]
         }
-      }
-    }
-  ],
-  "outbounds": [ { "type": "direct" } ]
-}
-EOF
-    ;;
-  hy2)
-    cat > "$SB_CONF" <<EOF
-{
-  "log": { "level": "warning" },
-  "inbounds": [
-    {
-      "type": "hysteria2",
-      "listen": "$SB_LISTEN",
-      "listen_port": $PORT,
-      "users": [ { "name": "xray-node", "password": "$HY2_PASS" } ],
-      "masquerade": "https://www.samsung.com/",
-      "tls": {
-        "enabled": true,
-        "server_name": "www.samsung.com",
-        "certificate_path": "$NODE_DIR/cert.pem",
-        "key_path": "$NODE_DIR/key.pem"
       }
     }
   ],
@@ -1474,8 +1935,8 @@ EOF
 EOF
     ;;
 esac
-"$SB_BIN" check -c "$SB_CONF" >/dev/null 2>&1 \
-  || die "配置文件校验没通过，请截图发我看看"
+_sb_test=$("$SB_BIN" check -c "$SB_CONF" 2>&1) \
+  || die "配置文件校验没通过。$(printf '%s' "$_sb_test" | tr '\n' ' ' | cut -c1-300)"
 info "配置文件校验通过"
 fi
 
@@ -1502,7 +1963,14 @@ done
 if [ "$_svc_listen_ok" = "1" ]; then
   info "端口 $PORT 已在监听，服务真正跑起来了"
 else
-  die "服务没能监听端口 $PORT：节点装坏了。请先运行 systemctl status 'xray-node@${NODE_ID}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
+  echo "-------- 服务最后的日志 --------"
+  if [ -n "$SVC_UNIT" ] && command -v journalctl >/dev/null 2>&1; then
+    journalctl -u "$SVC_UNIT" -n 20 --no-pager 2>/dev/null
+  fi
+  if [ -f "/var/log/xray-node-${NODE_ID}.log" ]; then
+    tail -n 20 "/var/log/xray-node-${NODE_ID}.log" 2>/dev/null
+  fi
+  die "服务没能监听端口 $PORT：节点装坏了。请把上面的日志截图发我。也可以运行 systemctl status '${SVC_UNIT:-xray-node@${NODE_ID}}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
 fi
 
 # ---------- 12. 放行端口 ----------
