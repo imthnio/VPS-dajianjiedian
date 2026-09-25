@@ -23,6 +23,8 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS
 
 NAT VPS 要先在服务商面板确认端口映射。脚本只能检查本机端口在监听，无法替服务商创建映射或验证公网入口。Hysteria2 和 TUIC 需要 UDP 映射，其余协议需要 TCP；Shadowsocks 需要 TCP 和 UDP。
 
+64MB 内存、1GB 硬盘的小 NAT 也可以装 Hysteria2。脚本会自动加一块虚拟内存，并改用大约 22MB 的官方 Hysteria 程序。新版 sing-box 解压后大约 80MB，这种小机器会在下载或启动时失败。
+
 UUID 和密码全部随机生成，不用你操心。
 
 ## 看节点
@@ -39,7 +41,7 @@ jiedian
 
 节点装好之后，想升级内核或修复脚本 bug，不用重装：**直接重跑上面那条一键命令**，看到菜单选 `1`（默认，直接回车就行）：
 
-- 只把脚本自己安装的 Xray / sing-box 内核升到最新版；机器原有的内核会跳过，以免影响其他服务
+- 只把脚本自己安装的 Xray / sing-box / Hysteria2 内核升到最新版；机器原有的内核会跳过，以免影响其他服务
 - 节点配置、端口、密码、链接**全部不变**，照常用
 - 内核已经是最新时，会顺手把 `jiedian` / `shanjiedian` 两个命令同步成最新版
 - 升级后自动检查每个节点的端口真的在监听；新内核万一起不来会自动回滚到旧版，节点不受影响
