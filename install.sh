@@ -1860,6 +1860,9 @@ step "[配置] 写入配置…"
 mkdir -p /etc/xray-node
 
 if [ "$CORE" = "xray" ]; then
+# 与 Hysteria2 / sing-box 一致：纯 IPv6 机器必须听 [::]，默认 0.0.0.0 只收 IPv4，
+# 选了 IPv6 却听不到时会出现“安装成功但客户端连不上”。
+if [ "$IPVER" = "6" ]; then XRAY_LISTEN="::"; else XRAY_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   vless)
     cat > "$NODE_DIR/config.json" <<EOF
@@ -1867,6 +1870,7 @@ case "$PROTO" in
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
+      "listen": "$XRAY_LISTEN",
       "port": $PORT,
       "protocol": "vless",
       "settings": {
@@ -1898,6 +1902,7 @@ EOF
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
+      "listen": "$XRAY_LISTEN",
       "port": $PORT,
       "protocol": "trojan",
       "settings": {
@@ -1928,6 +1933,7 @@ EOF
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
+      "listen": "$XRAY_LISTEN",
       "port": $PORT,
       "protocol": "vmess",
       "settings": {
@@ -1950,6 +1956,7 @@ EOF
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
+      "listen": "$XRAY_LISTEN",
       "port": $PORT,
       "protocol": "shadowsocks",
       "settings": {
