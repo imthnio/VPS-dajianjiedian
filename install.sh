@@ -179,7 +179,20 @@ wait_for_port() {
         netstat -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
       fi
     else
-      return 0  # 没有 ss/netstat，无法检查，视为通过
+      # 极简系统可能没有 ss/netstat；从内核套接字表检查，不能把“无法检查”当作成功。
+      _wp_hex=$(printf '%04X' "$_wp")
+      if [ "$_wproto" = "udp" ]; then
+        _wp_files="/proc/net/udp /proc/net/udp6"; _wp_state=07
+      else
+        _wp_files="/proc/net/tcp /proc/net/tcp6"; _wp_state=0A
+      fi
+      for _wp_file in $_wp_files; do
+        [ -r "$_wp_file" ] || continue
+        awk -v port="$_wp_hex" -v state="$_wp_state" '
+          NR > 1 { split($2, addr, ":"); if (toupper(addr[2]) == port && toupper($4) == state) found = 1 }
+          END { exit !found }
+        ' "$_wp_file" && return 0
+      done
     fi
     sleep 1
     _wtry=$((_wtry + 1))
@@ -755,9 +768,6 @@ recover_disk_space() {
   _rdf=$(_disk_free_mb /)
   if [ "$LOW_MEM" = "1" ] || { [ -n "$_rdf" ] && [ "$_rdf" -lt 200 ]; }; then
     rm -f /var/cache/apt/archives/*.deb 2>/dev/null
-    if command -v journalctl >/dev/null 2>&1; then
-      journalctl --vacuum-size=1M >/dev/null 2>&1
-    fi
   fi
 }
 
@@ -1173,39 +1183,86 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     _m_cfg=/usr/local/etc/sing-box/config.json
   fi
   if [ ! -f "$_m_cfg" ]; then
-    warn "找不到老节点的配置文件（$_m_cfg），跳过迁移，按全新安装处理"
-    rm -f /etc/xray-node/node.txt
+    die "找不到老节点的配置文件（$_m_cfg），旧节点资料已保留；请先检查旧安装再重试"
   else
-    mkdir -p /etc/xray-node/nodes/1
-    # 停掉老服务（systemd / OpenRC / 兜底进程都处理）
+    _m_port=$(sed -n 's/^端口: //p' /etc/xray-node/node.txt | head -1)
+    _m_proto=tcp
+    case "$(sed -n 's/^协议: //p' /etc/xray-node/node.txt | head -1)" in
+      hy2|hysteria2|tuic|TUIC) _m_proto=udp ;;
+    esac
+    if [ -f /etc/xray-node/fw_info ]; then
+      read -r _m_fw_port _m_fw_proto _m_rest < /etc/xray-node/fw_info
+      case "$_m_fw_port" in *[!0-9]*|'') ;; *)
+        _m_port=$_m_fw_port
+        case "$_m_fw_proto" in tcp|udp) _m_proto=$_m_fw_proto ;; esac
+        ;;
+      esac
+    fi
+    _m_manager=""
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-      systemctl stop "$_m_core" >/dev/null 2>&1
-      systemctl disable "$_m_core" >/dev/null 2>&1
-      rm -f "/etc/systemd/system/${_m_core}.service"
-      systemctl daemon-reload >/dev/null 2>&1
+      _m_manager=systemd
+    elif command -v rc-service >/dev/null 2>&1; then
+      _m_manager=openrc
     fi
-    if command -v rc-service >/dev/null 2>&1; then
-      rc-service "$_m_core" stop >/dev/null 2>&1
-      rc-update del "$_m_core" default >/dev/null 2>&1
-      rm -f "/etc/init.d/${_m_core}"
-    fi
-    pkill -f "$_m_cfg" >/dev/null 2>&1
-    sleep 1
-    # 搬家：配置、节点信息、防火墙记录、内核标记
-    mv -f "$_m_cfg" /etc/xray-node/nodes/1/config.json
-    mv -f /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt
-    [ -f /etc/xray-node/fw_info ] && mv -f /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info
-    [ -f /etc/xray-node/core ] && mv -f /etc/xray-node/core /etc/xray-node/nodes/1/core
-    chmod 600 /etc/xray-node/nodes/1/config.json /etc/xray-node/nodes/1/node.txt
-    rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
-    # 按新布局起服务
-    _svc_install 1
-    _m_port=""; _m_proto="tcp"
-    if _m_pp=$(_node_port 1); then set -- $_m_pp; _m_port="$1"; _m_proto="$2"; fi
-    if [ -n "$_m_port" ] && wait_for_port "$_m_port" "$_m_proto" 15; then
-      info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+    case "$_m_port" in *[!0-9]*|'') _m_port="" ;; esac
+    if [ -z "$_m_port" ] || [ "$_m_port" -lt 1 ] || [ "$_m_port" -gt 65535 ] ||
+       [ -z "$_m_manager" ] ||
+       { ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1 &&
+         [ ! -r /proc/net/tcp ] && [ ! -r /proc/net/udp ]; }; then
+      die "无法可靠核验老节点的端口或服务管理方式，旧节点保持原状；请检查后再重试"
     else
-      warn "老节点服务可能没起来：输入 jiedian 查看，或输入 shanjiedian 进节点管理检查"
+      # 先复制；只有新服务确认可用后才删除旧配置和旧服务。
+      mkdir -p /etc/xray-node/nodes/1 || die "无法创建新节点目录，旧节点未受影响"
+      cp -p "$_m_cfg" /etc/xray-node/nodes/1/config.json &&
+        cp -p /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "复制旧节点资料失败，旧节点未受影响"; }
+      [ ! -f /etc/xray-node/fw_info ] || cp -p /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "复制旧防火墙记录失败，旧节点未受影响"; }
+      printf '%s\n' "$_m_core" > /etc/xray-node/nodes/1/core ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "写入内核标记失败，旧节点未受影响"; }
+      if [ "$_m_manager" = systemd ]; then
+        systemctl stop "$_m_core" >/dev/null 2>&1
+      else
+        rc-service "$_m_core" stop >/dev/null 2>&1
+      fi
+      pkill -f "$_m_cfg" >/dev/null 2>&1
+      sleep 1
+      _svc_install 1
+      _m_new_ok=1
+      if [ "$_m_manager" = systemd ]; then
+        case "$_m_core" in sing-box) _m_new_unit=singbox-node@1 ;; *) _m_new_unit=xray-node@1 ;; esac
+        systemctl is-active --quiet "$_m_new_unit" || _m_new_ok=0
+      else
+        rc-service xray-node-1 status >/dev/null 2>&1 || _m_new_ok=0
+      fi
+      wait_for_port "$_m_port" "$_m_proto" 15 || _m_new_ok=0
+      if [ "$_m_new_ok" = 1 ]; then
+        if [ "$_m_manager" = systemd ]; then
+          systemctl disable "$_m_core" >/dev/null 2>&1
+          rm -f "/etc/systemd/system/${_m_core}.service"
+          systemctl daemon-reload >/dev/null 2>&1
+        else
+          rc-update del "$_m_core" default >/dev/null 2>&1
+          rm -f "/etc/init.d/${_m_core}"
+        fi
+        rm -f "$_m_cfg" /etc/xray-node/node.txt /etc/xray-node/fw_info /etc/xray-node/core
+        rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
+        info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+      else
+        if [ "$_m_manager" = systemd ]; then
+          systemctl stop "$_m_new_unit" >/dev/null 2>&1
+          systemctl disable "$_m_new_unit" >/dev/null 2>&1
+          systemctl start "$_m_core" >/dev/null 2>&1
+        else
+          rc-service xray-node-1 stop >/dev/null 2>&1
+          rc-update del xray-node-1 default >/dev/null 2>&1
+          rm -f /etc/init.d/xray-node-1
+          rc-service "$_m_core" start >/dev/null 2>&1
+        fi
+        rm -rf /etc/xray-node/nodes/1
+        rmdir /etc/xray-node/nodes 2>/dev/null
+        die "新服务未能正常监听，已尝试恢复旧节点；请检查旧服务状态后再重试"
+      fi
     fi
   fi
 fi
