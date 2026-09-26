@@ -323,3 +323,17 @@ class LegacyMigrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class XrayListenTest(unittest.TestCase):
+    def test_xray_inbounds_bind_listen_by_ipver(self):
+        """Pure IPv6 installs must not leave Xray on default 0.0.0.0-only (false success)."""
+        source = INSTALLER.read_text()
+        self.assertIn('if [ "$IPVER" = "6" ]; then XRAY_LISTEN="::"; else XRAY_LISTEN="0.0.0.0"; fi', source)
+        self.assertEqual(source.count('"listen": "$XRAY_LISTEN"'), 4)
+        # Each Xray protocol inbound must include the listen field.
+        for proto in ("vless", "trojan", "vmess", "shadowsocks"):
+            self.assertIn(f'"protocol": "{proto}"', source)
+            idx = source.find(f'"protocol": "{proto}"')
+            window = source[max(0, idx - 120):idx]
+            self.assertIn('"listen": "$XRAY_LISTEN"', window, msg=proto)
