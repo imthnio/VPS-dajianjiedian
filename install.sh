@@ -179,7 +179,20 @@ wait_for_port() {
         netstat -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
       fi
     else
-      return 0  # 没有 ss/netstat，无法检查，视为通过
+      # 极简系统可能没有 ss/netstat；从内核套接字表检查，不能把“无法检查”当作成功。
+      _wp_hex=$(printf '%04X' "$_wp")
+      if [ "$_wproto" = "udp" ]; then
+        _wp_files="/proc/net/udp /proc/net/udp6"; _wp_state=07
+      else
+        _wp_files="/proc/net/tcp /proc/net/tcp6"; _wp_state=0A
+      fi
+      for _wp_file in $_wp_files; do
+        [ -r "$_wp_file" ] || continue
+        awk -v port="$_wp_hex" -v state="$_wp_state" '
+          NR > 1 { split($2, addr, ":"); if (toupper(addr[2]) == port && toupper($4) == state) found = 1 }
+          END { exit !found }
+        ' "$_wp_file" && return 0
+      done
     fi
     sleep 1
     _wtry=$((_wtry + 1))
@@ -187,59 +200,66 @@ wait_for_port() {
   return 1
 }
 
-# 64MB 级别的 NAT 机器上 apt 装 iptables-persistent 会把内存吃光，节点一起被杀掉。
-# 这种机器直接把当前规则记到文件，开机用一条很轻的服务恢复。
+# 小内存机器不装 iptables-persistent。开机只恢复本脚本添加的端口规则，
+# 不回放整张 iptables 快照，以免清掉安装后其他程序或用户添加的规则。
 _save_fw_light() {
-  mkdir -p /etc/xray-node 2>/dev/null
-  if [ "$1" = "6" ]; then
-    _sv=/etc/xray-node/rules.v6; _sv_bin=ip6tables-save
-  else
-    _sv=/etc/xray-node/rules.v4; _sv_bin=iptables-save
-  fi
-  if ! command -v "$_sv_bin" >/dev/null 2>&1; then
-    warn "内存很小，没有安装额外的防火墙组件。规则这次有效；重启后如果端口不通，重跑一次脚本即可"
-    return 0
-  fi
-  if ! "$_sv_bin" > "$_sv" 2>/dev/null; then
-    warn "防火墙规则没能存盘。重启后如果端口不通，重跑一次脚本即可"
-    return 0
-  fi
-  chmod 600 "$_sv" 2>/dev/null
+  cat > /usr/local/bin/xray-node-fw-restore <<'FWEOF' || return 1
+#!/bin/sh
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+_restore_failed=0
+for _fw in "$NODES_DIR"/*/fw_info; do
+  [ -f "$_fw" ] || continue
+  while read -r _port _proto _ufw _fwl _ipt _family; do
+    case "$_port" in ''|*[!0-9]*) continue ;; esac
+    case "$_proto" in tcp|udp) ;; *) continue ;; esac
+    # 旧版两列 fw_info 默认记录脚本添加的规则。
+    [ "$_ipt" = "1" ] || [ -z "$_ufw$_fwl$_ipt" ] || continue
+    if [ "$_family" = "6" ]; then _bin=ip6tables; else _bin=iptables; fi
+    command -v "$_bin" >/dev/null 2>&1 || { _restore_failed=1; continue; }
+    "$_bin" -C INPUT -p "$_proto" --dport "$_port" -j ACCEPT >/dev/null 2>&1 ||
+      "$_bin" -I INPUT -p "$_proto" --dport "$_port" -j ACCEPT >/dev/null 2>&1 ||
+      _restore_failed=1
+  done < "$_fw"
+done
+exit "$_restore_failed"
+FWEOF
+  chmod 700 /usr/local/bin/xray-node-fw-restore || return 1
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    cat > /etc/systemd/system/xray-node-fw.service <<'FWEOF'
+    cat > /etc/systemd/system/xray-node-fw.service <<'FWEOF' || return 1
 [Unit]
 Description=Restore xray-node firewall rules
 After=network-pre.target
 Before=network.target
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '[ -f /etc/xray-node/rules.v4 ] && iptables-restore < /etc/xray-node/rules.v4; [ -f /etc/xray-node/rules.v6 ] && ip6tables-restore < /etc/xray-node/rules.v6; exit 0'
+ExecStart=/usr/local/bin/xray-node-fw-restore
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 FWEOF
     systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable xray-node-fw.service >/dev/null 2>&1
-    info "防火墙规则已存盘（重启后仍有效）"
+    systemctl enable xray-node-fw.service >/dev/null 2>&1 || return 1
+    rm -f /etc/xray-node/rules.v4 /etc/xray-node/rules.v6
+    info "本脚本添加的防火墙规则已设为开机恢复"
     return 0
   fi
   if command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
-    cat > /etc/init.d/xray-node-fw <<'FWEOF'
+    cat > /etc/init.d/xray-node-fw <<'FWEOF' || return 1
 #!/sbin/openrc-run
 description="Restore xray-node firewall rules"
 depend() { before net; }
 start() {
-  [ -f /etc/xray-node/rules.v4 ] && iptables-restore < /etc/xray-node/rules.v4
-  [ -f /etc/xray-node/rules.v6 ] && ip6tables-restore < /etc/xray-node/rules.v6
-  return 0
+  /usr/local/bin/xray-node-fw-restore
 }
 FWEOF
-    chmod +x /etc/init.d/xray-node-fw
-    rc-update add xray-node-fw default >/dev/null 2>&1
-    info "防火墙规则已存盘（重启后仍有效）"
+    chmod +x /etc/init.d/xray-node-fw || return 1
+    rc-update add xray-node-fw default >/dev/null 2>&1 || return 1
+    rm -f /etc/xray-node/rules.v4 /etc/xray-node/rules.v6
+    info "本脚本添加的防火墙规则已设为开机恢复"
     return 0
   fi
-  warn "防火墙规则这次已加上。小内存机器没有额外组件可装，重启后如果端口不通，重跑一次脚本即可"
+  warn "防火墙规则这次已加上，但没有开机服务管理器；重启后需手动运行 xray-node-fw-restore"
+  return 1
 }
 
 _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后还在
@@ -247,7 +267,7 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
   # 尽力而为：实在存不了就明确告诉用户，不拦主流程。
   # 小内存机器走轻量存盘，避免 apt 把仅有的几十 MB 内存吃光。
   if [ "$LOW_MEM" = "1" ]; then
-    _save_fw_light "$1"
+    _save_fw_light || warn "防火墙规则没能设为开机恢复，重启后可能需要重新放行端口"
     return 0
   fi
   if [ "$1" = "6" ]; then _fw_svc=ip6tables; _fw_save_bin=ip6tables-save
@@ -323,14 +343,7 @@ _fw_save() {
     if [ "$1" = "6" ]; then _fs_svc=ip6tables; else _fs_svc=iptables; fi
     [ -f "/etc/init.d/$_fs_svc" ] && "/etc/init.d/$_fs_svc" save >/dev/null 2>&1
   fi
-  # 小内存机器没有装 iptables-persistent，规则在 /etc/xray-node/rules.v4
-  if [ -f /etc/xray-node/rules.v4 ] || [ -f /etc/xray-node/rules.v6 ]; then
-    if [ "$1" = "6" ]; then
-      command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/xray-node/rules.v6 2>/dev/null
-    else
-      command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/xray-node/rules.v4 2>/dev/null
-    fi
-  fi
+  # 小内存模式的恢复器按现存节点的 fw_info 工作，无需保存整张规则表。
 }
 
 # _del_fw_rules <fw_info路径>：撤销该节点我们亲手加的防火墙规则（用户手写的不碰）
@@ -454,6 +467,7 @@ _uninstall_all() {
   rm -f /etc/sysctl.d/99-xray-node-bbr.conf
   rm -f /usr/local/bin/jiedian
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
+  rm -f /usr/local/bin/xray-node-fw-restore
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
 }
 
@@ -497,6 +511,19 @@ XZEOF
 chmod 700 /usr/local/bin/shanjiedian
 # 旧版的 xiezai 是"一键全删"，改名后把它删掉，免得留着误导人
 rm -f /usr/local/bin/xiezai
+for _hy_node in /etc/xray-node/nodes/*/; do
+  [ -f "${_hy_node}core" ] && [ -f "${_hy_node}node.txt" ] || continue
+  [ "$(tr -d ' \r\n' < "${_hy_node}core")" = "hysteria" ] || continue
+  # 旧节点只修分享链接和文字提示；证书、密码、端口和服务不变。
+  if grep -q '^hysteria2://.*pinSHA256=' "${_hy_node}node.txt" &&
+     ! grep -q '^hysteria2://.*[?&]insecure=' "${_hy_node}node.txt"; then
+    sed -e '/^hysteria2:\/\//s/?sni=/?insecure=1\&sni=/' \
+      -e 's/客户端不要打开“跳过证书验证”。如果导入后证书锁定是空的，把上面的指纹填进去。/官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。/' \
+      "${_hy_node}node.txt" > "${_hy_node}node.txt.tmp" &&
+      mv -f "${_hy_node}node.txt.tmp" "${_hy_node}node.txt"
+    chmod 600 "${_hy_node}node.txt" 2>/dev/null
+  fi
+done
 }
 
 _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
@@ -741,9 +768,6 @@ recover_disk_space() {
   _rdf=$(_disk_free_mb /)
   if [ "$LOW_MEM" = "1" ] || { [ -n "$_rdf" ] && [ "$_rdf" -lt 200 ]; }; then
     rm -f /var/cache/apt/archives/*.deb 2>/dev/null
-    if command -v journalctl >/dev/null 2>&1; then
-      journalctl --vacuum-size=1M >/dev/null 2>&1
-    fi
   fi
 }
 
@@ -1159,39 +1183,86 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     _m_cfg=/usr/local/etc/sing-box/config.json
   fi
   if [ ! -f "$_m_cfg" ]; then
-    warn "找不到老节点的配置文件（$_m_cfg），跳过迁移，按全新安装处理"
-    rm -f /etc/xray-node/node.txt
+    die "找不到老节点的配置文件（$_m_cfg），旧节点资料已保留；请先检查旧安装再重试"
   else
-    mkdir -p /etc/xray-node/nodes/1
-    # 停掉老服务（systemd / OpenRC / 兜底进程都处理）
+    _m_port=$(sed -n 's/^端口: //p' /etc/xray-node/node.txt | head -1)
+    _m_proto=tcp
+    case "$(sed -n 's/^协议: //p' /etc/xray-node/node.txt | head -1)" in
+      hy2|hysteria2|tuic|TUIC) _m_proto=udp ;;
+    esac
+    if [ -f /etc/xray-node/fw_info ]; then
+      read -r _m_fw_port _m_fw_proto _m_rest < /etc/xray-node/fw_info
+      case "$_m_fw_port" in *[!0-9]*|'') ;; *)
+        _m_port=$_m_fw_port
+        case "$_m_fw_proto" in tcp|udp) _m_proto=$_m_fw_proto ;; esac
+        ;;
+      esac
+    fi
+    _m_manager=""
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-      systemctl stop "$_m_core" >/dev/null 2>&1
-      systemctl disable "$_m_core" >/dev/null 2>&1
-      rm -f "/etc/systemd/system/${_m_core}.service"
-      systemctl daemon-reload >/dev/null 2>&1
+      _m_manager=systemd
+    elif command -v rc-service >/dev/null 2>&1; then
+      _m_manager=openrc
     fi
-    if command -v rc-service >/dev/null 2>&1; then
-      rc-service "$_m_core" stop >/dev/null 2>&1
-      rc-update del "$_m_core" default >/dev/null 2>&1
-      rm -f "/etc/init.d/${_m_core}"
-    fi
-    pkill -f "$_m_cfg" >/dev/null 2>&1
-    sleep 1
-    # 搬家：配置、节点信息、防火墙记录、内核标记
-    mv -f "$_m_cfg" /etc/xray-node/nodes/1/config.json
-    mv -f /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt
-    [ -f /etc/xray-node/fw_info ] && mv -f /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info
-    [ -f /etc/xray-node/core ] && mv -f /etc/xray-node/core /etc/xray-node/nodes/1/core
-    chmod 600 /etc/xray-node/nodes/1/config.json /etc/xray-node/nodes/1/node.txt
-    rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
-    # 按新布局起服务
-    _svc_install 1
-    _m_port=""; _m_proto="tcp"
-    if _m_pp=$(_node_port 1); then set -- $_m_pp; _m_port="$1"; _m_proto="$2"; fi
-    if [ -n "$_m_port" ] && wait_for_port "$_m_port" "$_m_proto" 15; then
-      info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+    case "$_m_port" in *[!0-9]*|'') _m_port="" ;; esac
+    if [ -z "$_m_port" ] || [ "$_m_port" -lt 1 ] || [ "$_m_port" -gt 65535 ] ||
+       [ -z "$_m_manager" ] ||
+       { ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1 &&
+         [ ! -r /proc/net/tcp ] && [ ! -r /proc/net/udp ]; }; then
+      die "无法可靠核验老节点的端口或服务管理方式，旧节点保持原状；请检查后再重试"
     else
-      warn "老节点服务可能没起来：输入 jiedian 查看，或输入 shanjiedian 进节点管理检查"
+      # 先复制；只有新服务确认可用后才删除旧配置和旧服务。
+      mkdir -p /etc/xray-node/nodes/1 || die "无法创建新节点目录，旧节点未受影响"
+      cp -p "$_m_cfg" /etc/xray-node/nodes/1/config.json &&
+        cp -p /etc/xray-node/node.txt /etc/xray-node/nodes/1/node.txt ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "复制旧节点资料失败，旧节点未受影响"; }
+      [ ! -f /etc/xray-node/fw_info ] || cp -p /etc/xray-node/fw_info /etc/xray-node/nodes/1/fw_info ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "复制旧防火墙记录失败，旧节点未受影响"; }
+      printf '%s\n' "$_m_core" > /etc/xray-node/nodes/1/core ||
+        { rm -rf /etc/xray-node/nodes/1; rmdir /etc/xray-node/nodes 2>/dev/null; die "写入内核标记失败，旧节点未受影响"; }
+      if [ "$_m_manager" = systemd ]; then
+        systemctl stop "$_m_core" >/dev/null 2>&1
+      else
+        rc-service "$_m_core" stop >/dev/null 2>&1
+      fi
+      pkill -f "$_m_cfg" >/dev/null 2>&1
+      sleep 1
+      _svc_install 1
+      _m_new_ok=1
+      if [ "$_m_manager" = systemd ]; then
+        case "$_m_core" in sing-box) _m_new_unit=singbox-node@1 ;; *) _m_new_unit=xray-node@1 ;; esac
+        systemctl is-active --quiet "$_m_new_unit" || _m_new_ok=0
+      else
+        rc-service xray-node-1 status >/dev/null 2>&1 || _m_new_ok=0
+      fi
+      wait_for_port "$_m_port" "$_m_proto" 15 || _m_new_ok=0
+      if [ "$_m_new_ok" = 1 ]; then
+        if [ "$_m_manager" = systemd ]; then
+          systemctl disable "$_m_core" >/dev/null 2>&1
+          rm -f "/etc/systemd/system/${_m_core}.service"
+          systemctl daemon-reload >/dev/null 2>&1
+        else
+          rc-update del "$_m_core" default >/dev/null 2>&1
+          rm -f "/etc/init.d/${_m_core}"
+        fi
+        rm -f "$_m_cfg" /etc/xray-node/node.txt /etc/xray-node/fw_info /etc/xray-node/core
+        rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
+        info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+      else
+        if [ "$_m_manager" = systemd ]; then
+          systemctl stop "$_m_new_unit" >/dev/null 2>&1
+          systemctl disable "$_m_new_unit" >/dev/null 2>&1
+          systemctl start "$_m_core" >/dev/null 2>&1
+        else
+          rc-service xray-node-1 stop >/dev/null 2>&1
+          rc-update del xray-node-1 default >/dev/null 2>&1
+          rm -f /etc/init.d/xray-node-1
+          rc-service "$_m_core" start >/dev/null 2>&1
+        fi
+        rm -rf /etc/xray-node/nodes/1
+        rmdir /etc/xray-node/nodes 2>/dev/null
+        die "新服务未能正常监听，已尝试恢复旧节点；请检查旧服务状态后再重试"
+      fi
     fi
   fi
 fi
@@ -1219,6 +1290,11 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
     *) UPDATE_MODE=1 ;;
   esac
+fi
+
+# 旧版小内存模式保存了整张 iptables 快照。更新或加节点时改为只恢复本脚本的规则。
+if [ -f /etc/xray-node/rules.v4 ] || [ -f /etc/xray-node/rules.v6 ]; then
+  _save_fw_light || warn "旧版防火墙恢复服务迁移失败，重启前请检查防火墙规则"
 fi
 
 # 新节点编号：已有最大编号 + 1（删掉的编号不重用，避免和以前的节点搞混）
@@ -1382,8 +1458,15 @@ if [ "$UPDATE_MODE" = "1" ]; then
       else
         warn "$_ucore 内核文件丢失或已损坏，直接下载最新版 v${_u_latest}（节点配置保留）。"
       fi
-      # 备份旧内核：新内核万一跑不起来，回滚后节点不受影响
-      [ -x "$_u_bin" ] && cp -a "$_u_bin" "${_u_bin}.bak" 2>/dev/null
+      # 每次升级用独立备份路径；上次失败留下的备份不会被覆盖。
+      _u_backup=""
+      if [ -x "$_u_bin" ]; then
+        _u_backup=$(mktemp "${_u_bin}.bak.XXXXXX") ||
+          die "$_ucore 无法创建备份文件，升级已取消"
+        cp -a "$_u_bin" "$_u_backup" ||
+          { rm -f "$_u_backup"; die "$_ucore 旧内核备份失败，升级已取消"; }
+        info "旧内核备份：$_u_backup"
+      fi
       FORCE_DL=1
       if [ "$_ucore" = "xray" ]; then dl_xray
       elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
@@ -1411,10 +1494,20 @@ if [ "$UPDATE_MODE" = "1" ]; then
       done
       if [ -n "$_u_failed" ]; then
         _u_rb_bad=""
-        if [ -f "${_u_bin}.bak" ]; then
+        if [ -n "$_u_backup" ] && [ -f "$_u_backup" ]; then
           warn "新内核启动后有节点端口没监听，正在回滚到旧版本…"
-          cp -a "${_u_bin}.bak" "$_u_bin"
-          for _rid in $_u_failed; do
+          # 不能 cp 到正在运行的可执行文件：其他节点可能正运行新版，会触发 ETXTBSY。
+          # 在同一目录先写临时文件，再原子替换路径，并保留备份直到全部恢复成功。
+          rm -f "${_u_bin}.rollback"
+          cp -a "$_u_backup" "${_u_bin}.rollback" ||
+            die "回滚文件写入失败，备份仍在 $_u_backup，请手动恢复"
+          mv -f "${_u_bin}.rollback" "$_u_bin" ||
+            die "回滚替换失败，备份仍在 $_u_backup，请手动恢复"
+          # 所有共享此内核的节点都要切回旧版本，不能只重启刚才失败的节点。
+          for _rd in /etc/xray-node/nodes/*/; do
+            [ -f "${_rd}core" ] || continue
+            [ "$(tr -d ' \r\n' < "${_rd}core" 2>/dev/null)" = "$_ucore" ] || continue
+            _rid=$(basename "$_rd")
             _svc_restart "$_rid"
             sleep 1
             _r_port=""; _r_proto="tcp"
@@ -1430,14 +1523,14 @@ if [ "$UPDATE_MODE" = "1" ]; then
           _u_rb_bad="$_u_failed"
           warn "没有旧内核备份，无法回滚，请手动检查节点${_u_failed}的服务状态"
         fi
-        rm -f "${_u_bin}.bak"
         if [ -z "$_u_rb_bad" ]; then
+          rm -f "$_u_backup"
           die "$_ucore 新版本在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
         else
-          die "$_ucore 新版本跑不起来，且回滚后节点${_u_rb_bad}仍未恢复监听——节点可能已中断，请按上面的提示手动检查"
+          die "$_ucore 新版本跑不起来，且节点${_u_rb_bad}仍未恢复监听；备份路径：${_u_backup:-无}，请手动检查"
         fi
       fi
-      rm -f "${_u_bin}.bak"
+      [ -z "$_u_backup" ] || rm -f "$_u_backup"
       info "$_ucore 升级完成"
       ) || _u_any_fail=1
     done
@@ -2066,8 +2159,9 @@ case "$PROTO" in
     PROTO_NAME="AnyTLS + REALITY"
     ;;
   hy2)
-    # 不写 insecure=1：新版 Xray 看到“跳过验证”会直接起不来。用证书指纹代替。
-    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
+    # 官方 Hysteria2 客户端连接自签证书须同时设置 insecure=1 与 pinSHA256；
+    # pcs 供支持 Xray 分享字段的客户端使用，指纹仍会校验证书。
+    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
     PROTO_NAME="Hysteria2"
     ;;
   tuic)
@@ -2101,7 +2195,7 @@ esac
     hy2)
       printf "SNI: www.samsung.com\n"
       printf "证书指纹: %s\n" "$HY2_PIN"
-      printf "客户端不要打开“跳过证书验证”。如果导入后证书锁定是空的，把上面的指纹填进去。\n"
+      printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
       printf "Loon 可粘贴这一行:\n"
       printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
         "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN"
