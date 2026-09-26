@@ -80,6 +80,41 @@ class FirewallRestoreTest(unittest.TestCase):
 
 
 class PortCheckTest(unittest.TestCase):
+
+    def test_port_in_use_proc_fallback_detects_occupied_ports(self):
+        """Without ss/netstat, occupied ports must not look free (else install can false-succeed)."""
+        source = INSTALLER.read_text()
+        match = re.search(
+            r"(port_in_use\(\) \{.*?\n\})\n\nrand_port",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            net = root / "net"
+            net.mkdir()
+            (net / "tcp").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000:3039 00000000:0000 0A\n"
+            )
+            (net / "udp").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000:5BA0 00000000:0000 07\n"
+            )
+            function = match.group(1).replace("/proc/net", str(net))
+            stubs = "command() { return 1; }; "
+            for port, proto, expected in (
+                (12345, "tcp", 0),
+                (23456, "udp", 0),
+                (12346, "tcp", 1),
+                (12345, "udp", 1),
+            ):
+                result = subprocess.run(
+                    ["sh", "-c", stubs + function + f"\nport_in_use {port} {proto}"],
+                )
+                self.assertEqual(result.returncode, expected, (port, proto))
+
     def test_proc_fallback_requires_a_matching_socket(self):
         source = INSTALLER.read_text()
         match = re.search(
