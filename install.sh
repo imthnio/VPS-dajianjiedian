@@ -1342,11 +1342,12 @@ _apt_do() {
     wait "$_apt_pid" 2>/dev/null
     _apt_rc=$(cat "$_dep_log.rc" 2>/dev/null); rm -f "$_dep_log.rc"
     if [ "$_apt_rc" = "0" ]; then return 0; fi
-    # 上一次 apt 可能被超时杀在 dpkg 中间：先修复 dpkg 状态再重试，
-    # 否则后面所有 apt 都会报"dpkg was interrupted"直接失败。
-    if grep -qi "dpkg was interrupted" "$_dep_log" 2>/dev/null; then
-      printf "检测到上次安装被打断，正在修复…\n"
-      timeout 120 dpkg --configure -a >"$_dep_log" 2>&1
+    # 超时杀在 dpkg 中间，或下一次 apt 已报 interrupted：先修复再重试。
+    # 这条路径也必须计入 _an，否则会在反复 interrupted 时死循环。
+    if [ "$_apt_rc" = "124" ] || grep -qi "dpkg was interrupted" "$_dep_log" 2>/dev/null; then
+      _an=$((_an + 1))
+      printf "检测到安装被打断或超时，正在修复（%s/10）…\n" "$_an"
+      timeout 120 dpkg --configure -a >"$_dep_log" 2>&1 || true
       continue
     fi
     if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
