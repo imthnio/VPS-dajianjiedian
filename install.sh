@@ -45,6 +45,26 @@ port_in_use() { # port_in_use <端口> <tcp|udp>
   elif command -v netstat >/dev/null 2>&1; then
     if [ "$_pi_proto" = "udp" ]; then _pi_list=$(netstat -uln 2>/dev/null); else _pi_list=$(netstat -ltn 2>/dev/null); fi
   else
+    # 与 wait_for_port 一致：极简系统没有 ss/netstat 时从 /proc 查。
+    # 以前这里直接 return 2，调用方把“查不了”当成“空闲”，可能选中已被占用的端口；
+    # 随后 wait_for_port 的 /proc 回退又会看到别人的监听，误报安装成功。
+    _pi_hex=$(printf '%04X' "$_pi_port" 2>/dev/null) || return 2
+    if [ "$_pi_proto" = "udp" ]; then
+      _pi_files="/proc/net/udp /proc/net/udp6"; _pi_state=07
+    else
+      _pi_files="/proc/net/tcp /proc/net/tcp6"; _pi_state=0A
+    fi
+    _pi_checked=0
+    for _pi_file in $_pi_files; do
+      [ -r "$_pi_file" ] || continue
+      _pi_checked=1
+      awk -v port="$_pi_hex" -v state="$_pi_state" '
+        NR > 1 { split($2, addr, ":"); if (toupper(addr[2]) == port && toupper($4) == state) found = 1 }
+        END { exit !found }
+      ' "$_pi_file" && return 0
+    done
+    # /proc 可读且未命中：确认空闲。都读不到才返回 2（未知）。
+    [ "$_pi_checked" = "1" ] && return 1
     return 2
   fi
   printf '%s\n' "$_pi_list" | grep -Eq ":${_pi_port}[[:space:]]"
@@ -2071,6 +2091,24 @@ for _sp in $_SVC_PROTOS; do
     _svc_listen_ok=0
   fi
 done
+# 端口在听不等于是我们的服务：极简机上 port_in_use 曾查不到占用时，
+# 别人占用的端口会让 wait_for_port 误报成功。再确认本节点服务/进程还在。
+if [ "$_svc_listen_ok" = "1" ]; then
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
+    systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
+  else
+    if [ "$CORE" = "hysteria" ]; then
+      _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.yaml"
+    else
+      _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.json"
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+      pgrep -f "$_svc_cfg_pat" >/dev/null 2>&1 || _svc_listen_ok=0
+    fi
+  fi
+fi
 if [ "$_svc_listen_ok" = "1" ]; then
   info "端口 $PORT 已在监听，服务真正跑起来了"
 else
