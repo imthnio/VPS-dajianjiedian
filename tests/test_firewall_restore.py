@@ -79,6 +79,41 @@ class FirewallRestoreTest(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
 
 
+class PortCheckTest(unittest.TestCase):
+    def test_proc_fallback_requires_a_matching_socket(self):
+        source = INSTALLER.read_text()
+        match = re.search(
+            r"(wait_for_port\(\) \{.*?\n\})\n\n# 小内存机器",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            net = root / "net"
+            net.mkdir()
+            (net / "tcp").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000:3039 00000000:0000 0A\n"
+            )
+            (net / "udp").write_text(
+                "sl local_address rem_address st\n"
+                "0: 00000000:5BA0 00000000:0000 07\n"
+            )
+            function = match.group(1).replace("/proc/net", str(net))
+            stubs = "command() { return 1; }; sleep() { :; }; "
+            for port, proto, expected in (
+                (12345, "tcp", 0),
+                (23456, "udp", 0),
+                (12346, "tcp", 1),
+                (12345, "udp", 1),
+            ):
+                result = subprocess.run(
+                    ["sh", "-c", stubs + function + f"\nwait_for_port {port} {proto} 1"],
+                )
+                self.assertEqual(result.returncode, expected, (port, proto))
+
+
 class HysteriaLinkTest(unittest.TestCase):
     def test_self_signed_link_enables_pin_verification(self):
         source = INSTALLER.read_text()
@@ -140,6 +175,114 @@ class HysteriaLinkTest(unittest.TestCase):
             self.assertEqual(
                 updated,
                 old_link.replace("?sni=", "?insecure=1&sni="),
+            )
+
+
+class LegacyMigrationTest(unittest.TestCase):
+    def migration_script(self, root):
+        source = INSTALLER.read_text()
+        match = re.search(
+            r"(if \[ -f /etc/xray-node/node\.txt \] && \[ ! -d /etc/xray-node/nodes \]; then.*?\nfi)\n\n# 已经装过节点",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        return match.group(1).replace(
+            "/etc/xray-node", str(root / "etc" / "xray-node")
+        ).replace(
+            "/usr/local/etc/xray", str(root / "old-xray")
+        ).replace(
+            "/usr/local/etc/sing-box", str(root / "old-sing-box")
+        ).replace(
+            "/run/systemd/system", str(root / "run" / "systemd" / "system")
+        ).replace(
+            "/etc/systemd/system", str(root / "etc" / "systemd" / "system")
+        )
+
+    def test_missing_config_preserves_legacy_node_details(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = root / "etc" / "xray-node"
+            old.mkdir(parents=True)
+            info = old / "node.txt"
+            info.write_text("legacy credentials\n")
+            (old / "core").write_text("xray\n")
+            result = subprocess.run(
+                ["sh", "-c", "step() { :; }\ndie() { exit 2; }\n" + self.migration_script(root)],
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(info.read_text(), "legacy credentials\n")
+            self.assertFalse((old / "nodes").exists())
+
+    def test_failed_new_service_restores_old_service_and_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = root / "etc" / "xray-node"
+            old.mkdir(parents=True)
+            (root / "old-xray").mkdir()
+            (root / "run" / "systemd" / "system").mkdir(parents=True)
+            info = old / "node.txt"
+            info.write_text("协议: vless\n端口: 12345\nlegacy credentials\n")
+            config = root / "old-xray" / "config.json"
+            config.write_text('{"inbounds": []}\n')
+            (old / "core").write_text("xray\n")
+            service_log = root / "service.log"
+            stubs = (
+                'step() { :; }; warn() { :; }; info() { :; }; sleep() { :; }; '
+                'pkill() { :; }; ss() { :; }; _svc_install() { :; }; '
+                'wait_for_port() { return 1; }; die() { exit 2; }; '
+                'systemctl() { printf "%s\\n" "$*" >> "$SERVICE_LOG"; '
+                'case "$1" in is-active) return 1 ;; esac; }; '
+            )
+            env = os.environ.copy()
+            env["SERVICE_LOG"] = str(service_log)
+            result = subprocess.run(
+                ["sh", "-c", stubs + self.migration_script(root)], env=env
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(info.read_text(), "协议: vless\n端口: 12345\nlegacy credentials\n")
+            self.assertEqual(config.read_text(), '{"inbounds": []}\n')
+            self.assertFalse((old / "nodes").exists())
+            self.assertIn("start xray", service_log.read_text().splitlines())
+
+    def test_old_service_is_removed_only_after_new_service_listens(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = root / "etc" / "xray-node"
+            old.mkdir(parents=True)
+            (root / "old-xray").mkdir()
+            (root / "run" / "systemd" / "system").mkdir(parents=True)
+            old_unit = root / "etc" / "systemd" / "system" / "xray.service"
+            old_unit.parent.mkdir(parents=True)
+            old_unit.write_text("legacy unit\n")
+            (old / "node.txt").write_text("协议: vless\n端口: 12345\n")
+            (old / "core").write_text("xray\n")
+            config = root / "old-xray" / "config.json"
+            config.write_text('{"inbounds": []}\n')
+            service_log = root / "service.log"
+            stubs = (
+                'step() { :; }; warn() { :; }; info() { :; }; sleep() { :; }; '
+                'pkill() { :; }; ss() { :; }; _svc_install() { :; }; '
+                'wait_for_port() { return 0; }; die() { exit 2; }; '
+                'systemctl() { printf "%s\\n" "$*" >> "$SERVICE_LOG"; }; '
+            )
+            env = os.environ.copy()
+            env["SERVICE_LOG"] = str(service_log)
+            subprocess.run(
+                ["sh", "-c", stubs + self.migration_script(root)],
+                env=env,
+                check=True,
+            )
+            self.assertFalse(config.exists())
+            self.assertFalse((old / "node.txt").exists())
+            self.assertFalse(old_unit.exists())
+            self.assertEqual(
+                (old / "nodes" / "1" / "config.json").read_text(),
+                '{"inbounds": []}\n',
+            )
+            self.assertEqual(
+                service_log.read_text().splitlines(),
+                ["stop xray", "is-active --quiet xray-node@1", "disable xray", "daemon-reload"],
             )
 
 
