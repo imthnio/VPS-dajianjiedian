@@ -403,6 +403,44 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
   warn "这台机器只有纯 iptables 且无法自动存盘：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
 }
 
+# _fw_allow <端口> <tcp|udp> <4|6> <fw_info路径> <1=同时处理 ufw/firewalld>
+# ufw 和 firewalld 一条规则同时覆盖 IPv4 和 IPv6，只记一次，删节点时才不会删两次。
+# iptables 和 ip6tables 要各记一条。
+_fw_allow() {
+  _fa_port="$1"; _fa_proto="$2"; _fa_family="$3"; _fa_file="$4"; _fa_front="$5"
+  _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
+  if [ "$_fa_family" = "6" ]; then _IPT_BIN=ip6tables; else _IPT_BIN=iptables; fi
+  if [ "$_fa_front" = "1" ]; then
+    if command -v ufw >/dev/null 2>&1; then
+      if ufw status 2>/dev/null | grep -qE "^${_fa_port}/${_fa_proto}[[:space:]]"; then
+        :
+      elif ufw allow "$_fa_port"/"$_fa_proto" >/dev/null 2>&1; then
+        _UFW_ADDED=1
+        info "ufw 已放行 ${_fa_port}/${_fa_proto}"
+      fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${_fa_port}/${_fa_proto}"; then
+        :
+      elif firewall-cmd --permanent --add-port="$_fa_port"/"$_fa_proto" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1; then
+        _FWL_ADDED=1
+        info "firewalld 已放行 ${_fa_port}/${_fa_proto}"
+      fi
+    fi
+  fi
+  if command -v "$_IPT_BIN" >/dev/null 2>&1; then
+    if "$_IPT_BIN" -C INPUT -p "$_fa_proto" --dport "$_fa_port" -j ACCEPT >/dev/null 2>&1; then
+      :
+    elif "$_IPT_BIN" -I INPUT -p "$_fa_proto" --dport "$_fa_port" -j ACCEPT >/dev/null 2>&1; then
+      _IPT_ADDED=1
+    fi
+  fi
+  if [ -n "$_fa_file" ]; then
+    echo "$_fa_port $_fa_proto $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED $_fa_family" >> "$_fa_file"
+  fi
+}
+
 write_helper_cmds() { # 写入/刷新 jiedian 和 shanjiedian 两个命令（安装和更新都会调）
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
@@ -447,7 +485,8 @@ _fw_save() {
 # _del_fw_rules <fw_info路径>：撤销该节点我们亲手加的防火墙规则（用户手写的不碰）
 _del_fw_rules() {
   [ -f "$1" ] || return 0
-  _fipt_touched=0
+  _fipt_v4=0
+  _fipt_v6=0
   while read -r _fport _fproto _fufw _ffwl _fipt _ffamily; do
     [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
     # 老版本 fw_info 只有"端口 协议"两列：按老行为尽量清干净
@@ -462,8 +501,7 @@ _del_fw_rules() {
     fi
     if [ "$_ffamily" = "6" ]; then _fipbin=ip6tables; else _fipbin=iptables; fi
     if [ "$_fipt" = "1" ] && command -v "$_fipbin" >/dev/null 2>&1; then
-      _fipt_touched=1
-      _fipt_family="${_ffamily:-4}"
+      if [ "$_ffamily" = "6" ]; then _fipt_v6=1; else _fipt_v4=1; fi
       if [ "$_oldfmt" = "1" ]; then
         while "$_fipbin" -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
           "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
@@ -475,8 +513,9 @@ _del_fw_rules() {
     fi
     echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
   done < "$1"
-  # iptables 删了规则也要存盘，不然重启后删掉的规则又回来了
-  [ "$_fipt_touched" = "1" ] && _fw_save "$_fipt_family"
+  # iptables 删了规则也要存盘，不然重启后删掉的规则又回来了。两种地址分开存。
+  [ "$_fipt_v4" = "1" ] && _fw_save 4
+  [ "$_fipt_v6" = "1" ] && _fw_save 6
 }
 
 # _stop_remove_svc <节点id>：停掉并删除该节点的服务，不碰其它节点
@@ -782,6 +821,146 @@ _svc_restart() { # _svc_restart <节点id>：重写服务模板后再重启（�
   # 走 _svc_install：它会重写 systemd/OpenRC 模板。只 systemctl restart 的话，
   # 64MB 机器上的旧单元没有 GOMEMLIMIT，新内核一起就可能被打爆。
   _svc_install "$1"
+}
+
+_hy_local_ipv4() { # 打印本机第一个全局 IPv4；没有就失败。内网地址也算，用来判断要不要双栈监听。
+  command -v ip >/dev/null 2>&1 || return 1
+  _hip=$(ip -4 -o addr show scope global 2>/dev/null | awk '
+    { split($4, a, "/"); if (a[1] != "") { print a[1]; exit } }
+  ')
+  [ -n "$_hip" ] || return 1
+  printf '%s' "$_hip"
+}
+
+_hy_local_ipv6() { # 打印本机第一个公网 IPv6。临时地址和内网地址（fc/fd）不要，客户端连不上。
+  command -v ip >/dev/null 2>&1 || return 1
+  _hip6=$(ip -6 -o addr show scope global 2>/dev/null | awk '
+    / temporary/ || / deprecated/ { next }
+    {
+      split($4, a, "/")
+      ip = a[1]
+      if (ip == "" || ip ~ /^[fF][cCdD]/) next
+      print ip
+      exit
+    }
+  ')
+  [ -n "$_hip6" ] || return 1
+  _valid_ip 6 "$_hip6" || return 1
+  printf '%s' "$_hip6"
+}
+
+_hy_listen_for() { # _hy_listen_for <端口> <4|6> <非空=两种都听>
+  # 官方 Hysteria2 把 0.0.0.0 收成只听 IPv4，把 [::] 收成只听 IPv6。
+  # 写成 :端口 才是同一个口同时收两种地址。只有一种地址时维持单栈，
+  # 避免纯 IPv4 机器去绑一个用不了的 IPv6。
+  if [ -n "$3" ]; then
+    printf ':%s' "$1"
+    return 0
+  fi
+  if [ "$2" = "6" ]; then
+    printf '[::]:%s' "$1"
+  else
+    printf '0.0.0.0:%s' "$1"
+  fi
+}
+
+_hy_set_listen() { # _hy_set_listen <config.yaml> <listen值>
+  _hs_tmp="$1.tmp"
+  awk -v listen="$2" '
+    /^listen:/ { print "listen: \"" listen "\""; found = 1; next }
+    { print }
+    END { if (!found) exit 1 }
+  ' "$1" > "$_hs_tmp" && mv -f "$_hs_tmp" "$1" || return 1
+  chmod 600 "$1" 2>/dev/null
+  return 0
+}
+
+_hy_fix_existing_ipv6() {
+  # 以前装的 Hysteria2 选了 IPv4 就只听 0.0.0.0。重跑脚本选更新时改成同时听 IPv6。
+  # 改完端口没起来就把配置改回去，避免把正在用的节点弄断。
+  _hy6=$(_hy_local_ipv6) || return 0
+  [ -n "$_hy6" ] || return 0
+  for _hd in /etc/xray-node/nodes/*/; do
+    [ -f "${_hd}core" ] && [ -f "${_hd}config.yaml" ] || continue
+    [ "$(tr -d ' \r\n' < "${_hd}core")" = "hysteria" ] || continue
+    _hcfg="${_hd}config.yaml"
+    _hlisten=$(awk '
+      /^listen:/ {
+        line = $0
+        sub(/\r$/, "", line)
+        sub(/^listen:[[:space:]]*/, "", line)
+        gsub(/^"|"$/, "", line)
+        print line
+        exit
+      }
+    ' "$_hcfg")
+    case "$_hlisten" in
+      0.0.0.0:*) ;;
+      *) continue ;;
+    esac
+    _hport=${_hlisten#0.0.0.0:}
+    case "$_hport" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    _hid=$(basename "$_hd")
+    cp -a "$_hcfg" "${_hcfg}.bak-ipv6" || {
+      warn "节点 $_hid 无法备份配置，跳过 IPv6"
+      continue
+    }
+    if ! _hy_set_listen "$_hcfg" ":$_hport"; then
+      mv -f "${_hcfg}.bak-ipv6" "$_hcfg"
+      warn "节点 $_hid 没能改成同时听 IPv6"
+      continue
+    fi
+    _svc_restart "$_hid"
+    _hy_up=0
+    if wait_for_port "$_hport" udp 15; then
+      _hy_up=1
+      if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl is-active --quiet "hysteria-node@${_hid}" || _hy_up=0
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "xray-node-${_hid}" status >/dev/null 2>&1 || _hy_up=0
+      fi
+    fi
+    if [ "$_hy_up" = "1" ]; then
+      rm -f "${_hcfg}.bak-ipv6"
+      HY_IPV6_FIXED=1
+      if [ -f "${_hd}node.txt" ] && ! grep -F "[${_hy6}]" "${_hd}node.txt" >/dev/null 2>&1; then
+        _hline=$(grep -m1 '^hysteria2://' "${_hd}node.txt" 2>/dev/null)
+        _hrest=${_hline#hysteria2://}
+        _hpass=${_hrest%%@*}
+        _hafter=${_hrest#*@}
+        _hquery=""
+        case "$_hafter" in
+          *\?*) _hquery=${_hafter#*\?}; _hquery=${_hquery%%#*} ;;
+        esac
+        if [ -n "$_hpass" ] && [ -n "$_hquery" ]; then
+          _hlink="hysteria2://${_hpass}@[${_hy6}]:${_hport}/?${_hquery}#xray-node"
+          _htmp="${_hd}node.txt.tmp"
+          awk -v link="$_hlink" '
+            { print }
+            !done && /^hysteria2:\/\// {
+              print "IPv6 链接（同一个节点）:"
+              print link
+              done = 1
+            }
+          ' "${_hd}node.txt" > "$_htmp" && mv -f "$_htmp" "${_hd}node.txt"
+          chmod 600 "${_hd}node.txt" 2>/dev/null
+        fi
+      fi
+      if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6tables -C INPUT -p udp --dport "$_hport" -j ACCEPT >/dev/null 2>&1; then
+          _fw_allow "$_hport" udp 6 "${_hd}fw_info" 0
+          [ "$_IPT_ADDED" = "1" ] && _save_fw 6
+        fi
+      fi
+      info "节点 $_hid 的 Hysteria2 已同时听 IPv6：${_hy6}"
+    else
+      mv -f "${_hcfg}.bak-ipv6" "$_hcfg"
+      _svc_restart "$_hid"
+      warn "节点 $_hid 改成同时听 IPv6 后端口没起来，已改回只听 IPv4"
+    fi
+  done
 }
 
 _node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
@@ -1456,7 +1635,7 @@ if [ -d /etc/xray-node/nodes ]; then
 fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐：所有节点配置不变，只把 Xray/sing-box/Hysteria2 内核升到最新版）\n"
+  printf "  1) 更新内核（推荐。Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
   printf "  2) 添加新节点（再搭一个，旧节点不受影响、继续用）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
@@ -1465,7 +1644,7 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
     2) info "进入添加新节点流程（旧节点不受影响）" ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
-    *) UPDATE_MODE=1 ;;
+    *) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6 ;;
   esac
 fi
 
@@ -1720,6 +1899,8 @@ if [ "$UPDATE_MODE" = "1" ]; then
     if [ "$_u_any_fail" = "1" ]; then
       printf "\n${YELLOW}${BOLD}更新结束：部分内核更新失败（上面有说明），其它节点不受影响。${NC}\n"
       exit 1
+    elif [ "$HY_IPV6_FIXED" = "1" ]; then
+      printf "\n${GREEN}${BOLD}更新完成。${NC}Hysteria2 已同时听 IPv6。上面多出来的是 IPv6 链接，密码没变。云服务器还要在安全组放行这个 UDP 端口的 IPv6。\n"
     else
       printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
     fi
@@ -2143,7 +2324,27 @@ elif [ "$CORE" = "hysteria" ]; then
 # ---------- 官方 Hysteria2 配置 ----------
 # 伪装用内置 404，不反向代理外网：NAT 上解析不了伪装站时，节点照样能起。
 HY_CONF="$NODE_DIR/config.yaml"
-if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
+HY_EXTRA_IP=""
+_hy_v6=$(_hy_local_ipv6) || _hy_v6=""
+_hy_v4=$(_hy_local_ipv4) || _hy_v4=""
+if [ -n "$_hy_v6" ] && [ -n "$_hy_v4" ]; then
+  _hy_both=1
+else
+  _hy_both=""
+fi
+HY_LISTEN=$(_hy_listen_for "$PORT" "$IPVER" "$_hy_both")
+if [ -n "$_hy_both" ]; then
+  if [ "$IPVER" = "6" ]; then
+    HY_EXTRA_IP=$(get_ip 4) || HY_EXTRA_IP=""
+  else
+    HY_EXTRA_IP="$_hy_v6"
+  fi
+  case "$HY_EXTRA_IP" in
+    \[*\]) HY_EXTRA_IP=${HY_EXTRA_IP#\[}; HY_EXTRA_IP=${HY_EXTRA_IP%\]} ;;
+  esac
+  [ "$HY_EXTRA_IP" = "$SERVER_IP" ] && HY_EXTRA_IP=""
+  info "这台机器同时有 IPv4 和 IPv6，Hysteria2 两个都听"
+fi
 _hy_quic=""
 if [ "$LOW_MEM" = "1" ]; then
   # 官方默认接收窗口是 8MB/20MB，64MB 机器上容易把进程打爆。内存小就收紧。
@@ -2280,6 +2481,22 @@ if [ "$_svc_listen_ok" = "1" ]; then
     fi
   fi
 fi
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
+  warn "同时听 IPv4 和 IPv6 没成功，改回只听你刚才选的那一种"
+  if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
+  HY_EXTRA_IP=""
+  if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN"; then
+    _svc_restart "$NODE_ID"
+    _svc_listen_ok=1
+    if ! wait_for_port "$PORT" udp 15; then
+      _svc_listen_ok=0
+    elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
+      systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
+    fi
+  fi
+fi
 if [ "$_svc_listen_ok" = "1" ]; then
   info "端口 $PORT 已在监听，服务真正跑起来了"
 else
@@ -2306,46 +2523,36 @@ esac
 # 只删我们亲手加的规则，用户机器上本来就有的不碰。
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
-_FW_IPT_TOUCHED=0
-if [ "$IPVER" = "6" ]; then _IPT_BIN=ip6tables; else _IPT_BIN=iptables; fi
-for _np in $_FW_PROTOS; do
-  _UFW_ADDED=0; _FWL_ADDED=0; _IPT_ADDED=0
-  if command -v ufw >/dev/null 2>&1; then
-    if ufw status 2>/dev/null | grep -qE "^${PORT}/${_np}[[:space:]]"; then
-      : # 这条规则本来就存在（用户自己加的），我们不动它
-    elif ufw allow "$PORT"/"$_np" >/dev/null 2>&1; then
-      _UFW_ADDED=1
-      info "ufw 已放行 $PORT/$_np"
+# Hysteria2 两种地址都听时，IPv4 和 IPv6 的防火墙要分别放行。
+_FW_FAMILIES="$IPVER"
+if [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
+  if [ "$IPVER" = "6" ]; then _FW_FAMILIES="6 4"; else _FW_FAMILIES="4 6"; fi
+fi
+_FW_SAVE4=0
+_FW_SAVE6=0
+_fw_front=1
+for _fw_family in $_FW_FAMILIES; do
+  for _np in $_FW_PROTOS; do
+    _fw_allow "$PORT" "$_np" "$_fw_family" "$NODE_DIR/fw_info" "$_fw_front"
+    if [ "$_IPT_ADDED" = "1" ]; then
+      if [ "$_fw_family" = "6" ]; then _FW_SAVE6=1; else _FW_SAVE4=1; fi
     fi
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    if firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${PORT}/${_np}"; then
-      : # 这条规则本来就存在（用户自己加的），我们不动它
-    elif firewall-cmd --permanent --add-port="$PORT"/"$_np" >/dev/null 2>&1 \
-      && firewall-cmd --reload >/dev/null 2>&1; then
-      _FWL_ADDED=1
-      info "firewalld 已放行 $PORT/$_np"
-    fi
-  fi
-  if command -v "$_IPT_BIN" >/dev/null 2>&1; then
-    if "$_IPT_BIN" -C INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
-      : # 这条规则本来就存在（用户自己加的），我们不动它
-    elif "$_IPT_BIN" -I INPUT -p "$_np" --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
-      _IPT_ADDED=1
-      _FW_IPT_TOUCHED=1
-    fi
-  fi
-  echo "$PORT $_np $_UFW_ADDED $_FWL_ADDED $_IPT_ADDED $IPVER" >> "$NODE_DIR/fw_info"
+  done
+  _fw_front=0
 done
 # 纯 iptables 的规则默认重启就丢：刚才亲手加了规则就存盘，
 # 否则机器一重启端口又被墙、节点连不上（ufw/firewalld 自己会持久化，不用管）
-if [ "$_FW_IPT_TOUCHED" = "1" ]; then
-  _save_fw "$IPVER"
+[ "$_FW_SAVE4" = "1" ] && _save_fw 4
+[ "$_FW_SAVE6" = "1" ] && _save_fw 6
+if [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
+  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT/UDP，IPv4 和 IPv6 都要放"
+else
+  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 fi
-warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 
 # ---------- 13. 生成节点链接 ----------
 step "[完成] 生成你的节点…"
+LINK_EXTRA=""
 case "$PROTO" in
   vless)
     LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
@@ -2372,6 +2579,16 @@ case "$PROTO" in
     # 官方 Hysteria2 客户端连接自签证书须同时设置 insecure=1 与 pinSHA256；
     # pcs 供支持 Xray 分享字段的客户端使用，指纹仍会校验证书。
     LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
+    LINK_EXTRA=""
+    if [ -n "$HY_EXTRA_IP" ]; then
+      case "$HY_EXTRA_IP" in
+        *:*) _hy_xip="[$HY_EXTRA_IP]" ;;
+        *)   _hy_xip="$HY_EXTRA_IP" ;;
+      esac
+      # IPv6 没有 IPv4 那种公网端口映射，客户端直接连本机监听端口。
+      if [ "$IPVER" = "6" ]; then _hy_xport="$LINK_PORT"; else _hy_xport="$PORT"; fi
+      LINK_EXTRA="hysteria2://${HY2_PASS}@${_hy_xip}:${_hy_xport}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
+    fi
     PROTO_NAME="Hysteria2"
     ;;
   tuic)
@@ -2383,9 +2600,14 @@ esac
 # ---------- 14. 保存 + jiedian 命令 ----------
 {
   printf "==============================================\n"
-  printf " 你的节点（复制下面整行，粘贴到客户端导入）\n"
+  if [ -n "$LINK_EXTRA" ]; then
+    printf " 你的节点（下面两条是同一个节点，复制其中一行）\n"
+  else
+    printf " 你的节点（复制下面整行，粘贴到客户端导入）\n"
+  fi
   printf "==============================================\n"
   printf "%s\n" "$LINK"
+  if [ -n "$LINK_EXTRA" ]; then printf "%s\n" "$LINK_EXTRA"; fi
   printf -- "----------------------------------------------\n"
   printf "协议: %s\n" "$PROTO_NAME"
   printf "地址: %s\n" "$SERVER_IP"
@@ -2405,10 +2627,25 @@ esac
     hy2)
       printf "SNI: www.samsung.com\n"
       printf "证书指纹: %s\n" "$HY2_PIN"
+      if [ -n "$HY_EXTRA_IP" ]; then
+        if [ "$IPVER" = "6" ]; then
+          printf "另一地址（IPv4）: %s\n" "$HY_EXTRA_IP"
+        else
+          printf "IPv6 地址: %s\n" "$HY_EXTRA_IP"
+          if [ "$PORT" != "$LINK_PORT" ]; then
+            printf "IPv6 端口: %s（IPv6 直接连这个端口，不走上面的 IPv4 映射端口）\n" "$PORT"
+          fi
+        fi
+      fi
       printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
       printf "Loon 可粘贴这一行:\n"
       printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
         "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN"
+      if [ -n "$LINK_EXTRA" ]; then
+        if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
+        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
+          "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_PIN"
+      fi
       ;;
     tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
   esac
