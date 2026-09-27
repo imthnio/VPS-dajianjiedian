@@ -107,8 +107,36 @@ b64url() { # 标准输入 -> base64url（去换行、去 =）
   base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '='
 }
 
-get_ip() { # get_ip 4|6 -> 打印公网 IP，失败返回非零
+get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非零
   _v="$1"
+  # 链接里的地址是别人连进来用的，取主路由网卡上的公网地址。
+  # curl 看到的是出口。L2TP 接通后出口是隧道地址，不能写进节点链接。
+  _nic=""
+  _ip=""
+  if [ "$_v" = "4" ]; then
+    _nic=$(ip -4 route show default table main 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    _ip=$(ip -4 -o addr show dev "$_nic" scope global 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}')
+    if [ -n "$_ip" ] && _valid_ip 4 "$_ip"; then
+      case "$_ip" in
+        10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) ;;
+        *) printf "%s" "$_ip"; return 0 ;;
+      esac
+    fi
+  else
+    _nic=$(ip -6 route show default table main 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    _ip=$(ip -6 -o addr show dev "$_nic" scope global 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}')
+    if [ -n "$_ip" ] && _valid_ip 6 "$_ip"; then
+      case "$_ip" in
+        fe80:*|fc*|fd*) ;;
+        *) printf "%s" "$_ip"; return 0 ;;
+      esac
+    fi
+  fi
+  # 网卡是内网地址时，没有 L2TP 就用出口检测得到 NAT 公网地址。
+  # L2TP 已接通时出口是隧道地址，交给使用者手填这台机器真实的公网地址。
+  if ip -4 addr show dev l2tp-aa 2>/dev/null | grep -q 'inet '; then
+    return 1
+  fi
   if [ "$_v" = "6" ]; then _f="-6"; else _f="-4"; fi
   for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
     _ip=$(curl -fsSL --max-time 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
