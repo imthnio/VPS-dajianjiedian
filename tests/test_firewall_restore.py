@@ -573,5 +573,122 @@ class ServerAddressTest(unittest.TestCase):
         self.assertNotIn("198.51.100.8", result.stdout)
 
 
+class HysteriaIpv6ListenTest(unittest.TestCase):
+    def source_between(self, start, end):
+        source = INSTALLER.read_text()
+        begin = source.index(start)
+        return source[begin:source.index(end, begin)]
+
+    def test_single_stack_stays_single_and_dual_uses_wildcard(self):
+        function = self.source_between("_hy_listen_for() {", "\n_hy_set_listen() {")
+        checks = (
+            ("443 4", "0.0.0.0:443"),
+            ("443 6", "[::]:443"),
+            ("443 4 dual", ":443"),
+            ("8443 6 yes", ":8443"),
+        )
+        for args, expected in checks:
+            result = subprocess.run(
+                ["sh", "-c", function + f"\n_hy_listen_for {args}\n"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(result.stdout, expected, args)
+
+    def test_existing_ipv4_hysteria_starts_listening_on_ipv6(self):
+        function = self.source_between("_hy_set_listen() {", "\n_node_port() {")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nodes = root / "nodes"
+            ipv4 = nodes / "1"
+            ipv6 = nodes / "2"
+            other = nodes / "4"
+            for directory in (ipv4, ipv6, other):
+                directory.mkdir(parents=True)
+            (ipv4 / "core").write_text("hysteria\n")
+            (ipv4 / "config.yaml").write_text(
+                'listen: "0.0.0.0:443"\ntls:\n  cert: /tmp/cert.pem\n'
+            )
+            (ipv4 / "node.txt").write_text(
+                "==============================================\n"
+                "hysteria2://secret@203.0.113.8:443/"
+                "?insecure=1&sni=www.samsung.com&pinSHA256="
+                + "ab" * 32
+                + "#xray-node\n"
+                "协议: Hysteria2\n"
+            )
+            (ipv4 / "fw_info").write_text("443 udp 0 0 1 4\n")
+            (ipv6 / "core").write_text("hysteria\n")
+            (ipv6 / "config.yaml").write_text('listen: "[::]:444"\n')
+            (other / "core").write_text("xray\n")
+            (other / "config.json").write_text("{}\n")
+            restart_log = root / "restart.log"
+            script = function.replace("/etc/xray-node/nodes", str(nodes))
+            stubs = (
+                "_hy_local_ipv6() { printf '%s' '2001:db8::20'; }\n"
+                "_svc_restart() { printf '%s\\n' \"restart $1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 0; }\n"
+                "info() { :; }\n"
+                "warn() { :; }\n"
+                "_fw_allow() { :; }\n"
+                "_save_fw() { :; }\n"
+            )
+            env = os.environ.copy()
+            env["RESTART_LOG"] = str(restart_log)
+            env["PATH"] = "/bin:/usr/bin"
+            subprocess.run(
+                ["sh", "-c", stubs + script + "\n_hy_fix_existing_ipv6\n_hy_fix_existing_ipv6\n"],
+                env=env,
+                check=True,
+            )
+            config = (ipv4 / "config.yaml").read_text()
+            self.assertIn('listen: ":443"', config)
+            self.assertIn("tls:", config)
+            self.assertNotIn("0.0.0.0", config)
+            self.assertFalse((ipv4 / "config.yaml.bak-ipv6").exists())
+            saved = (ipv4 / "node.txt").read_text()
+            self.assertEqual(saved.count("hysteria2://"), 2)
+            self.assertIn("hysteria2://secret@[2001:db8::20]:443/", saved)
+            self.assertIn("pinSHA256=" + "ab" * 32, saved)
+            self.assertEqual((ipv6 / "config.yaml").read_text(), 'listen: "[::]:444"\n')
+            self.assertEqual((other / "config.json").read_text(), "{}\n")
+            self.assertEqual(restart_log.read_text().splitlines(), ["restart 1"])
+
+    def test_failed_ipv6_listen_restores_ipv4_config(self):
+        function = self.source_between("_hy_set_listen() {", "\n_node_port() {")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            node = root / "nodes" / "7"
+            node.mkdir(parents=True)
+            original = 'listen: "0.0.0.0:8443"\nauth:\n  password: "keep"\n'
+            (node / "core").write_text("hysteria\n")
+            (node / "config.yaml").write_text(original)
+            (node / "node.txt").write_text(
+                "hysteria2://secret@203.0.113.8:8443/?insecure=1&sni=www.samsung.com#xray-node\n"
+            )
+            restart_log = root / "restart.log"
+            script = function.replace("/etc/xray-node/nodes", str(node.parent))
+            stubs = (
+                "_hy_local_ipv6() { printf '%s' '2001:db8::20'; }\n"
+                "_svc_restart() { printf '%s\\n' \"restart $1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 1; }\n"
+                "info() { :; }\n"
+                "warn() { :; }\n"
+            )
+            env = os.environ.copy()
+            env["RESTART_LOG"] = str(restart_log)
+            env["PATH"] = "/bin:/usr/bin"
+            subprocess.run(
+                ["sh", "-c", stubs + script + "\n_hy_fix_existing_ipv6\n"],
+                env=env,
+                check=True,
+            )
+            self.assertEqual((node / "config.yaml").read_text(), original)
+            self.assertFalse((node / "config.yaml.bak-ipv6").exists())
+            self.assertEqual((node / "node.txt").read_text().count("hysteria2://"), 1)
+            self.assertEqual(restart_log.read_text().splitlines(), ["restart 7", "restart 7"])
+
+
 if __name__ == "__main__":
     unittest.main()
