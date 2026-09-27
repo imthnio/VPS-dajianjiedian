@@ -503,5 +503,75 @@ class DeleteNodeSelectionTest(unittest.TestCase):
             self.assertEqual(log.read_text(), "")
 
 
+class ServerAddressTest(unittest.TestCase):
+    def functions(self):
+        source = INSTALLER.read_text()
+        start = source.index("get_ip() {")
+        end = source.index("\n# gh_api_dl ")
+        return source[start:end]
+
+    def run_get(self, version, ip_stub, curl_ip):
+        script = (
+            "ip() {\n"
+            + ip_stub
+            + "\n}\n"
+            + "curl() { printf '%s\\n' '"
+            + curl_ip
+            + "'; }\n"
+            + self.functions()
+            + "\nget_ip "
+            + version
+            + "\n"
+        )
+        return subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+
+    def test_public_nic_address_is_kept_when_curl_sees_the_tunnel(self):
+        result = self.run_get(
+            "4",
+            '''
+            case "$*" in
+              "-4 route show default table main") echo "default via 192.0.2.1 dev eth0";;
+              "-4 -o addr show dev eth0 scope global") echo "2: eth0 inet 203.0.113.10/24 scope global eth0";;
+              *) return 1;;
+            esac
+            ''',
+            "198.51.100.8",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "203.0.113.10")
+
+    def test_private_nic_without_tunnel_uses_the_nat_address(self):
+        result = self.run_get(
+            "4",
+            '''
+            case "$*" in
+              "-4 route show default table main") echo "default via 10.0.0.1 dev eth0";;
+              "-4 -o addr show dev eth0 scope global") echo "2: eth0 inet 10.0.0.5/24 scope global eth0";;
+              "-4 addr show dev l2tp-aa") return 1;;
+              *) return 1;;
+            esac
+            ''',
+            "203.0.113.9",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "203.0.113.9")
+
+    def test_private_nic_with_tunnel_does_not_publish_the_tunnel_address(self):
+        result = self.run_get(
+            "4",
+            '''
+            case "$*" in
+              "-4 route show default table main") echo "default via 10.0.0.1 dev eth0";;
+              "-4 -o addr show dev eth0 scope global") echo "2: eth0 inet 10.0.0.5/24 scope global eth0";;
+              "-4 addr show dev l2tp-aa") echo "8: l2tp-aa inet 198.51.100.10/32 scope global";;
+              *) return 1;;
+            esac
+            ''',
+            "198.51.100.8",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("198.51.100.8", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
