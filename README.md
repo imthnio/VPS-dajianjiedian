@@ -13,7 +13,14 @@ curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS
 # 3. 按提示回答问题，装完自动显示节点链接
 ```
 
-安装时会询问：
+安装时会先进入节点种类菜单：
+
+- **永久节点**：一直有效。看不懂就回车，默认是这一种。
+- **定时节点**：再选 1 小时、2 小时、6 小时、24 小时、48 小时、72 小时或 1 周。到点后大约一分钟内，这个节点彻底失效（服务停掉、链接作废、配置和防火墙规则删掉）。其它节点不受影响。服务器中间重启过也一样。
+
+机器上已经有节点时，选「添加节点」，下一步同样先分永久节点和定时节点。
+
+然后再问：
 
 1. **IPv4 还是 IPv6**（默认 IPv4）
 2. **协议**：VLESS+REALITY+Vision（推荐）/ VMess+WS / Trojan+REALITY / Shadowsocks / AnyTLS+REALITY / Hysteria2 / TUIC

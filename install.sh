@@ -10,6 +10,12 @@
 #
 # 装完之后，想看所有节点随时输入：  jiedian
 # 输入 shanjiedian 进入节点管理：查看节点、删除单个节点，或全部卸载
+#
+# 节点分两种，装的时候先选：
+#   永久节点：一直有效
+#   定时节点：1 小时、2 小时、6 小时、24 小时、48 小时、72 小时或 1 周
+# 定时节点到点后大约一分钟内彻底失效：停服务、作废链接、删配置和防火墙规则。
+# 服务器中途重启也不会让它复活。其它节点不动。
 # ============================================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -441,10 +447,431 @@ _fw_allow() {
   fi
 }
 
-write_helper_cmds() { # 写入/刷新 jiedian 和 shanjiedian 两个命令（安装和更新都会调）
+_set_expire_choice() { # 定时节点菜单编号 -> EXPIRE_AFTER（秒）和 EXPIRE_LABEL
+  case "$1" in
+    1) EXPIRE_AFTER=3600; EXPIRE_LABEL="1 小时" ;;
+    2) EXPIRE_AFTER=7200; EXPIRE_LABEL="2 小时" ;;
+    3) EXPIRE_AFTER=21600; EXPIRE_LABEL="6 小时" ;;
+    4) EXPIRE_AFTER=86400; EXPIRE_LABEL="24 小时" ;;
+    5) EXPIRE_AFTER=172800; EXPIRE_LABEL="48 小时" ;;
+    6) EXPIRE_AFTER=259200; EXPIRE_LABEL="72 小时" ;;
+    7) EXPIRE_AFTER=604800; EXPIRE_LABEL="1 周" ;;
+    *) return 1 ;;
+  esac
+}
+
+_choose_expire_duration() {
+  printf "\n定时节点多久后失效？从安装完成开始算，用的是这台服务器的时间。\n"
+  printf "到点后大约一分钟内，这个节点会被彻底删掉：服务停掉，链接作废，配置和防火墙一起清掉。\n"
+  printf "服务器中间重启过也一样。其它节点不受影响。\n"
+  printf "  1) 1 小时\n"
+  printf "  2) 2 小时\n"
+  printf "  3) 6 小时\n"
+  printf "  4) 24 小时\n"
+  printf "  5) 48 小时\n"
+  printf "  6) 72 小时\n"
+  printf "  7) 1 周（7 天）\n"
+  printf "不知道选多久就回车，默认 24 小时。\n"
+  ask "请选择" "4" _ed
+  if _set_expire_choice "$_ed"; then
+    info "种类：定时节点，${EXPIRE_LABEL}后彻底失效"
+  else
+    warn "没有这个选项，按 24 小时算"
+    _set_expire_choice 4
+    info "种类：定时节点，${EXPIRE_LABEL}后彻底失效"
+  fi
+}
+
+_choose_node_kind() {
+  printf "\n请选择节点种类：\n"
+  printf "  1) 永久节点（一直有效）\n"
+  printf "  2) 定时节点（到时间后彻底失效）\n"
+  printf "看不懂就回车，默认是永久节点。\n"
+  ask "请选择" "1" _nk
+  case "$_nk" in
+    2) NODE_KIND=timed ;;
+    *)
+      if [ "$_nk" != "1" ]; then
+        warn "没有这个选项，按永久节点安装"
+      fi
+      NODE_KIND=permanent
+      EXPIRE_AFTER=0
+      EXPIRE_LABEL=""
+      ;;
+  esac
+  if [ "$NODE_KIND" = "timed" ]; then
+    _choose_expire_duration
+  else
+    info "种类：永久节点，一直有效"
+  fi
+}
+
+install_expire_bins() { # 写出到点删除脚本和启动包装。重复运行只覆盖脚本，不动节点。
+  _eb_bin=${XRAY_BIN_DIR:-/usr/local/bin}
+  mkdir -p "$_eb_bin" 2>/dev/null || return 1
+  cat > "$_eb_bin/xray-node-expire" <<'EXPEOF' || return 1
+#!/bin/sh
+# 到点后彻底删除定时节点。没有 expire 文件的永久节点不会被碰。
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+LOG=${XRAY_EXPIRE_LOG:-/var/log/xray-node-expire.log}
+LOCK=${XRAY_EXPIRE_LOCK:-/run/xray-node-expire.lock}
+WANTS=${XRAY_SYSTEMD_WANTS:-/etc/systemd/system/multi-user.target.wants}
+SD_DIR=${XRAY_SYSTEMD_DIR:-/etc/systemd/system}
+INITD=${XRAY_INITD:-/etc/init.d}
+RUNLEVEL=${XRAY_RUNLEVEL:-/etc/runlevels/default}
+
+case "$LOCK" in
+  */xray-node-expire.lock) ;;
+  *) exit 0 ;;
+esac
+case "$NODES_DIR" in
+  ''|'/'|*..*) exit 0 ;;
+esac
+
+_log() {
+  _log_dir=${LOG%/*}
+  if [ -n "$_log_dir" ] && [ -d "$_log_dir" ] && [ -w "$_log_dir" ]; then
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)" "$1" >> "$LOG" 2>/dev/null || true
+  fi
+}
+
+_due() {
+  [ -f "$1" ] || return 1
+  _ts=$(tr -d ' \r\n' < "$1" 2>/dev/null) || return 1
+  case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
+  _now=$(date +%s 2>/dev/null) || return 1
+  [ "$_now" -ge "$_ts" ]
+}
+
+_fw_save() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  elif [ -f /etc/alpine-release ]; then
+    if [ "$1" = "6" ]; then _fs_svc=ip6tables; else _fs_svc=iptables; fi
+    [ -f "/etc/init.d/$_fs_svc" ] && "/etc/init.d/$_fs_svc" save >/dev/null 2>&1 || true
+  fi
+}
+
+_del_fw() {
+  [ -f "$1" ] || return 0
+  _fipt_v4=0
+  _fipt_v6=0
+  while read -r _fport _fproto _fufw _ffwl _fipt _ffamily; do
+    [ -n "$_fport" ] && [ -n "$_fproto" ] || continue
+    _oldfmt=0
+    if [ -z "$_fufw$_ffwl$_fipt" ]; then _fufw=1; _ffwl=1; _fipt=1; _oldfmt=1; fi
+    if [ "$_fufw" = "1" ] && command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1 || true
+    fi
+    if [ "$_ffwl" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if [ "$_ffamily" = "6" ]; then _fipbin=ip6tables; else _fipbin=iptables; fi
+    if [ "$_fipt" = "1" ] && command -v "$_fipbin" >/dev/null 2>&1; then
+      if [ "$_ffamily" = "6" ]; then _fipt_v6=1; else _fipt_v4=1; fi
+      if [ "$_oldfmt" = "1" ]; then
+        while "$_fipbin" -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+          "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || break
+        done
+      else
+        "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1 || true
+      fi
+    fi
+  done < "$1"
+  [ "$_fipt_v4" = "1" ] && _fw_save 4
+  [ "$_fipt_v6" = "1" ] && _fw_save 6
+}
+
+_stop_outside() {
+  _x_id=$1
+  _x_core=$(tr -d ' \r\n' < "$NODES_DIR/$_x_id/core" 2>/dev/null || true)
+  if command -v systemctl >/dev/null 2>&1 && [ -d "${XRAY_SYSTEMD_RUN:-/run/systemd/system}" ]; then
+    case "$_x_core" in
+      sing-box) _x_unit="singbox-node@${_x_id}" ;;
+      hysteria) _x_unit="hysteria-node@${_x_id}" ;;
+      *) _x_unit="xray-node@${_x_id}" ;;
+    esac
+    systemctl stop "$_x_unit" >/dev/null 2>&1 || true
+    systemctl disable "$_x_unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$_x_unit" >/dev/null 2>&1 || true
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${_x_id}" stop >/dev/null 2>&1 || true
+    rc-update del "xray-node-${_x_id}" default >/dev/null 2>&1 || true
+    rm -f "$INITD/xray-node-${_x_id}"
+  fi
+  pkill -f "$NODES_DIR/${_x_id}/config.json" >/dev/null 2>&1 || true
+  pkill -f "$NODES_DIR/${_x_id}/config.yaml" >/dev/null 2>&1 || true
+  sleep 1
+}
+
+# 包装脚本发现自己到期时，不能 systemctl stop 自己，否则会和正在进行的启动互相卡住。
+# 只拆掉开机链接。这次启动会马上退出，端口不会打开。
+_stop_inside() {
+  _x_id=$1
+  rm -f "$WANTS/xray-node@${_x_id}.service" \
+    "$WANTS/hysteria-node@${_x_id}.service" \
+    "$WANTS/singbox-node@${_x_id}.service" \
+    "$RUNLEVEL/xray-node-${_x_id}" \
+    "$INITD/xray-node-${_x_id}"
+}
+
+_delete_node() {
+  _d_id=$1
+  case "$_d_id" in ''|*[!0-9]*) return 1 ;; esac
+  [ -d "$NODES_DIR/$_d_id" ] || return 0
+  _due "$NODES_DIR/$_d_id/expire" || return 0
+  if [ "${XRAY_EXPIRE_FROM_SERVICE:-}" = "$_d_id" ]; then
+    _del_fw "$NODES_DIR/$_d_id/fw_info"
+    _stop_inside "$_d_id"
+  else
+    _stop_outside "$_d_id"
+    _del_fw "$NODES_DIR/$_d_id/fw_info"
+  fi
+  rm -rf "$NODES_DIR/$_d_id"
+  echo "节点 ${_d_id} 已到时间，已经彻底删除。"
+  _log "节点 ${_d_id} 已到时间，已彻底删除（服务已停、链接作废、配置和防火墙规则已清除）"
+}
+
+_expire_lock() {
+  if mkdir "$1" 2>/dev/null; then
+    return 0
+  fi
+  _now=$(date +%s 2>/dev/null) || return 1
+  _born=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)
+  case "$_born" in ''|*[!0-9]*) return 1 ;; esac
+  if [ $((_now - _born)) -gt 120 ]; then
+    rm -rf "$1"
+    mkdir "$1" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+_lock_parent=${LOCK%/*}
+if [ -n "$_lock_parent" ] && [ ! -d "$_lock_parent" ]; then
+  mkdir -p "$_lock_parent" 2>/dev/null || exit 0
+fi
+_got=0
+if _expire_lock "$LOCK"; then _got=1; fi
+if [ "$_got" != "1" ] && [ "$1" = "--delete" ]; then
+  _w=0
+  while [ "$_got" != "1" ] && [ "$_w" -lt 5 ]; do
+    sleep 1
+    _w=$((_w + 1))
+    if _expire_lock "$LOCK"; then _got=1; fi
+  done
+fi
+[ "$_got" = "1" ] || exit 0
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+case "$1" in
+  --delete) _delete_node "$2" ;;
+  *)
+    for _d in "$NODES_DIR"/*/; do
+      [ -d "$_d" ] || continue
+      _id=$(basename "$_d")
+      case "$_id" in ''|*[!0-9]*) continue ;; esac
+      _due "$_d/expire" || continue
+      _delete_node "$_id"
+    done
+    ;;
+esac
+
+if [ -d "$NODES_DIR" ]; then
+  _left=0
+  for _d in "$NODES_DIR"/*/; do
+    [ -f "${_d}expire" ] || continue
+    _left=1
+    break
+  done
+  if [ "$_left" = "0" ]; then
+    if [ -f "$SD_DIR/xray-node-expire.timer" ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now xray-node-expire.timer >/dev/null 2>&1 || true
+      rm -f "$SD_DIR/xray-node-expire.timer" "$SD_DIR/xray-node-expire.service"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [ -f "$INITD/xray-node-expire" ] && command -v rc-update >/dev/null 2>&1; then
+      rc-service xray-node-expire stop >/dev/null 2>&1 || true
+      rc-update del xray-node-expire default >/dev/null 2>&1 || true
+      rm -f "$INITD/xray-node-expire"
+    fi
+    rm -f "${XRAY_CRON_DIR:-/etc/cron.d}/xray-node-expire"
+  fi
+fi
+exit 0
+EXPEOF
+  cat > "$_eb_bin/xray-node-run" <<'RUNEOF' || return 1
+#!/bin/sh
+# 启动一个节点。定时节点如果已经到期，先彻底删掉，不再打开端口。
+_id=$1
+case "$_id" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+_dir="${_nodes}/${_id}"
+_bin_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 1
+
+_is_due() {
+  [ -f "$1" ] || return 1
+  _ts=$(tr -d ' \r\n' < "$1" 2>/dev/null) || return 1
+  case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
+  _now=$(date +%s 2>/dev/null) || return 1
+  [ "$_now" -ge "$_ts" ]
+}
+
+if _is_due "$_dir/expire"; then
+  if [ -x "$_bin_dir/xray-node-expire" ]; then
+    XRAY_EXPIRE_FROM_SERVICE="$_id" "$_bin_dir/xray-node-expire" --delete "$_id" || true
+  fi
+  exit 0
+fi
+[ -d "$_dir" ] || exit 0
+[ -f "$_dir/core" ] || exit 1
+_core=$(tr -d ' \r\n' < "$_dir/core")
+_xray=${XRAY_BIN_PATH:-/usr/local/bin/xray}
+_sb=${SB_BIN_PATH:-/usr/local/bin/sing-box}
+_hy=${HY_BIN_PATH:-/usr/local/bin/hysteria}
+case "$_core" in
+  hysteria) exec "$_hy" server -c "$_dir/config.yaml" ;;
+  sing-box) exec "$_sb" run -c "$_dir/config.json" ;;
+  *) exec "$_xray" -config "$_dir/config.json" ;;
+esac
+exit 1
+RUNEOF
+  cat > "$_eb_bin/xray-node-expire-loop" <<'LOOPEOF' || return 1
+#!/bin/sh
+_here=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 1
+while true; do
+  "$_here/xray-node-expire"
+  sleep 60
+done
+LOOPEOF
+  chmod 700 "$_eb_bin/xray-node-expire" "$_eb_bin/xray-node-run" "$_eb_bin/xray-node-expire-loop" || return 1
+}
+
+arm_expire_watch() { # 有定时节点才挂上巡检；没有就卸掉以前留下的巡检。
+  _aw_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+  _aw_need=0
+  for _aw_d in "$_aw_nodes"/*/; do
+    [ -f "${_aw_d}expire" ] || continue
+    _aw_need=1
+    break
+  done
+  _aw_bin_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  _aw_expire="$_aw_bin_dir/xray-node-expire"
+  _aw_loop="$_aw_bin_dir/xray-node-expire-loop"
+  _aw_sd=${XRAY_SYSTEMD_DIR:-/etc/systemd/system}
+  _aw_run=${XRAY_SYSTEMD_RUN:-/run/systemd/system}
+  if [ "$_aw_need" = "1" ] && [ ! -x "$_aw_expire" ]; then
+    warn "找不到定时失效程序，到点后不会自动删除。下次运行安装脚本或 jiedian 时还会再试。"
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [ -d "$_aw_run" ] && [ -d "$_aw_sd" ] && [ -w "$_aw_sd" ]; then
+    if [ "$_aw_need" = "1" ]; then
+      _aw_was=$(systemctl is-enabled xray-node-expire.timer 2>/dev/null || true)
+      cat > "$_aw_sd/xray-node-expire.service" <<EOF
+[Unit]
+Description=Delete expired proxy nodes
+[Service]
+Type=oneshot
+ExecStart=${_aw_expire}
+EOF
+      cat > "$_aw_sd/xray-node-expire.timer" <<EOF
+[Unit]
+Description=Watch proxy nodes and delete them when their time is up
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=60
+AccuracySec=1s
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if systemctl enable --now xray-node-expire.timer >/dev/null 2>&1; then
+        if [ "$_aw_was" != "enabled" ]; then
+          info "定时节点到点后大约一分钟内会自动彻底失效"
+        fi
+      else
+        warn "定时检查没能设成开机自启。到点后，运行 jiedian 或重跑安装脚本也会把到期节点删掉。"
+      fi
+    elif [ -f "$_aw_sd/xray-node-expire.timer" ] || [ -f "$_aw_sd/xray-node-expire.service" ]; then
+      systemctl disable --now xray-node-expire.timer >/dev/null 2>&1 || true
+      rm -f "$_aw_sd/xray-node-expire.timer" "$_aw_sd/xray-node-expire.service"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  if command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ] && [ -w /etc/init.d ]; then
+    if [ "$_aw_need" = "1" ]; then
+      _aw_new=0
+      [ -f /etc/init.d/xray-node-expire ] || _aw_new=1
+      cat > /etc/init.d/xray-node-expire <<EOF
+#!/sbin/openrc-run
+name="xray-node-expire"
+description="Delete proxy nodes when their time is up"
+command="${_aw_loop}"
+command_background="yes"
+pidfile="/run/xray-node-expire.pid"
+depend() { after localmount; }
+EOF
+      chmod 700 /etc/init.d/xray-node-expire || return 0
+      rc-update add xray-node-expire default >/dev/null 2>&1 || true
+      rc-service xray-node-expire restart >/dev/null 2>&1 || rc-service xray-node-expire start >/dev/null 2>&1 || true
+      if [ "$_aw_new" = "1" ]; then
+        info "定时节点到点后大约一分钟内会自动彻底失效"
+      fi
+    elif [ -f /etc/init.d/xray-node-expire ]; then
+      rc-service xray-node-expire stop >/dev/null 2>&1 || true
+      rc-update del xray-node-expire default >/dev/null 2>&1 || true
+      rm -f /etc/init.d/xray-node-expire
+    fi
+    return 0
+  fi
+  _aw_cron=${XRAY_CRON_DIR:-/etc/cron.d}
+  if [ -d "$_aw_cron" ] && [ -w "$_aw_cron" ]; then
+    if [ "$_aw_need" = "1" ]; then
+      cat > "$_aw_cron/xray-node-expire" <<EOF
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root ${_aw_expire}
+EOF
+      return 0
+    fi
+    rm -f "$_aw_cron/xray-node-expire"
+    return 0
+  fi
+  if [ "$_aw_need" != "1" ]; then
+    return 0
+  fi
+  _aw_pid=${XRAY_EXPIRE_PID:-/run/xray-node-expire.pid}
+  if [ -f "$_aw_pid" ]; then
+    _aw_old=$(tr -d ' \r\n' < "$_aw_pid" 2>/dev/null || true)
+    case "$_aw_old" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$_aw_old" 2>/dev/null; then
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  if [ -x "$_aw_loop" ]; then
+    nohup "$_aw_loop" >/dev/null 2>&1 &
+    echo $! > "$_aw_pid" 2>/dev/null || true
+  fi
+  warn "这台机器没有 systemd、OpenRC 或 cron。已在后台看着到期时间。服务器重启后，请再跑一次安装脚本，定时才会继续生效。"
+  return 0
+}
+
+write_helper_cmds() { # 写入/刷新 jiedian、shanjiedian，以及定时失效脚本
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
 # 输入 jiedian，显示所有已安装节点的信息和链接
+if [ -x /usr/local/bin/xray-node-expire ]; then
+  /usr/local/bin/xray-node-expire || true
+fi
 _n=0
 for _d in /etc/xray-node/nodes/*/; do
   [ -f "${_d}node.txt" ] || continue
@@ -461,13 +888,25 @@ chmod 700 /usr/local/bin/jiedian
 cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
 # 输入 shanjiedian，进入节点管理：查看节点、删除单个节点，或全部卸载
+if [ -x /usr/local/bin/xray-node-expire ]; then
+  /usr/local/bin/xray-node-expire || true
+fi
 NODES_DIR=/etc/xray-node/nodes
 
-# _node_info <节点id>：从 node.txt 里读出"协议，端口"
+# _node_info <节点id>：从 node.txt 里读出"协议，端口，种类"
 _node_info() {
   _ni_proto=$(grep -m1 '^协议: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^协议: //')
   _ni_port=$(grep -m1 '^端口: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^端口: //')
-  printf "%s，端口 %s" "$_ni_proto" "$_ni_port"
+  _ni_kind="永久节点"
+  _ni_exp=$(tr -d ' \r\n' < "$NODES_DIR/$1/expire" 2>/dev/null || true)
+  case "$_ni_exp" in
+    ''|*[!0-9]*) ;;
+    *)
+      _ni_when=$(date -d "@$_ni_exp" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$_ni_exp" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$_ni_exp")
+      _ni_kind="定时节点，${_ni_when} 失效"
+      ;;
+  esac
+  printf "%s，端口 %s，%s" "$_ni_proto" "$_ni_port" "$_ni_kind"
 }
 
 # _fw_save：iptables 规则改动后存盘（删规则后也要存，否则重启后删掉的规则又回来了）
@@ -572,14 +1011,23 @@ _uninstall_all() {
   if [ -d /run/systemd/system ]; then
     systemctl disable xray-node-fw.service >/dev/null 2>&1
     systemctl stop xray-node-fw.service >/dev/null 2>&1
+    systemctl disable --now xray-node-expire.timer >/dev/null 2>&1
   fi
   if command -v rc-update >/dev/null 2>&1; then
     rc-service xray-node-fw stop >/dev/null 2>&1
     rc-update del xray-node-fw default >/dev/null 2>&1
+    rc-service xray-node-expire stop >/dev/null 2>&1
+    rc-update del xray-node-expire default >/dev/null 2>&1
+  fi
+  if [ -f /run/xray-node-expire.pid ]; then
+    kill "$(tr -d ' \r\n' < /run/xray-node-expire.pid)" >/dev/null 2>&1
+    rm -f /run/xray-node-expire.pid
   fi
   rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service \
-    /etc/systemd/system/hysteria-node@.service /etc/systemd/system/xray-node-fw.service
-  rm -f /etc/init.d/xray-node-fw /etc/sysctl.d/99-xray-node-overcommit.conf
+    /etc/systemd/system/hysteria-node@.service /etc/systemd/system/xray-node-fw.service \
+    /etc/systemd/system/xray-node-expire.service /etc/systemd/system/xray-node-expire.timer
+  rm -f /etc/init.d/xray-node-fw /etc/init.d/xray-node-expire /etc/sysctl.d/99-xray-node-overcommit.conf
+  rm -f /etc/cron.d/xray-node-expire
   if [ -f /xray-node.swap ]; then
     swapoff /xray-node.swap >/dev/null 2>&1
     rm -f /xray-node.swap
@@ -619,6 +1067,7 @@ _uninstall_all() {
   rm -f /usr/local/bin/jiedian
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
   rm -f /usr/local/bin/xray-node-fw-restore
+  rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
 }
 
@@ -683,6 +1132,8 @@ for _hy_node in /etc/xray-node/nodes/*/; do
     chmod 600 "${_hy_node}node.txt" 2>/dev/null
   fi
 done
+install_expire_bins || true
+arm_expire_watch || true
 }
 
 _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
@@ -736,6 +1187,12 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
   esac
   SVC_UNIT="$_si_unit"
   _si_svc="xray-node-${_si_id}"
+  install_expire_bins || true
+  # 包装脚本在到期时直接退出，避免重启后过期节点又把端口打开。
+  if [ -x /usr/local/bin/xray-node-run ]; then
+    _si_bin=/usr/local/bin/xray-node-run
+    _si_args="$_si_id"
+  fi
   [ "$LOW_MEM" = "1" ] && drop_page_cache
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     # 每次都重写模板。只在文件不存在时写一次的话，旧模板没有小内存环境变量，
@@ -745,6 +1202,11 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
       sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
       *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
     esac
+    if [ -x /usr/local/bin/xray-node-run ]; then
+      _si_tpl_exec="/usr/local/bin/xray-node-run %i"
+    else
+      _si_tpl_exec="${_si_tpl_bin} ${_si_tpl_args}"
+    fi
     cat > "$_si_tpl" <<EOF
 [Unit]
 Description=${_si_tpl_desc}
@@ -753,7 +1215,7 @@ After=network.target
 Type=simple
 User=root
 ${_si_unit_env}
-ExecStart=${_si_tpl_bin} ${_si_tpl_args}
+ExecStart=${_si_tpl_exec}
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -1443,6 +1905,7 @@ done
 for _sec_file in /etc/xray-node/nodes/*/config.json /etc/xray-node/nodes/*/node.txt \
   /etc/xray-node/nodes/*/fw_info /etc/xray-node/nodes/*/core \
   /etc/xray-node/nodes/*/key.pem /etc/xray-node/nodes/*/cert.pem \
+  /etc/xray-node/nodes/*/expire \
   /etc/xray-node/our_bins /etc/xray-node/node.txt /etc/xray-node/core /etc/xray-node/fw_info; do
   [ -f "$_sec_file" ] && chmod 600 "$_sec_file"
 done
@@ -1451,6 +1914,7 @@ printf "\n${BOLD}==============================================${NC}\n"
 printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
 printf "${BOLD}==============================================${NC}\n"
 printf "全程中文提问，看不懂就一路回车用默认。\n"
+printf "节点分两种：永久节点一直有效；定时节点到点后彻底失效。\n"
 
 # ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
 mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
@@ -1623,10 +2087,21 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
   fi
 fi
 
-# 已经装过节点：更新（默认）/ 添加新节点 / 节点管理 / 取消
-# 注意：选 2 添加新节点不会动旧节点，旧节点继续用；想删节点选 3 或直接输 shanjiedian
+# 已经装过节点：更新（默认）/ 添加节点 / 节点管理 / 取消
+# 选 2 之后先进入种类菜单：永久节点或定时节点。旧节点继续用。
+# 想删节点选 3，或直接输 shanjiedian
 UPDATE_MODE=0
 FORCE_DL=0
+NODE_KIND=permanent
+EXPIRE_AFTER=0
+EXPIRE_LABEL=""
+_KIND_CHOSEN=0
+# 先清掉已经到点的定时节点，再数还剩几个。永久节点没有失效时间，不会被碰。
+install_expire_bins || warn "定时失效程序没能写上。永久节点不受影响；定时节点可能要等下次运行脚本才会被删掉。"
+if [ -x /usr/local/bin/xray-node-expire ]; then
+  /usr/local/bin/xray-node-expire || true
+fi
+arm_expire_watch || true
 _NODE_COUNT=0
 if [ -d /etc/xray-node/nodes ]; then
   for _nd in /etc/xray-node/nodes/*/; do
@@ -1636,12 +2111,12 @@ fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
   printf "  1) 更新内核（推荐。Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
-  printf "  2) 添加新节点（再搭一个，旧节点不受影响、继续用）\n"
+  printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
   ask "请选择" "1" _um
   case "$_um" in
-    2) info "进入添加新节点流程（旧节点不受影响）" ;;
+    2) _choose_node_kind; _KIND_CHOSEN=1 ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
     *) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6 ;;
@@ -1908,6 +2383,11 @@ if [ "$UPDATE_MODE" = "1" ]; then
   fi
 fi
 # 更新模式上面已经退出；新节点目录在完成输入和下载后再建，避免失败时留下空编号。
+
+# 第一次安装，或更新失败后改走添加：先选种类。已经在上面选过就不再问。
+if [ "${_KIND_CHOSEN:-0}" != "1" ]; then
+  _choose_node_kind
+fi
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
 step "[1/4] 节点里填你服务器的哪个公网地址？"
@@ -2598,6 +3078,19 @@ case "$PROTO" in
 esac
 
 # ---------- 14. 保存 + jiedian 命令 ----------
+EXPIRE_AT=""
+EXPIRE_SHOW=""
+if [ "$NODE_KIND" = "timed" ]; then
+  case "$EXPIRE_AFTER" in
+    ''|*[!0-9]*|0) die "定时节点没有有效的失效时间，安装已停" ;;
+  esac
+  _exp_now=$(date +%s 2>/dev/null) || die "读不到服务器时间，定时节点没装上"
+  case "$_exp_now" in ''|*[!0-9]*) die "读不到服务器时间，定时节点没装上" ;; esac
+  EXPIRE_AT=$((_exp_now + EXPIRE_AFTER))
+  EXPIRE_SHOW=$(date -d "@$EXPIRE_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$EXPIRE_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$EXPIRE_AT")
+  printf '%s\n' "$EXPIRE_AT" > "$NODE_DIR/expire" || die "写不了失效时间"
+  chmod 600 "$NODE_DIR/expire" 2>/dev/null || true
+fi
 {
   printf "==============================================\n"
   if [ -n "$LINK_EXTRA" ]; then
@@ -2650,6 +3143,13 @@ esac
     tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
   esac
   printf -- "----------------------------------------------\n"
+  if [ "$NODE_KIND" = "timed" ]; then
+    printf "种类: 定时节点\n"
+    printf "失效时间: %s（%s后，按这台服务器的时间）\n" "$EXPIRE_SHOW" "$EXPIRE_LABEL"
+    printf "到点后大约一分钟内，这个节点会被彻底删除，链接不能再用。其它节点不受影响。\n"
+  else
+    printf "种类: 永久节点\n"
+  fi
   printf "以后想看节点，直接输入: jiedian\n"
   printf "==============================================\n"
 } > "$NODE_DIR/node.txt"
@@ -2688,4 +3188,8 @@ fi
 printf "\n节点 %s 安装完成！\n" "$NODE_ID"
 cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
+if [ "$NODE_KIND" = "timed" ]; then
+  printf "这是定时节点，%s（%s后）会彻底失效：服务停掉，链接作废，配置删掉。其它节点不受影响。\n" "$EXPIRE_SHOW" "$EXPIRE_LABEL"
+  printf "到点后不用你操作。到期记录在 /var/log/xray-node-expire.log。\n"
+fi
 printf "以后看所有节点输入 jiedian，管理节点（查看/删除）输入 shanjiedian。\n"
