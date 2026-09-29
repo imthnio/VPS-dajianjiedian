@@ -8,75 +8,9 @@
 
 ```bash
 # 1. SSH 连上你的服务器（root 用户）
-# 2. 整段粘贴，回车。没有 curl 会自己装上再继续：
-sh <<'EOF'
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-export PATH
-url="https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh"
-out="/tmp/xray-install.sh"
-has() { command -v "$1" >/dev/null 2>&1; }
-can_wget() {
-  has wget && return 0
-  has busybox && busybox --list 2>/dev/null | grep -qx wget
-}
-download() {
-  rm -f "$out"
-  if has curl; then
-    curl -fsSL --connect-timeout 15 --max-time 120 -o "$out" "$url" && [ -s "$out" ] && return 0
-    curl -4 -fsSL --connect-timeout 15 --max-time 120 -o "$out" "$url" && [ -s "$out" ] && return 0
-  fi
-  if has wget; then
-    wget -O "$out" -T 120 "$url" && [ -s "$out" ] && return 0
-    wget -4 -O "$out" -T 120 "$url" && [ -s "$out" ] && return 0
-  elif can_wget; then
-    busybox wget -O "$out" -T 120 "$url" && [ -s "$out" ] && return 0
-  fi
-  return 1
-}
-install_curl() {
-  echo "没有 curl，也没有 wget。正在识别系统并自动安装，装完继续…"
-  sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
-  if has apt-get; then
-    export DEBIAN_FRONTEND=noninteractive
-    _n=0
-    while [ "$_n" -lt 5 ]; do
-      apt-get update -qq && break
-      apt-get -o Acquire::ForceIPv4=true update -qq && break
-      _n=$((_n + 1))
-      echo "软件源正忙，20 秒后重试（${_n}/5）…"
-      sleep 20
-    done
-    apt-get install -y -qq curl ca-certificates \
-      || apt-get -o Acquire::ForceIPv4=true install -y curl ca-certificates \
-      || apt-get -o Acquire::ForceIPv4=true install -y curl \
-      || true
-  elif has apk; then
-    apk add --no-cache curl ca-certificates || apk add --no-cache curl || true
-  elif has dnf; then
-    dnf install -y curl ca-certificates || dnf install -y curl || true
-  elif has yum; then
-    yum install -y curl ca-certificates || yum install -y curl || true
-  elif has pacman; then
-    pacman -Sy --noconfirm --needed curl ca-certificates || true
-  elif has zypper; then
-    zypper --non-interactive install curl ca-certificates || true
-  else
-    echo "识别不到软件安装方式。请先手动安装 curl 或 wget。"
-    exit 1
-  fi
-  hash -r 2>/dev/null || true
-}
-download || {
-  if has curl || has wget; then
-    echo "安装脚本没下载下来。请把上面的报错发出来。"
-    exit 1
-  fi
-  install_curl
-  download || { echo "安装脚本没下载下来。请把上面的报错发出来。"; exit 1; }
-}
-sh "$out"
-EOF
-# 3. 按提示回答问题，装完自动显示节点链接
+# 2. 粘贴下面这一行，回车。没有 curl 会先装上再继续：
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! { command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; }; then { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y curl; } || { apt-get -o Acquire::ForceIPv4=true update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y curl; } || apk add --no-cache curl || yum install -y curl || dnf install -y curl || pacman -Sy --noconfirm curl || zypper --non-interactive install curl; hash -r 2>/dev/null || true; fi; rm -f /tmp/xray-install.sh; if { curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh || wget -O /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh || busybox wget -O /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh; } && [ -s /tmp/xray-install.sh ]; then sh /tmp/xray-install.sh; else echo "安装脚本没下载下来。请把上面的报错发出来。"; fi
+# 3. 按提示回答问题。端口和伪装域名都会停下来等你输入，看不懂就回车用默认。
 ```
 
 安装时会先进入菜单：
