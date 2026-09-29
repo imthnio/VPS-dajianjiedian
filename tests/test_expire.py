@@ -25,6 +25,9 @@ class MenuSplitTest(unittest.TestCase):
         source = source_text()
         self.assertIn("1) 永久节点（一直有效）", source)
         self.assertIn("2) 定时节点（到时间后彻底失效）", source)
+        self.assertIn("3) 关闭 IPv6（这台服务器以后只通过 IPv4 访问网站和 App，效果和没有 IPv6 一样。重启后也保持关闭）", source)
+        self.assertIn("4) 开启 IPv6（恢复使用。服务商没分配地址的话，打开后仍然没有 IPv6）", source)
+        self.assertIn("5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）", source)
         self.assertIn("7) 1 周（7 天）", source)
         self.assertIn("2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）", source)
         self.assertIn("3) 节点管理（查看所有节点、删除某个节点）", source)
@@ -79,6 +82,192 @@ class MenuSplitTest(unittest.TestCase):
         )
         self.assertNotEqual(lone.returncode, 0)
         self.assertEqual(lone.stdout.strip(), "21600")
+
+
+class IPv6SwitchTest(unittest.TestCase):
+    def script(self, extra=""):
+        body = between("_set_expire_choice() {", "\ninstall_expire_bins() {")
+        ask = between("ask() {", "\nrand_hex() {")
+        return (
+            "info() { printf 'INFO %s\\n' \"$1\"; }\n"
+            "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
+            + ask
+            + "\n"
+            + body
+            + "\n"
+            + extra
+        )
+
+    def env_for(self, root):
+        proc = Path(root) / "proc"
+        for name in ("all", "default", "lo", "eth0"):
+            directory = proc / name
+            directory.mkdir(parents=True)
+            (directory / "disable_ipv6").write_text("0\n")
+        systemd = Path(root) / "systemd"
+        run = Path(root) / "run"
+        systemd.mkdir()
+        run.mkdir()
+        nodes = Path(root) / "nodes"
+        nodes.mkdir()
+        bindir = Path(root) / "bin"
+        bindir.mkdir()
+        systemctl = bindir / "systemctl"
+        systemctl.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\nexit 0\n"
+        )
+        systemctl.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "XRAY_IPV6_CONF": str(Path(root) / "sysctl.d" / "99-xray-node-ipv6.conf"),
+                "XRAY_IPV6_PROC": str(proc),
+                "XRAY_SYSCTL_CONF": str(Path(root) / "sysctl.conf"),
+                "XRAY_GAI_CONF": str(Path(root) / "gai.conf"),
+                "XRAY_NODES_DIR": str(nodes),
+                "XRAY_SYSTEMD_DIR": str(systemd),
+                "XRAY_SYSTEMD_RUN": str(run),
+                "XRAY_IPV6_HAS_V4": "1",
+                "SYSTEMCTL_LOG": str(Path(root) / "systemctl.log"),
+                "PATH": str(bindir) + os.pathsep + env.get("PATH", ""),
+            }
+        )
+        return env, proc, nodes
+
+    def test_kind_menu_disables_ipv6_then_installs_a_permanent_node(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, _nodes = self.env_for(root)
+            result = subprocess.run(
+                ["sh", "-c", self.script("_choose_node_kind\nprintf 'RESULT %s\\n' \"$NODE_KIND\"\n")],
+                input="3\n1\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertEqual(result.stderr, "", result.stderr)
+            self.assertIn("RESULT permanent", result.stdout)
+            self.assertIn("IPv6 已关闭", result.stdout)
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "1")
+            self.assertEqual((proc / "eth0" / "disable_ipv6").read_text().strip(), "1")
+            conf = Path(env["XRAY_IPV6_CONF"]).read_text()
+            self.assertIn("net.ipv6.conf.all.disable_ipv6 = 1", conf)
+            sysctl = Path(env["XRAY_SYSCTL_CONF"]).read_text()
+            self.assertEqual(sysctl.count("# xray-node-ipv6 begin"), 1)
+            self.assertIn("precedence ::ffff:0:0/96  100  # xray-node-ipv6", Path(env["XRAY_GAI_CONF"]).read_text())
+            unit = Path(root) / "systemd" / "xray-node-ipv6.service"
+            self.assertIn("disable_ipv6", unit.read_text())
+            self.assertIn("enable xray-node-ipv6.service", Path(env["SYSTEMCTL_LOG"]).read_text())
+
+    def test_enabling_ipv6_removes_the_persistent_switch(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, _nodes = self.env_for(root)
+            subprocess.run(
+                ["sh", "-c", self.script("_choose_node_kind\n")],
+                input="3\n4\n5\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+            self.assertFalse(Path(env["XRAY_IPV6_CONF"]).exists())
+            self.assertFalse((Path(root) / "systemd" / "xray-node-ipv6.service").exists())
+            self.assertNotIn("xray-node-ipv6", Path(env["XRAY_SYSCTL_CONF"]).read_text())
+            self.assertNotIn("xray-node-ipv6", Path(env["XRAY_GAI_CONF"]).read_text())
+
+    def test_ipv6_ssh_and_ipv6_only_host_need_a_yes(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, _nodes = self.env_for(root)
+            env["SSH_CONNECTION"] = "2001:db8::10 50000 2001:db8::20 22"
+            refused = subprocess.run(
+                ["sh", "-c", self.script("_choose_node_kind\nprintf 'RESULT %s\\n' \"$NODE_KIND\"\n")],
+                input="3\nn\n1\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertIn("保持 IPv6 可用", refused.stdout)
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+            self.assertIn("RESULT permanent", refused.stdout)
+
+            env["XRAY_IPV6_HAS_V4"] = "0"
+            env.pop("SSH_CONNECTION")
+            only = subprocess.run(
+                ["sh", "-c", self.script("_choose_node_kind\nprintf 'DONE\\n'\n")],
+                input="3\nn\n5\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertIn("没有 IPv4", only.stdout)
+            self.assertIn("已退出，没有安装节点", only.stdout)
+            self.assertNotIn("DONE", only.stdout)
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+
+    def test_disabling_ipv6_rebinds_dual_stack_listeners_to_ipv4(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, _proc, nodes = self.env_for(root)
+            hy = nodes / "3"
+            hy.mkdir()
+            (hy / "config.yaml").write_text('listen: ":444"\n')
+            (hy / "fw_info").write_text("444 udp 0 0 0 4\n")
+            (hy / "node.txt").write_text(
+                "hysteria2://pass@1.2.3.4:444/?insecure=1#xray-node\n"
+                "IPv6 链接（同一个节点）:\n"
+                "hysteria2://pass@[2001:db8::1]:444/?insecure=1#xray-node\n"
+                "IPv6 地址: 2001:db8::1\n"
+                "Hysteria2 = Hysteria2,1.2.3.4,444,pw\n"
+                "Hysteria2 = Hysteria2,2001:db8::1,444,pw\n"
+            )
+            xray = nodes / "4"
+            xray.mkdir()
+            (xray / "config.json").write_text('{ "listen": "::" }\n')
+            (xray / "fw_info").write_text("443 tcp 0 0 0 6\n")
+            v6 = nodes / "5"
+            v6.mkdir()
+            (v6 / "config.yaml").write_text('listen: "[::]:555"\n')
+            log = Path(root) / "restart.log"
+            env["RESTART_LOG"] = str(log)
+            extra = (
+                "_hy_set_listen() { printf 'listen: \"%s\"\\n' \"$2\" > \"$1\"; }\n"
+                "_svc_restart() { printf '%s\\n' \"$1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 0; }\n"
+                "_ipv6_turn_off\n"
+            )
+            result = subprocess.run(
+                ["sh", "-c", self.script(extra)],
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertEqual(result.stderr, "", result.stderr)
+            self.assertEqual((hy / "config.yaml").read_text(), 'listen: "0.0.0.0:444"\n')
+            self.assertFalse((hy / "config.yaml.bak-ipv6off").exists())
+            self.assertIn('"listen": "0.0.0.0"', (xray / "config.json").read_text())
+            self.assertEqual((v6 / "config.yaml").read_text(), 'listen: "0.0.0.0:555"\n')
+            self.assertEqual(log.read_text().splitlines(), ["3", "4", "5"])
+            self.assertIn("节点 3 已改为只听 IPv4", result.stdout)
+            kept = (hy / "node.txt").read_text()
+            self.assertIn("hysteria2://pass@1.2.3.4:444/", kept)
+            self.assertIn("Hysteria2 = Hysteria2,1.2.3.4,444,pw", kept)
+            self.assertNotIn("2001:db8::1", kept)
+            self.assertNotIn("IPv6 链接", kept)
+
+    def test_readme_bootstrap_is_valid_shell(self):
+        readme = (INSTALLER.parent / "README.md").read_text()
+        start = readme.index("sh <<'EOF'\n") + len("sh <<'EOF'\n")
+        body = readme[start:readme.index("\nEOF\n", start)]
+        subprocess.run(["sh", "-n"], input=body, text=True, check=True)
 
 
 class ExpireScriptTest(unittest.TestCase):
