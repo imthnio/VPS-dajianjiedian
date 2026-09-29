@@ -4,8 +4,8 @@
 #
 # 小白用法（root 用户）：
 #   1. SSH 连上你的服务器
-#   2. 粘贴下面这一行，回车：
-#      curl -fsSL -o /tmp/xray-install.sh https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh && sh /tmp/xray-install.sh
+#   2. 整段粘贴 README 里的安装命令，回车。
+#      没有 curl、也没有 wget 时，会认出 apt/apk/dnf/yum/pacman/zypper，装好再继续。
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
 # 装完之后，想看所有节点随时输入：  jiedian
@@ -14,9 +14,15 @@
 # 节点分两种，装的时候先选：
 #   永久节点：一直有效
 #   定时节点：1 小时、2 小时、6 小时、24 小时、48 小时、72 小时或 1 周
+# 同一个菜单里可以关闭或开启 IPv6。关掉之后，这台服务器只通过 IPv4
+# 访问网站和 App，效果和没有 IPv6 一样，重启后也保持关闭。
 # 定时节点到点后大约一分钟内彻底失效：停服务、作废链接、删配置和防火墙规则。
 # 服务器中途重启也不会让它复活。其它节点不动。
 # ============================================================
+
+# 精简 NAT / LXC / KVM 的 PATH 有时没有 /usr/bin，命令明明装上了也报 not found。
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+export PATH
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info() { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
@@ -145,7 +151,15 @@ get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非�
   fi
   if [ "$_v" = "6" ]; then _f="-6"; else _f="-4"; fi
   for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
-    _ip=$(curl -fsSL --max-time 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
+    if command -v curl >/dev/null 2>&1; then
+      _ip=$(curl -fsSL --max-time 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
+    elif command -v wget >/dev/null 2>&1; then
+      _ip=$(wget -qO- -T 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
+    elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
+      _ip=$(busybox wget -qO- -T 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
+    else
+      _ip=""
+    fi
     # 检测网站偶尔返回非 IP 的垃圾（比如限流提示页）：长得不像 IP 就换下一个
     if [ -n "$_ip" ] && _valid_ip "$_v" "$_ip"; then
       printf "%s" "$_ip"; return 0
@@ -234,13 +248,61 @@ _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
 # API 返回 302 跳到 release-assets，下得快。成功返回 0，失败返回非零。
 gh_api_dl() {
   _gh_repo="$1"; _gh_asset="$2"; _gh_out="$3"
-  _gh_rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${_gh_repo}/releases/latest" 2>/dev/null) || return 1
+  _gh_rel=$(_http_body "https://api.github.com/repos/${_gh_repo}/releases/latest" 2>/dev/null) || return 1
   [ -n "$_gh_rel" ] || return 1
   _gh_aid=$(printf "%s\n" "$_gh_rel" | grep -B10 -F "\"name\": \"${_gh_asset}\"" | grep '"id"' | tail -1 | grep -o '[0-9][0-9]*' | head -1)
   [ -n "$_gh_aid" ] || return 1
-  curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
-    -H "Accept: application/octet-stream" \
-    -o "$_gh_out" "https://api.github.com/repos/${_gh_repo}/releases/assets/${_gh_aid}"
+  _http_save "https://api.github.com/repos/${_gh_repo}/releases/assets/${_gh_aid}" "$_gh_out" "Accept: application/octet-stream"
+}
+
+# 有 curl 就用 curl；只有 wget（含 busybox wget）就用 wget。两边都没有则失败。
+_http_body() { # _http_body [-4|-6] URL -> 正文
+  _hb_flag=""
+  if [ "$1" = "-4" ] || [ "$1" = "-6" ]; then
+    _hb_flag="$1"
+    shift
+  fi
+  _hb_url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 20 --connect-timeout 15 $_hb_flag "$_hb_url"
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- -T 20 $_hb_flag "$_hb_url"
+    return $?
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
+    busybox wget -qO- -T 20 $_hb_flag "$_hb_url"
+    return $?
+  fi
+  return 127
+}
+
+_http_save() { # _http_save URL 输出文件 [请求头]
+  _hs_url="$1"; _hs_out="$2"; _hs_hdr="${3:-}"
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$_hs_hdr" ]; then
+      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
+        -H "$_hs_hdr" -o "$_hs_out" "$_hs_url"
+    else
+      curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
+        -o "$_hs_out" "$_hs_url"
+    fi
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if [ -n "$_hs_hdr" ]; then
+      wget -O "$_hs_out" -T 30 --header="$_hs_hdr" "$_hs_url"
+    else
+      wget -O "$_hs_out" -T 30 "$_hs_url"
+    fi
+    return $?
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
+    busybox wget -O "$_hs_out" -T 30 "$_hs_url"
+    return $?
+  fi
+  return 127
 }
 
 # pick_dldir: 选一个磁盘上的下载目录（/tmp 可能是内存盘，大文件下载会爆内存）
@@ -482,23 +544,376 @@ _choose_expire_duration() {
   fi
 }
 
-_choose_node_kind() {
-  printf "\n请选择节点种类：\n"
-  printf "  1) 永久节点（一直有效）\n"
-  printf "  2) 定时节点（到时间后彻底失效）\n"
-  printf "看不懂就回车，默认是永久节点。\n"
-  ask "请选择" "1" _nk
-  case "$_nk" in
-    2) NODE_KIND=timed ;;
-    *)
-      if [ "$_nk" != "1" ]; then
-        warn "没有这个选项，按永久节点安装"
-      fi
-      NODE_KIND=permanent
-      EXPIRE_AFTER=0
-      EXPIRE_LABEL=""
-      ;;
+_ipv6_conf_path() {
+  printf '%s' "${XRAY_IPV6_CONF:-/etc/sysctl.d/99-xray-node-ipv6.conf}"
+}
+
+_ipv6_has_v4() {
+  if [ -n "${XRAY_IPV6_HAS_V4+x}" ]; then
+    [ "$XRAY_IPV6_HAS_V4" = "1" ]
+    return $?
+  fi
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -4 -o addr show scope global 2>/dev/null | grep -q '[0-9]'
+}
+
+_ipv6_ssh_is_v6() {
+  _sc="${SSH_CONNECTION:-}"
+  [ -n "$_sc" ] || return 1
+  _sip=$(printf '%s\n' "$_sc" | awk '{print $3}')
+  case "$_sip" in
+    *:*) return 0 ;;
   esac
+  return 1
+}
+
+_ipv6_is_off() {
+  _iv_root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
+  _iv_all="${_iv_root}/all/disable_ipv6"
+  if [ -f "$_iv_all" ]; then
+    [ "$(tr -d ' \r\n' < "$_iv_all" 2>/dev/null)" = "1" ]
+    return $?
+  fi
+  [ -f "$(_ipv6_conf_path)" ]
+}
+
+_ipv6_apply() { # _ipv6_apply 0|1：立刻生效。以 all/disable_ipv6 的结果为准。
+  _iv="$1"
+  _root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
+  [ -d "$_root" ] || return 1
+  for _f in "$_root"/*/disable_ipv6; do
+    [ -f "$_f" ] || continue
+    printf '%s\n' "$_iv" > "$_f" 2>/dev/null || true
+  done
+  _all="${_root}/all/disable_ipv6"
+  if [ ! -f "$_all" ] || [ "$(tr -d ' \r\n' < "$_all" 2>/dev/null)" != "$_iv" ]; then
+    if command -v sysctl >/dev/null 2>&1; then
+      sysctl -w "net.ipv6.conf.all.disable_ipv6=${_iv}" >/dev/null 2>&1 || true
+      sysctl -w "net.ipv6.conf.default.disable_ipv6=${_iv}" >/dev/null 2>&1 || true
+      sysctl -w "net.ipv6.conf.lo.disable_ipv6=${_iv}" >/dev/null 2>&1 || true
+    fi
+  fi
+  [ -f "$_all" ] || return 1
+  [ "$(tr -d ' \r\n' < "$_all" 2>/dev/null)" = "$_iv" ]
+}
+
+_ipv6_sysctl_block() { # off|on：改 sysctl.conf 里的标记段，开机时还会再关一次。
+  _mode="$1"
+  _sc="${XRAY_SYSCTL_CONF:-/etc/sysctl.conf}"
+  _dir=$(dirname "$_sc")
+  [ -d "$_dir" ] && [ -w "$_dir" ] || return 1
+  _tmp=$(mktemp 2>/dev/null) || return 1
+  if [ -f "$_sc" ]; then
+    awk '
+      /^# xray-node-ipv6 begin/ { skip=1; next }
+      /^# xray-node-ipv6 end/ { skip=0; next }
+      skip { next }
+      { print }
+    ' "$_sc" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  else
+    : > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  fi
+  if [ "$_mode" = "off" ]; then
+    if [ -s "$_tmp" ]; then
+      _last=$(tail -c 1 "$_tmp" 2>/dev/null || true)
+      [ -z "$_last" ] || printf '\n' >> "$_tmp"
+    fi
+    printf '%s\n' \
+      "# xray-node-ipv6 begin" \
+      "net.ipv6.conf.all.disable_ipv6 = 1" \
+      "net.ipv6.conf.default.disable_ipv6 = 1" \
+      "net.ipv6.conf.lo.disable_ipv6 = 1" \
+      "# xray-node-ipv6 end" >> "$_tmp" || { rm -f "$_tmp"; return 1; }
+  fi
+  cat "$_tmp" > "$_sc" || { rm -f "$_tmp"; return 1; }
+  rm -f "$_tmp"
+}
+
+_ipv6_gai() { # off|on：让程序查地址时先用 IPv4。关掉 IPv6 时写上，打开时删掉。
+  _mode="$1"
+  _gai="${XRAY_GAI_CONF:-/etc/gai.conf}"
+  _dir=$(dirname "$_gai")
+  [ -d "$_dir" ] && [ -w "$_dir" ] || return 1
+  _tmp=$(mktemp 2>/dev/null) || return 1
+  if [ -f "$_gai" ]; then
+    # grep 把标记行全部滤掉时退出码是 1，这不是读文件失败。
+    _gstat=0
+    grep -v 'xray-node-ipv6' "$_gai" > "$_tmp" || _gstat=$?
+    if [ "$_gstat" -gt 1 ]; then
+      rm -f "$_tmp"
+      return 1
+    fi
+  else
+    : > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  fi
+  if [ "$_mode" = "off" ]; then
+    printf '%s\n' "precedence ::ffff:0:0/96  100  # xray-node-ipv6" >> "$_tmp" || { rm -f "$_tmp"; return 1; }
+  fi
+  cat "$_tmp" > "$_gai" || { rm -f "$_tmp"; return 1; }
+  rm -f "$_tmp"
+}
+
+_ipv6_boot_unit() { # off|on：有 systemd 就开机再关一次。没有就靠 sysctl 配置。
+  _mode="$1"
+  _sd="${XRAY_SYSTEMD_DIR:-/etc/systemd/system}"
+  _run="${XRAY_SYSTEMD_RUN:-/run/systemd/system}"
+  _unit="${_sd}/xray-node-ipv6.service"
+  if command -v systemctl >/dev/null 2>&1 && [ -d "$_run" ] && [ -d "$_sd" ] && [ -w "$_sd" ]; then
+    if [ "$_mode" = "off" ]; then
+      cat > "$_unit" <<'EOF'
+[Unit]
+Description=Keep IPv6 disabled
+DefaultDependencies=no
+Before=network-pre.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do [ -f "$f" ] && echo 1 > "$f"; done'
+[Install]
+WantedBy=sysinit.target
+EOF
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable xray-node-ipv6.service >/dev/null 2>&1 || true
+    else
+      systemctl disable xray-node-ipv6.service >/dev/null 2>&1 || true
+      rm -f "$_unit"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ "$_mode" = "off" ] && [ -x /etc/init.d/sysctl ] && command -v rc-update >/dev/null 2>&1; then
+    rc-update add sysctl boot >/dev/null 2>&1 || true
+  fi
+}
+
+# 关掉 IPv6 前，把还在听 IPv6 的节点改成只听 IPv4。
+# 双栈套接字在 IPv6 被关掉时会一起失效，不改的话 IPv4 客户端也会断。
+_ipv6_rebind_nodes() {
+  _root=${XRAY_NODES_DIR:-/etc/xray-node/nodes}
+  [ -d "$_root" ] || return 0
+  for _d in "$_root"/*/; do
+    [ -d "$_d" ] || continue
+    _id=$(basename "$_d")
+    if [ -f "${_d}config.yaml" ]; then
+      _listen=$(awk '
+        /^listen:/ {
+          line = $0
+          sub(/\r$/, "", line)
+          sub(/^listen:[[:space:]]*/, "", line)
+          gsub(/^"|"$/, "", line)
+          print line
+          exit
+        }
+      ' "${_d}config.yaml")
+      _port=""
+      case "$_listen" in
+        \[::\]:*) _port=${_listen#\[::\]:} ;;
+        :*) _port=${_listen#:} ;;
+      esac
+      case "$_port" in
+        ''|*[!0-9]*) ;;
+        *)
+          _cfg="${_d}config.yaml"
+          cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
+          if _hy_set_listen "$_cfg" "0.0.0.0:${_port}"; then
+            _svc_restart "$_id"
+            if wait_for_port "$_port" udp 15; then
+              rm -f "${_cfg}.bak-ipv6off"
+              info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
+            else
+              mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+              _svc_restart "$_id"
+              warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
+            fi
+          else
+            mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+            warn "节点 ${_id} 的监听地址没改成"
+          fi
+          ;;
+      esac
+    fi
+    if [ -f "${_d}config.json" ] && grep -q '"listen"[[:space:]]*:[[:space:]]*"::"' "${_d}config.json" 2>/dev/null; then
+      _cfg="${_d}config.json"
+      cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
+      sed 's/"listen"[[:space:]]*:[[:space:]]*"::"/"listen": "0.0.0.0"/' "${_cfg}.bak-ipv6off" > "$_cfg" || {
+        mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+        warn "节点 ${_id} 的监听地址没改成"
+        continue
+      }
+      _proto=tcp
+      _port=""
+      if [ -f "${_d}fw_info" ]; then
+        read -r _port _fproto _frest < "${_d}fw_info"
+        case "$_fproto" in udp) _proto=udp ;; esac
+      fi
+      _svc_restart "$_id"
+      case "$_port" in
+        ''|*[!0-9]*)
+          rm -f "${_cfg}.bak-ipv6off"
+          info "节点 ${_id} 已改为只听 IPv4"
+          ;;
+        *)
+          if wait_for_port "$_port" "$_proto" 15; then
+            rm -f "${_cfg}.bak-ipv6off"
+            info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
+          else
+            mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+            _svc_restart "$_id"
+            warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
+          fi
+          ;;
+      esac
+    fi
+  done
+}
+
+_ipv6_persist() { # off|on
+  _mode="$1"
+  _conf=$(_ipv6_conf_path)
+  _cdir=$(dirname "$_conf")
+  if [ "$_mode" = "off" ]; then
+    mkdir -p "$_cdir" 2>/dev/null || return 1
+    cat > "$_conf" <<'EOF' || return 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+  else
+    rm -f "$_conf"
+  fi
+  _ipv6_sysctl_block "$_mode" || true
+  _ipv6_gai "$_mode" || true
+  _ipv6_boot_unit "$_mode" || true
+}
+
+# 关掉 IPv6 后，节点说明里的 IPv6 链接不能再用，从 jiedian 里拿掉。
+_ipv6_strip_links() {
+  _root=${XRAY_NODES_DIR:-/etc/xray-node/nodes}
+  [ -d "$_root" ] || return 0
+  for _d in "$_root"/*/; do
+    [ -f "${_d}node.txt" ] || continue
+    _tmp="${_d}node.txt.tmp-ipv6off"
+    awk '
+      /^IPv6 链接/ { next }
+      /^IPv6 地址:/ { next }
+      /^IPv6 端口:/ { next }
+      /^hysteria2:\/\/.*@\[/ { next }
+      /^Hysteria2 = Hysteria2,/ {
+        n = split($0, a, ",")
+        if (n >= 2 && a[2] ~ /:/) next
+      }
+      { print }
+    ' "${_d}node.txt" > "$_tmp" && mv -f "$_tmp" "${_d}node.txt"
+    chmod 600 "${_d}node.txt" 2>/dev/null || true
+    rm -f "$_tmp"
+  done
+}
+
+_ipv6_turn_off() {
+  if ! _ipv6_has_v4; then
+    printf "这台服务器没有 IPv4。关掉 IPv6 之后，它访问不了网站，你也可能连不上。\n"
+    ask "仍然关闭吗？输入 y 才关闭" "n" _iv_yes
+    case "$_iv_yes" in
+      y|Y|yes|YES) ;;
+      *) info "保持 IPv6 可用。"; return 0 ;;
+    esac
+  elif _ipv6_ssh_is_v6; then
+    printf "你现在是用 IPv6 连上这台服务器的。关掉之后这次连接会断，之后要用 IPv4 才能再连。\n"
+    ask "确定关闭 IPv6 吗？输入 y 才关闭" "n" _iv_yes
+    case "$_iv_yes" in
+      y|Y|yes|YES) ;;
+      *) info "保持 IPv6 可用。"; return 0 ;;
+    esac
+  fi
+  _ipv6_rebind_nodes
+  if ! _ipv6_persist off; then
+    warn "关闭设置没写上，重启后 IPv6 可能又会打开。"
+  fi
+  _root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
+  if [ ! -d "$_root" ]; then
+    _ipv6_strip_links
+    info "这台服务器现在没有 IPv6。已经记下：以后也不使用 IPv6。"
+    return 0
+  fi
+  if _ipv6_apply 1; then
+    _ipv6_strip_links
+    info "IPv6 已关闭。这台服务器以后只通过 IPv4 访问网站和 App，效果和没有 IPv6 一样。重启后也保持关闭。"
+    info "用 IPv4 连接不受影响。想重新打开，再运行脚本，选「开启 IPv6」。"
+  else
+    warn "系统没有允许马上关闭 IPv6。有些容器会被服务商锁住，脚本改不了。"
+  fi
+}
+
+_ipv6_turn_on() {
+  _ipv6_persist on || warn "有的关闭设置没删掉。如果重启后又没有 IPv6，再选一次开启。"
+  _root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
+  if [ ! -d "$_root" ]; then
+    info "已经去掉关闭设置。这台系统现在没有 IPv6 可以打开。"
+    return 0
+  fi
+  if _ipv6_apply 0; then
+    info "IPv6 已打开。地址可能要过一会儿，或重启一次服务器，才会回来。"
+    info "已经装好的节点如果要同时听 IPv6，再运行脚本，选「更新内核」。"
+  else
+    warn "关闭设置已去掉，但系统现在没允许打开 IPv6。重启后再看；服务商没分配的话，打开后仍然没有地址。"
+  fi
+}
+
+_ipv6_switch_menu() {
+  while true; do
+    printf "\n要怎么处理这台服务器的 IPv6？\n"
+    printf "  1) 关闭（以后只通过 IPv4 访问网站和 App，效果和没有 IPv6 一样。重启后也保持关闭）\n"
+    printf "  2) 开启（恢复使用 IPv6）\n"
+    printf "  3) 返回\n"
+    if _ipv6_is_off; then
+      printf "当前：IPv6 已关闭。\n"
+    else
+      printf "当前：IPv6 开着。\n"
+    fi
+    ask "请选择" "3" _ip6m
+    case "$_ip6m" in
+      1) _ipv6_turn_off ;;
+      2) _ipv6_turn_on ;;
+      *) break ;;
+    esac
+  done
+}
+
+_choose_node_kind() {
+  while true; do
+    printf "\n请选择：\n"
+    printf "  1) 永久节点（一直有效）\n"
+    printf "  2) 定时节点（到时间后彻底失效）\n"
+    printf "  3) 关闭 IPv6（这台服务器以后只通过 IPv4 访问网站和 App，效果和没有 IPv6 一样。重启后也保持关闭）\n"
+    printf "  4) 开启 IPv6（恢复使用。服务商没分配地址的话，打开后仍然没有 IPv6）\n"
+    printf "  5) 先不装节点，退出\n"
+    if _ipv6_is_off; then
+      printf "当前：IPv6 已关闭。\n"
+    else
+      printf "当前：IPv6 开着。\n"
+    fi
+    printf "看不懂就回车，默认是永久节点。\n"
+    ask "请选择" "1" _nk
+    case "$_nk" in
+      2)
+        NODE_KIND=timed
+        break
+        ;;
+      3) _ipv6_turn_off ;;
+      4) _ipv6_turn_on ;;
+      5)
+        echo "已退出，没有安装节点"
+        exit 0
+        ;;
+      *)
+        if [ "$_nk" != "1" ]; then
+          warn "没有这个选项，按永久节点安装"
+        fi
+        NODE_KIND=permanent
+        EXPIRE_AFTER=0
+        EXPIRE_LABEL=""
+        break
+        ;;
+    esac
+  done
   if [ "$NODE_KIND" = "timed" ]; then
     _choose_expire_duration
   else
@@ -1437,7 +1852,7 @@ _ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "
 }
 
 _latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
-  _lt_tag=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
+  _lt_tag=$(_http_body "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s/^v//')
   # 必须是版本号的样子：tag 格式万一变了（比如 "nightly"），
   # 不能把整行垃圾当版本号吐出去，否则版本比较永远对不上、每次更新都重复下载
@@ -1641,7 +2056,7 @@ prepare_low_memory() {
 }
 
 _latest_hysteria_ver() { # 打印 hysteria 最新版本号（不带 v），失败返回非零
-  _hv=$(curl -fsSL --max-time 20 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+  _hv=$(_http_body "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s|.*/||; s/^v//')
   case "$_hv" in ''|*[!0-9A-Za-z.-]*) return 1 ;; esac
   printf '%s' "$_hv"
@@ -1687,7 +2102,7 @@ dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内�
     rm -f "${HY_BIN}.new"
     _url="https://github.com/apernet/hysteria/releases/latest/download/${_hy_asset}"
     info "尝试下载：$_url"
-    if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "${HY_BIN}.new" "$_url"; then
+    if _http_save "$_url" "${HY_BIN}.new"; then
       _dl_ok=1
     fi
   fi
@@ -1781,7 +2196,7 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
         ; do
           [ -z "$_url" ] && continue
           info "尝试下载：$_url"
-          if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/xray.zip" "$_url"; then
+          if _http_save "$_url" "$DL_DIR/xray.zip"; then
             _dl_ok=1
             break
           fi
@@ -1860,7 +2275,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
         rm -f "$DL_DIR/sb.tar.gz"
         # 路线 B：github.com 版本直链兜底
         _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/${_cand}"
-        if curl -fSL --progress-bar --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 -o "$DL_DIR/sb.tar.gz" "$_url"; then
+        if _http_save "$_url" "$DL_DIR/sb.tar.gz"; then
           _dl_ok=1
           break
         fi
@@ -1915,6 +2330,7 @@ printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
 printf "${BOLD}==============================================${NC}\n"
 printf "全程中文提问，看不懂就一路回车用默认。\n"
 printf "节点分两种：永久节点一直有效；定时节点到点后彻底失效。\n"
+printf "同一个菜单里可以关闭 IPv6：关掉之后，这台服务器只通过 IPv4 访问网站和 App。\n"
 
 # ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
 mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
@@ -2088,7 +2504,7 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
 fi
 
 # 已经装过节点：更新（默认）/ 添加节点 / 节点管理 / 取消
-# 选 2 之后先进入种类菜单：永久节点或定时节点。旧节点继续用。
+# 选 2 之后先进入种类菜单：永久节点、定时节点，或关闭/开启 IPv6。旧节点继续用。
 # 想删节点选 3，或直接输 shanjiedian
 UPDATE_MODE=0
 FORCE_DL=0
@@ -2109,18 +2525,22 @@ if [ -d /etc/xray-node/nodes ]; then
   done
 fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
+  while true; do
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
   printf "  1) 更新内核（推荐。Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
   printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
+  printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
-    2) _choose_node_kind; _KIND_CHOSEN=1 ;;
+    2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
-    *) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6 ;;
+    5) _ipv6_switch_menu ;;
+    *) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6; break ;;
   esac
+  done
 fi
 
 # 旧版小内存模式保存了整张 iptables 快照。更新或加节点时改为只恢复本脚本的规则。
@@ -2148,6 +2568,31 @@ _dep_log="/tmp/xray-dep-apt.log"
 # 这里检测到锁就等 20 秒重试并报进度，而不是静默卡死。
 # 注意：这个函数定义在 if 外面——后面存 iptables 规则时也要用它装 iptables-persistent，
 # 放里面会导致"依赖本来就齐"时函数根本没定义、调用直接报错。
+# 有的精简系统没有 timeout。没有就自己计时，避免装 curl 时先报 timeout: not found。
+_timeout_cmd() {
+  _tsec="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_tsec" "$@"
+    return $?
+  fi
+  "$@" &
+  _tpid=$!
+  _tw=0
+  while kill -0 "$_tpid" 2>/dev/null; do
+    if [ "$_tw" -ge "$_tsec" ]; then
+      kill "$_tpid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$_tpid" 2>/dev/null || true
+      wait "$_tpid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 2
+    _tw=$((_tw + 2))
+  done
+  wait "$_tpid"
+  return $?
+}
+
 _apt_do() {
   _ad="$1"; _ato="$2"; shift 2
   [ "$1" = "--" ] && shift
@@ -2159,7 +2604,7 @@ _apt_do() {
     # 单次尝试卡满整个超时、重试逻辑还检测不到——看着就像"卡住不动"。
     # 心跳：apt 的输出被吞掉了，单次尝试最长 $_ato 秒；每 30 秒报一次"还在装"，
     # 免得小白以为卡死。
-    ( timeout "$_ato" apt-get -o DPkg::Lock::Timeout=120 "$@" >"$_dep_log" 2>&1
+    ( _timeout_cmd "$_ato" apt-get -o DPkg::Lock::Timeout=120 "$@" >"$_dep_log" 2>&1
       echo "$?" >"$_dep_log.rc" ) &
     _apt_pid=$!
     _apt_waited=0
@@ -2178,7 +2623,7 @@ _apt_do() {
     if [ "$_apt_rc" = "124" ] || grep -qi "dpkg was interrupted" "$_dep_log" 2>/dev/null; then
       _an=$((_an + 1))
       printf "检测到安装被打断或超时，正在修复（%s/10）…\n" "$_an"
-      timeout 120 dpkg --configure -a >"$_dep_log" 2>&1 || true
+      _timeout_cmd 120 dpkg --configure -a >"$_dep_log" 2>&1 || true
       continue
     fi
     if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
@@ -2198,35 +2643,80 @@ _dep_fail() {
 }
 # unzip 只有 Xray 的 zip 包才要。小内存机器上为了 Hysteria2 先 apt 装 unzip，
 # 很容易在选协议之前就把内存吃光。缺 unzip 时留到下载 Xray 再装。
-_need_install=0
-command -v curl >/dev/null 2>&1 || _need_install=1
-if [ "$_need_install" -eq 1 ]; then
-  printf "缺少 curl，正在自动安装（每一步都有进度提示，不会卡住不动）…\n"
-  export DEBIAN_FRONTEND=noninteractive
+_have_curl() { command -v curl >/dev/null 2>&1; }
+_have_wget() {
+  command -v wget >/dev/null 2>&1 && return 0
+  command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget
+}
+_have_pkgman() {
+  command -v apt-get >/dev/null 2>&1 && return 0
+  command -v apk >/dev/null 2>&1 && return 0
+  command -v dnf >/dev/null 2>&1 && return 0
+  command -v yum >/dev/null 2>&1 && return 0
+  command -v pacman >/dev/null 2>&1 && return 0
+  command -v zypper >/dev/null 2>&1 && return 0
+  return 1
+}
+_pkg_updated=0
+_pkg_add() { # _pkg_add 描述 包名…
+  _pa_desc="$1"; shift
   if command -v apt-get >/dev/null 2>&1; then
-    _apt_do "正在更新软件源" 60 -- update -qq \
-      || warn "软件源更新失败，用已有索引继续装（多数情况不影响）"
-    _apt_do "正在安装 curl" 300 -- install -y -qq curl ca-certificates \
+    export DEBIAN_FRONTEND=noninteractive
+    if [ "$_pkg_updated" != 1 ]; then
+      _apt_do "正在更新软件源" 90 -- update -qq \
+        || _apt_do "正在更新软件源（改走 IPv4）" 90 -- -o Acquire::ForceIPv4=true update -qq \
+        || warn "软件源更新失败，用已有索引继续装（多数情况不影响）"
+      _pkg_updated=1
+    fi
+    _apt_do "$_pa_desc" 300 -- install -y -qq "$@" \
+      || _apt_do "${_pa_desc}（改走 IPv4）" 300 -- -o Acquire::ForceIPv4=true install -y "$@" \
       || _dep_fail
-  elif command -v apk >/dev/null 2>&1; then
-    printf "正在安装 curl…\n"
-    timeout 300 apk add --no-cache curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    unset DEBIAN_FRONTEND
+    return 0
+  fi
+  printf "%s…\n" "$_pa_desc"
+  if command -v apk >/dev/null 2>&1; then
+    _timeout_cmd 300 apk add --no-cache "$@" >"$_dep_log" 2>&1 || _dep_fail
   elif command -v dnf >/dev/null 2>&1; then
-    printf "正在安装 curl…\n"
-    timeout 300 dnf install -y -q curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    _timeout_cmd 300 dnf install -y -q "$@" >"$_dep_log" 2>&1 \
+      || _timeout_cmd 300 dnf install -y -q --setopt=ip_resolve=4 "$@" >"$_dep_log" 2>&1 \
+      || _dep_fail
   elif command -v yum >/dev/null 2>&1; then
-    printf "正在安装 curl…\n"
-    timeout 300 yum install -y -q curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    _timeout_cmd 300 yum install -y -q "$@" >"$_dep_log" 2>&1 || _dep_fail
   elif command -v pacman >/dev/null 2>&1; then
-    printf "正在安装 curl…\n"
-    timeout 300 pacman -Sy --noconfirm --needed curl ca-certificates >"$_dep_log" 2>&1 || _dep_fail
+    _timeout_cmd 300 pacman -Sy --noconfirm --needed "$@" >"$_dep_log" 2>&1 || _dep_fail
+  elif command -v zypper >/dev/null 2>&1; then
+    _timeout_cmd 300 zypper --non-interactive install "$@" >"$_dep_log" 2>&1 || _dep_fail
+  else
+    return 1
+  fi
+}
+if _have_curl; then
+  info "curl 已有，直接跳过安装"
+elif _have_wget; then
+  info "没有 curl，用已有的 wget 继续"
+else
+  printf "没有 curl，也没有 wget。正在识别系统并自动安装，装完继续…\n"
+  _have_pkgman || die "识别不到软件安装方式。请先手动安装 curl 或 wget，然后再运行。"
+  _pkg_add "正在安装 curl" curl ca-certificates
+  hash -r 2>/dev/null || true
+  if ! _have_curl && ! _have_wget; then
+    _pkg_add "正在安装 curl" curl
+    hash -r 2>/dev/null || true
+  fi
+  if ! _have_curl && ! _have_wget; then
+    _pkg_add "curl 没装上，改装 wget" wget
+    hash -r 2>/dev/null || true
   fi
   rm -f "$_dep_log"
-  unset DEBIAN_FRONTEND
-else
-  info "curl 已有，直接跳过安装"
+  if _have_curl; then
+    info "curl 已装好，继续"
+  elif _have_wget; then
+    info "wget 已装好，继续"
+  else
+    die "curl 和 wget 都没装上。请把上面的报错发出来，或手动安装 curl 后再运行。"
+  fi
 fi
-command -v curl >/dev/null 2>&1 || die "装不上 curl，请手动安装 curl 后重试"
 info "系统工具就绪"
 
 # ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
@@ -2585,13 +3075,13 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     _rp_try=$((_rp_try + 1))
     _rp_out=""
     if [ "$CORE" = "xray" ] && [ -x "$XRAY_BIN" ]; then
-      _rp_out=$(timeout 25 "$XRAY_BIN" tls ping "$REALITY_DOMAIN" 2>&1)
+      _rp_out=$(_timeout_cmd 25 "$XRAY_BIN" tls ping "$REALITY_DOMAIN" 2>&1)
       if printf "%s" "$_rp_out" | grep -q "Handshake succeeded" \
         && printf "%s" "$_rp_out" | grep -q "TLS 1.3"; then
         _rp_ok=1
       fi
     elif command -v openssl >/dev/null 2>&1; then
-      _rp_out=$(timeout 20 openssl s_client -connect "${REALITY_DOMAIN}:443" \
+      _rp_out=$(_timeout_cmd 20 openssl s_client -connect "${REALITY_DOMAIN}:443" \
         -servername "$REALITY_DOMAIN" -tls1_3 </dev/null 2>&1)
       if printf "%s" "$_rp_out" | grep -q "Protocol  *: *TLSv1.3" \
         && printf "%s" "$_rp_out" | grep -q "Verify return code: 0"; then
