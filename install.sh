@@ -2319,7 +2319,8 @@ fi
 # 用 heredoc 或管道把脚本喂给 sh 时，标准输入已经结束。
 # 提问会读到空，回车的默认值会被当成你的选择，端口和伪装域名就不再问。
 # 键盘还在就改回键盘。这里不能写进 ask：测试用管道喂答案，在 ask 里读 /dev/tty 会卡住。
-if [ ! -t 0 ] && [ -r /dev/tty ]; then
+# 没有控制终端时（面板、cloud-init、无 tty 的 ssh 命令）/dev/tty 打不开，dash 下 exec 失败会直接退出。先试开一次。
+if [ ! -t 0 ] && [ -r /dev/tty ] && (: < /dev/tty) 2>/dev/null; then
   exec < /dev/tty
 fi
 umask 077
@@ -3093,7 +3094,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     elif command -v openssl >/dev/null 2>&1; then
       _rp_out=$(_timeout_cmd 20 openssl s_client -connect "${REALITY_DOMAIN}:443" \
         -servername "$REALITY_DOMAIN" -tls1_3 </dev/null 2>&1)
-      if printf "%s" "$_rp_out" | grep -q "Protocol  *: *TLSv1.3" \
+      if printf "%s" "$_rp_out" | grep -q "Protocol *: *TLSv1.3" \
         && printf "%s" "$_rp_out" | grep -q "Verify return code: 0"; then
         _rp_ok=1
       fi
