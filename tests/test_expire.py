@@ -263,11 +263,265 @@ class IPv6SwitchTest(unittest.TestCase):
             self.assertNotIn("2001:db8::1", kept)
             self.assertNotIn("IPv6 链接", kept)
 
-    def test_readme_bootstrap_is_valid_shell(self):
+class InstallPromptTest(unittest.TestCase):
+    def readme_command(self):
         readme = (INSTALLER.parent / "README.md").read_text()
-        start = readme.index("sh <<'EOF'\n") + len("sh <<'EOF'\n")
-        body = readme[start:readme.index("\nEOF\n", start)]
-        subprocess.run(["sh", "-n"], input=body, text=True, check=True)
+        self.assertNotIn("sh <<'EOF'", readme)
+        start = readme.index("```bash\n") + len("```bash\n")
+        block = readme[start:readme.index("\n```", start)]
+        lines = [
+            line for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(lines), 1, block)
+        command = lines[0]
+        self.assertIn("sh /tmp/xray-install.sh", command)
+        self.assertNotIn("<<", command)
+        self.assertIn(
+            'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
+            command,
+        )
+        subprocess.run(["/bin/sh", "-n", "-c", command], check=True)
+        return command
+
+    def test_readme_command_is_one_line(self):
+        self.readme_command()
+
+    def ask_script(self):
+        ask = between("ask() {", "\nrand_hex() {")
+        self.assertNotIn("/dev/tty", ask)
+        return (
+            "err() { printf 'ERR %s\\n' \"$1\"; }\n"
+            "die() { err \"$1\"; exit 1; }\n"
+            + ask
+            + "\nask '端口' '随机' PORT\nprintf 'SET %s\\n' \"$PORT\"\n"
+        )
+
+    def test_closed_stdin_does_not_apply_the_default(self):
+        result = subprocess.run(
+            ["/bin/sh", "-c", self.ask_script()],
+            input="",
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("SET ", result.stdout)
+        self.assertIn("没有读到你的选择", result.stdout)
+
+    def test_enter_still_uses_the_default(self):
+        result = subprocess.run(
+            ["/bin/sh", "-c", self.ask_script()],
+            input="\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertIn("SET 随机", result.stdout)
+
+    def test_installer_reopens_the_terminal_before_the_first_question(self):
+        source = source_text()
+        root = source.index('die "请用 root 用户运行')
+        tty = source.index("exec < /dev/tty")
+        menu = source.index('ask "请选择" "1" _um')
+        self.assertLess(root, tty)
+        self.assertLess(tty, menu)
+
+    def run_line(self, tools, payload, stdin="8443\n"):
+        command = self.readme_command()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bindir = root / "bin"
+            bindir.mkdir()
+            out = root / "install.sh"
+            log = root / "log"
+            payload_path = root / "payload.sh"
+            payload_path.write_text(payload)
+            curl_body = root / "curl-body.sh"
+            curl_body.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$LOG\"\n"
+                "out=\nprev=\n"
+                "for a in \"$@\"; do\n"
+                "  if [ \"$prev\" = \"-o\" ]; then out=$a; fi\n"
+                "  prev=$a\n"
+                "done\n"
+                "cp \"$PAYLOAD\" \"$out\"\n"
+                "exit 0\n"
+            )
+            command = command.replace(
+                'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
+                f'PATH="{bindir}:/bin"',
+            )
+            command = command.replace("/tmp/xray-install.sh", str(out))
+            command = command.replace(
+                "https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh",
+                "http://example.invalid/install.sh",
+            )
+            for name, text in tools.items():
+                path = bindir / name
+                path.write_text(text)
+                path.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bindir}:/bin"
+            env["LOG"] = str(log)
+            env["PAYLOAD"] = str(payload_path)
+            env["BIN"] = str(bindir)
+            env["CURL_BODY"] = str(curl_body)
+            result = subprocess.run(
+                ["/bin/sh", "-c", command],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                env=env,
+            )
+            logged = log.read_text() if log.exists() else ""
+            return result, logged, out
+
+    def test_one_line_keeps_keyboard_input_and_skips_package_install(self):
+        result, logged, _out = self.run_line(
+            {
+                "curl": CURL_STUB,
+                "apt-get": FAIL_STUB,
+                "apk": FAIL_STUB,
+                "wget": FAIL_STUB,
+                "busybox": FAIL_STUB,
+            },
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertNotIn("安装脚本没下载下来", result.stdout)
+        self.assertNotIn("fail ", logged)
+        self.assertIn("-fsSL", logged)
+
+    def test_one_line_uses_wget_without_installing_curl(self):
+        result, logged, _out = self.run_line(
+            {"wget": WGET_STUB, "apt-get": FAIL_STUB, "busybox": FAIL_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertNotIn("fail ", logged)
+        self.assertIn("wget -O ", logged)
+
+    def test_one_line_uses_busybox_wget_without_package_install(self):
+        result, logged, _out = self.run_line(
+            {"busybox": BUSYBOX_STUB, "grep": GREP_STUB, "apt-get": FAIL_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertNotIn("fail ", logged)
+        self.assertIn("busybox wget", logged)
+
+    def test_one_line_installs_curl_with_apt_then_asks(self):
+        result, logged, _out = self.run_line(
+            {"apt-get": APT_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertIn("apt update -qq", logged)
+        self.assertIn("apt install -y curl", logged)
+        self.assertNotIn("ForceIPv4", logged)
+        self.assertNotIn("apk ", logged)
+
+    def test_one_line_installs_curl_with_apk_when_apt_is_missing(self):
+        result, logged, _out = self.run_line(
+            {"apk": APK_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertIn("apk add --no-cache curl", logged)
+        self.assertNotIn("ForceIPv4", logged)
+
+    def test_failed_download_does_not_run_the_installer(self):
+        result, _logged, out = self.run_line(
+            {"apt-get": FAIL_STUB},
+            "#!/bin/sh\nprintf 'GOT ran\\n'\n",
+        )
+        self.assertIn("安装脚本没下载下来", result.stdout)
+        self.assertNotIn("GOT ", result.stdout)
+        self.assertFalse(out.exists())
+
+    def test_installer_failure_is_not_reported_as_a_download_failure(self):
+        result, _logged, _out = self.run_line({"curl": CURL_STUB}, "#!/bin/sh\nexit 3\n", stdin="")
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertNotIn("安装脚本没下载下来", result.stdout)
+
+
+CURL_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$LOG"
+out=
+prev=
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out=$a; fi
+  prev=$a
+done
+cp "$PAYLOAD" "$out"
+exit 0
+"""
+
+WGET_STUB = """#!/bin/sh
+printf 'wget %s\\n' "$*" >> "$LOG"
+cp "$PAYLOAD" "$2"
+exit 0
+"""
+
+BUSYBOX_STUB = """#!/bin/sh
+if [ "$1" = "--list" ]; then
+  printf 'wget\\n'
+  exit 0
+fi
+printf 'busybox %s\\n' "$*" >> "$LOG"
+if [ "$1" = "wget" ]; then
+  cp "$PAYLOAD" "$3"
+  exit 0
+fi
+exit 1
+"""
+
+GREP_STUB = """#!/bin/sh
+pat=
+for a in "$@"; do
+  case "$a" in
+    -*) ;;
+    *) pat=$a ;;
+  esac
+done
+while IFS= read -r line; do
+  [ "$line" = "$pat" ] && exit 0
+done
+exit 1
+"""
+
+APT_STUB = """#!/bin/sh
+printf 'apt %s\\n' "$*" >> "$LOG"
+case " $* " in
+  *" install "*)
+    cp "$CURL_BODY" "$BIN/curl"
+    chmod 755 "$BIN/curl"
+    ;;
+esac
+exit 0
+"""
+
+APK_STUB = """#!/bin/sh
+printf 'apk %s\\n' "$*" >> "$LOG"
+cp "$CURL_BODY" "$BIN/curl"
+chmod 755 "$BIN/curl"
+exit 0
+"""
+
+FAIL_STUB = """#!/bin/sh
+printf 'fail %s\\n' "$*" >> "$LOG"
+exit 1
+"""
 
 
 class ExpireScriptTest(unittest.TestCase):
