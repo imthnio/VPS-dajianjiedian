@@ -131,22 +131,24 @@ get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非�
   _ip=""
   if [ "$_v" = "4" ]; then
     _nic=$(ip -4 route show default table main 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    _ip=$(ip -4 -o addr show dev "$_nic" scope global 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}')
-    if [ -n "$_ip" ] && _valid_ip 4 "$_ip"; then
+    # 网卡上可能有好几个地址（内网 + 公网）。逐个看，用第一个公网地址。
+    for _ip in $(ip -4 -o addr show dev "$_nic" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'); do
+      _valid_ip 4 "$_ip" || continue
       case "$_ip" in
         10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) ;;
         *) printf "%s" "$_ip"; return 0 ;;
       esac
-    fi
+    done
   else
     _nic=$(ip -6 route show default table main 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    _ip=$(ip -6 -o addr show dev "$_nic" scope global 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}')
-    if [ -n "$_ip" ] && _valid_ip 6 "$_ip"; then
+    # 临时地址（隐私扩展）过一阵就换，写进链接会失效；deprecated 的也跳过。
+    for _ip in $(ip -6 -o addr show dev "$_nic" scope global 2>/dev/null | awk '/ temporary/ || / deprecated/ { next } {split($4,a,"/"); print a[1]}'); do
+      _valid_ip 6 "$_ip" || continue
       case "$_ip" in
-        fe80:*|fc*|fd*) ;;
+        fe80:*|fc*|fd*|FC*|FD*) ;;
         *) printf "%s" "$_ip"; return 0 ;;
       esac
-    fi
+    done
   fi
   # 网卡是内网地址时，没有 L2TP 就用出口检测得到 NAT 公网地址。
   # L2TP 已接通时出口是隧道地址，交给使用者手填这台机器真实的公网地址。
@@ -454,6 +456,12 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
     if netfilter-persistent save >/dev/null 2>&1; then
       info "iptables 规则已存盘（重启后仍有效）"
     fi
+    return 0
+  fi
+  # 装了 ufw 或 firewalld 时不能装 iptables-persistent：ufw 的包声明和它冲突（Breaks），
+  # apt -y 会顺手把 ufw 卸掉；firewalld 开机也会和整表回放打架。只恢复本脚本加的端口规则。
+  if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
+    _save_fw_light || warn "防火墙规则没能设为开机恢复，重启后可能需要重新放行端口"
     return 0
   fi
   if command -v "$_fw_save_bin" >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -1388,6 +1396,7 @@ _stop_remove_svc() {
     esac
     systemctl stop "$_x_unit" >/dev/null 2>&1
     systemctl disable "$_x_unit" >/dev/null 2>&1
+    systemctl reset-failed "$_x_unit" >/dev/null 2>&1
     rm -f "/etc/systemd/system/${_x_unit}.service"
   fi
   if command -v rc-service >/dev/null 2>&1; then
@@ -1488,6 +1497,10 @@ _uninstall_all() {
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
+  # IPv6 开关是整台服务器的设置，不跟着节点删。关过的话提醒一下怎么打开。
+  if [ -f /etc/sysctl.d/99-xray-node-ipv6.conf ]; then
+    echo "注意：你之前在菜单里关掉的 IPv6 仍然是关闭的。想打开：重新运行一键安装命令，选「开启 IPv6」，再选退出。"
+  fi
 }
 
 echo "==================== 节点管理 ===================="
@@ -1691,7 +1704,8 @@ RCEOF
       _hy_export_env
     fi
     pkill -f "$_si_cfg" >/dev/null 2>&1
-    # shellcheck disable=SC2086 — _si_args 故意拆成多个参数
+    # _si_args 故意不加引号，拆成多个参数
+    # shellcheck disable=SC2086
     nohup $_si_bin $_si_args >/var/log/xray-node-${_si_id}.log 2>&1 &
     sleep 1
     info "节点 $_si_id 已在后台启动"
@@ -1855,9 +1869,29 @@ _ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "
   printf "%s" "$1" | sed 's/^[^0-9]*//; s/[^0-9.].*//; s/\.*$//'
 }
 
+# _latest_tag_web <owner/repo>：不走 API，看 github.com/<repo>/releases/latest 跳转到哪个 tag。
+# api.github.com 对每个 IP 每小时只给 60 次，同一出口的机器多了就会被限流。
+_latest_tag_web() {
+  _ltw_page="https://github.com/$1/releases/latest"
+  _ltw_url=""
+  if command -v curl >/dev/null 2>&1; then
+    _ltw_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 20 --connect-timeout 15 "$_ltw_page" 2>/dev/null)
+  elif command -v wget >/dev/null 2>&1; then
+    _ltw_url=$(wget -S --spider -T 20 "$_ltw_page" 2>&1 | awk 'tolower($1) == "location:" { u = $2 } END { print u }')
+  fi
+  case "$_ltw_url" in
+    */releases/tag/*) printf '%s' "${_ltw_url##*/releases/tag/}" | tr -d '\r' ;;
+    *) return 1 ;;
+  esac
+}
+
 _latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
   _lt_tag=$(_http_body "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s/^v//')
+  # API 被限流或连不上时，改看 github.com 的跳转地址
+  if [ -z "$_lt_tag" ]; then
+    _lt_tag=$(_latest_tag_web "$1" | sed 's/^v//') || _lt_tag=""
+  fi
   # 必须是版本号的样子：tag 格式万一变了（比如 "nightly"），
   # 不能把整行垃圾当版本号吐出去，否则版本比较永远对不上、每次更新都重复下载
   case "$_lt_tag" in ''|*[!0-9a-zA-Z.-]*) return 1 ;; esac
@@ -2238,7 +2272,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
   else
     DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
     _ver=$(_latest_tag "SagerNet/sing-box") \
-      || die "获取 sing-box 最新版本失败，检查服务器能否访问 api.github.com"
+      || die "获取 sing-box 最新版本失败，检查服务器能否访问 github.com（纯 IPv6 机器连不上 GitHub，要先配好 NAT64 或 WARP）"
     # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
     # 更新模式（FORCE_DL=1）不走这里，必须拉最新版。
     # 但缓存的包可能是几个月前的旧版本：验一下版本，旧了就重新下，别装个过期内核
@@ -3041,7 +3075,9 @@ TUIC_PASS=$(rand_hex 16)
 if command -v openssl >/dev/null 2>&1; then
   SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
 else
-  SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | od -An -tu1 | awk '{for(i=1;i<=NF;i++) printf "%c",$i}' | base64 | tr -d '\n')
+  # 直接对 16 个随机字节做 base64。以前经 awk printf "%c" 转一道，
+  # gawk 在 UTF-8 环境会把 >127 的字节写成两个字节，密钥长度不对，Xray 校验失败。
+  SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | base64 | tr -d '\n')
 fi
 WS_PATH="/$(rand_hex 4)"
 info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
