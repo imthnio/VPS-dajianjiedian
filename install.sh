@@ -18,12 +18,35 @@
 # 访问网站和 App，效果和没有 IPv6 一样，重启后也保持关闭。
 # 定时节点到点后大约一分钟内彻底失效：停服务、作废链接、删配置和防火墙规则。
 # 服务器中途重启也不会让它复活。其它节点不动。
+#
+# ---------------- 名词小词典（看不懂下面的注释先看这里） ----------------
+# 节点：你自己的一台“翻墙服务器入口”。手机/电脑上的客户端连上它，再由它替你上网。
+# 协议：客户端和服务器之间“说话的方式”，比如 VLESS、VMess、Trojan、Shadowsocks、
+#       AnyTLS、Hysteria2、TUIC。不同协议伪装方式、速度、兼容性不一样。
+# 内核：真正干活的程序。本脚本按协议自动选：Xray、sing-box 或官方 hysteria。
+#       脚本只负责下载它、写好配置、让它开机自己跑起来。
+# REALITY：一种伪装技术。别人探测你的服务器时，看到的是一个真实大网站
+#       （比如 www.samsung.com）的正常 HTTPS 握手，所以不需要自己买域名和证书。
+# UUID / 密码：节点的“钥匙”。随机生成，谁拿到链接谁就能用，不要乱发给别人。
+# 分享链接：vless://、hysteria2:// 这种一整行文字，把地址、端口、钥匙都打包在里面，
+#       复制到客户端里“从剪贴板导入”就能用，不用一项项手填。
+# 端口：服务器上的“门牌号”（1-65535）。节点要占一个空闲端口，别的程序不能同时用。
+# 防火墙：服务器上管“哪些门能进”的规则（ufw、firewalld、iptables 都是防火墙工具）。
+#       端口不放行，客户端就连不进来。云服务器控制台里的“安全组”是另一层防火墙，
+#       脚本改不到，要你自己去控制台放行。
+# systemd 服务：Linux 管“后台程序”的系统。把节点注册成服务后，程序挂了会自动拉起，
+#       服务器重启后也会自动启动。Alpine 等系统用的是 OpenRC，作用一样。
+# 定时节点：到时间后自动彻底删除的节点，适合临时给别人用。
+# 所有节点都放在 /etc/xray-node/nodes/<编号>/ 目录里，一个节点一个目录，互不影响。
 # ============================================================
 
 # 精简 NAT / LXC / KVM 的 PATH 有时没有 /usr/bin，命令明明装上了也报 not found。
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 export PATH
 
+# ---------- 0. 打印小工具 ----------
+# info 绿色 [OK]、warn 黄色 [注意]、err 红色 [出错]；die 打印错误后直接结束脚本。
+# step 用来打印每一大步的标题，让你知道脚本做到哪儿了。
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info() { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[注意]${NC} %s\n" "$1"; }
@@ -31,6 +54,7 @@ err()  { printf "${RED}[出错]${NC} %s\n" "$1"; }
 step() { printf "\n${CYAN}${BOLD}%s${NC}\n" "$1"; }
 die()  { err "$1"; exit 1; }
 
+# ask：问你一个问题并把回答存进变量。直接回车就用方括号里的默认值。
 ask() { # ask "提示文字" "默认值" 变量名
   _p="$1"; _d="$2"; _v="$3"
   if [ -n "$_d" ]; then
@@ -50,10 +74,14 @@ ask() { # ask "提示文字" "默认值" 变量名
   eval "$_v='$_a_esc'"
 }
 
+# 从系统随机数源 /dev/urandom 取随机字节，转成 0-9a-f 的字符串。
+# 密码、REALITY 的 shortId、WebSocket 路径都用它生成，别人猜不到。
 rand_hex() { # rand_hex 字节数 -> 十六进制串
   od -An -tx1 -N"$1" /dev/urandom 2>/dev/null | tr -d ' \n'
 }
 
+# 查某个端口是不是已经有程序在用。两个程序不能同时占同一个端口，
+# 所以装节点前要先查，查到被占用就换一个。TCP 和 UDP 的端口是分开算的。
 port_in_use() { # port_in_use <端口> <tcp|udp>
   _pi_port="$1"; _pi_proto="$2"
   if command -v ss >/dev/null 2>&1; then
@@ -86,6 +114,8 @@ port_in_use() { # port_in_use <端口> <tcp|udp>
   printf '%s\n' "$_pi_list" | grep -Eq ":${_pi_port}[[:space:]]"
 }
 
+# 随机挑一个没人用的端口当默认值。用 20000 以上的高端口，
+# 避开 22（SSH）、80/443（网站）这些常用端口，减少冲突。
 rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
   _rp_proto="$1"
   _try=0
@@ -111,6 +141,8 @@ rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
   return 1
 }
 
+# UUID 是一串形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 的随机编号，
+# VLESS / VMess / TUIC 用它当“用户身份”，相当于账号密码合在一起。
 gen_uuid() {
   if [ -r /proc/sys/kernel/random/uuid ]; then
     tr 'A-Z' 'a-z' < /proc/sys/kernel/random/uuid | tr -d '\n'
@@ -119,10 +151,15 @@ gen_uuid() {
   fi
 }
 
+# base64 是把任意内容变成只含字母数字的一串字符的编码方式（不是加密）。
+# VMess 和 Shadowsocks 的分享链接规定要这样编码，客户端导入时会自动解开。
 b64url() { # 标准输入 -> base64url（去换行、去 =）
   base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '='
 }
 
+# 找出这台服务器的公网 IP，写进分享链接里。
+# 公网 IP 是全世界都能访问到的地址；10.x、192.168.x 这类是“内网地址”，外面连不进来。
+# NAT VPS（很多便宜小鸡）网卡上只有内网地址，这时才去问外部网站“我的出口 IP 是多少”。
 get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非零
   _v="$1"
   # 链接里的地址是别人连进来用的，取主路由网卡上的公网地址。
@@ -174,6 +211,8 @@ get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非�
   return 1
 }
 
+# 检查一串文字长得像不像 IP 地址。手动输错或检测网站返回乱码时，
+# 不能把垃圾写进链接，否则“装成功了”却怎么也连不上。
 _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
   if [ "$1" = "6" ]; then
     _v6="$2"
@@ -249,6 +288,9 @@ _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
   fi
 }
 
+# ---------- 下载工具 ----------
+# 各个内核都发布在 GitHub 的 Releases 页面。下面几个函数负责从 GitHub 下载，
+# 有 curl 用 curl，没有就用 wget，一条路不通就换另一条。
 # gh_api_dl <仓库> <文件名> <输出路径>
 # 走 GitHub API 下载 release 文件：api.github.com 比 github.com 稳得多，
 # API 返回 302 跳到 release-assets，下得快。成功返回 0，失败返回非零。
@@ -311,6 +353,7 @@ _http_save() { # _http_save URL 输出文件 [请求头]
   return 127
 }
 
+# 下载的安装包先放到硬盘上的临时目录，装完就删。
 # pick_dldir: 选一个磁盘上的下载目录（/tmp 可能是内存盘，大文件下载会爆内存）
 # 优先 /var/tmp，其次 $HOME，最后才 /tmp。打印目录路径，失败返回非零。
 pick_dldir() {
@@ -326,6 +369,7 @@ pick_dldir() {
   return 1
 }
 
+# 卸载时只删脚本自己装的内核。如果你机器上本来就有 xray 等程序（别的服务在用），不能误删。
 # mark_our_bin <名字>: 记录这个内核是脚本自己下载安装的，卸载时才删
 # （用户机器上本来就有的不删，避免误删）
 mark_our_bin() {
@@ -333,6 +377,7 @@ mark_our_bin() {
   grep -qx "$1" /etc/xray-node/our_bins 2>/dev/null || echo "$1" >> /etc/xray-node/our_bins
 }
 
+# 服务启动后要等它真的“开门”（端口进入监听状态）才算成功，最多等几秒。
 # wait_for_port <端口> <tcp|udp> <超时秒>: 等端口进入监听，成功返回 0
 wait_for_port() {
   _wp="$1"; _wproto="${2:-tcp}"; _wtimeout="${3:-15}"
@@ -372,6 +417,10 @@ wait_for_port() {
   return 1
 }
 
+# ---------- 防火墙 ----------
+# iptables 规则默认只存在内存里，服务器一重启就没了，端口又被挡住。
+# 所以要么装 iptables-persistent 把规则存盘，要么用下面这个“开机恢复”小服务，
+# 开机时只把本脚本放行过的端口重新放行一遍。
 # 小内存机器不装 iptables-persistent。开机只恢复本脚本添加的端口规则，
 # 不回放整张 iptables 快照，以免清掉安装后其他程序或用户添加的规则。
 _save_fw_light() {
@@ -434,6 +483,7 @@ FWEOF
   return 1
 }
 
+# 把刚加的放行规则保存下来，保证重启后还在。
 _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后还在
   # ufw / firewalld 自己会持久化，不用管；只有纯 iptables 需要手动存。
   # 尽力而为：实在存不了就明确告诉用户，不拦主流程。
@@ -483,6 +533,9 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
   warn "这台机器只有纯 iptables 且无法自动存盘：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
 }
 
+# 放行端口 = 告诉防火墙“这个门牌号允许外面的人进来”。
+# 机器上有哪种防火墙工具就用哪种；每条自己加的规则都记到节点的 fw_info 文件里，
+# 删节点时只删这些，你自己原来设的规则一条都不动。
 # _fw_allow <端口> <tcp|udp> <4|6> <fw_info路径> <1=同时处理 ufw/firewalld>
 # ufw 和 firewalld 一条规则同时覆盖 IPv4 和 IPv6，只记一次，删节点时才不会删两次。
 # iptables 和 ip6tables 要各记一条。
@@ -521,6 +574,7 @@ _fw_allow() {
   fi
 }
 
+# ---------- 定时节点：选多久后失效 ----------
 _set_expire_choice() { # 定时节点菜单编号 -> EXPIRE_AFTER（秒）和 EXPIRE_LABEL
   case "$1" in
     1) EXPIRE_AFTER=3600; EXPIRE_LABEL="1 小时" ;;
@@ -556,6 +610,11 @@ _choose_expire_duration() {
   fi
 }
 
+# ---------- IPv6 开关 ----------
+# IPv6 是新一代的 IP 地址（长这样：2001:db8::1）。有的服务器 IPv6 线路很差，
+# 访问网站时优先走 IPv6 反而又慢又不稳。菜单里的“关闭 IPv6”就是让这台服务器
+# 只用 IPv4 上网，并写进系统配置，重启后仍然关闭。“开启 IPv6”是反过来。
+# 下面这些函数分别负责：立刻生效、写开机配置、调整地址优先级、改节点监听地址。
 _ipv6_conf_path() {
   printf '%s' "${XRAY_IPV6_CONF:-/etc/sysctl.d/99-xray-node-ipv6.conf}"
 }
@@ -933,6 +992,11 @@ _choose_node_kind() {
   fi
 }
 
+# ---------- 定时节点的“到点删除”程序 ----------
+# 写出三个小脚本到 /usr/local/bin：
+#   xray-node-expire      检查所有定时节点，到时间的就彻底删掉（服务、配置、防火墙规则）
+#   xray-node-run         启动节点前先看是否已过期，过期就不再启动（防止重启后“复活”）
+#   xray-node-expire-loop 没有 systemd/cron 的机器上，每分钟检查一次
 install_expire_bins() { # 写出到点删除脚本和启动包装。重复运行只覆盖脚本，不动节点。
   _eb_bin=${XRAY_BIN_DIR:-/usr/local/bin}
   mkdir -p "$_eb_bin" 2>/dev/null || return 1
@@ -1177,6 +1241,8 @@ LOOPEOF
   chmod 700 "$_eb_bin/xray-node-expire" "$_eb_bin/xray-node-run" "$_eb_bin/xray-node-expire-loop" || return 1
 }
 
+# 让系统每分钟自动跑一次到点检查。有 systemd 用它的“定时器”（timer），
+# Alpine 用 OpenRC 服务，都没有就用 cron（Linux 自带的定时任务）。
 arm_expire_watch() { # 有定时节点才挂上巡检；没有就卸掉以前留下的巡检。
   _aw_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
   _aw_need=0
@@ -1292,6 +1358,9 @@ EOF
   return 0
 }
 
+# ---------- 写入 jiedian / shanjiedian 两个快捷命令 ----------
+# jiedian：显示所有节点的分享链接；shanjiedian：删除某个节点或全部卸载。
+# 它们是普通的 shell 脚本，放在 /usr/local/bin，以后直接输入名字就能用。
 write_helper_cmds() { # 写入/刷新 jiedian、shanjiedian，以及定时失效脚本
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
@@ -1568,6 +1637,7 @@ install_expire_bins || true
 arm_expire_watch || true
 }
 
+# ---------- 服务（让节点在后台一直跑、开机自启） ----------
 _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
   export HYSTERIA_DISABLE_UPDATE_CHECK=1
   export HYSTERIA_LOG_LEVEL=warn
@@ -1582,6 +1652,10 @@ _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里�
   fi
 }
 
+# 把节点注册成系统服务。
+# systemd 用“模板服务”：一个 xray-node@.service 文件，节点 1 就是 xray-node@1，节点 2 是 xray-node@2，
+# 各管各的。程序意外退出会在 5 秒后自动重启（Restart=on-failure）。
+# 没有 systemd 的机器（Alpine 等）用 OpenRC；两者都没有就用 nohup 放到后台跑（重启后要重跑脚本）。
 _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机自启服务并启动（systemd 模板实例 / OpenRC 独立脚本 / 兜底后台）
   _si_id="$1"
   _si_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_si_id"/core 2>/dev/null)
@@ -1718,6 +1792,9 @@ _svc_restart() { # _svc_restart <节点id>：重写服务模板后再重启（�
   _svc_install "$1"
 }
 
+# ---------- Hysteria2 的 IPv4 / IPv6 双栈 ----------
+# 双栈 = 同时有 IPv4 和 IPv6 地址。Hysteria2 走 UDP，这里判断要不要两种地址都听，
+# 这样不管你家网络是 IPv4 还是 IPv6 都能连。
 _hy_local_ipv4() { # 打印本机第一个全局 IPv4；没有就失败。内网地址也算，用来判断要不要双栈监听。
   command -v ip >/dev/null 2>&1 || return 1
   _hip=$(ip -4 -o addr show scope global 2>/dev/null | awk '
@@ -1858,6 +1935,7 @@ _hy_fix_existing_ipv6() {
   done
 }
 
+# ---------- 更新内核时用的小工具：读端口、比版本号 ----------
 _node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
   read -r _np_port _np_proto _np_rest < /etc/xray-node/nodes/"$1"/fw_info 2>/dev/null
   [ -n "$_np_port" ] || return 1
@@ -1912,6 +1990,9 @@ _cached_ver_ok() {
   [ "$_cvo_ver" = "$_cvo_latest" ]
 }
 
+# ---------- 小内存机器（64MB / 128MB）的特殊处理 ----------
+# 内存很小时，下载和启动内核容易被系统“杀掉”。下面会检测内存大小，
+# 必要时做一块硬盘上的虚拟内存（swap），并放宽内存申请限制。
 _read_meminfo_kb() { # _read_meminfo_kb MemTotal: -> 数字（kB）
   awk -v k="$1" '$1==k {print $2; exit}' /proc/meminfo 2>/dev/null
 }
@@ -2093,6 +2174,8 @@ prepare_low_memory() {
   fi
 }
 
+# ---------- 下载三个内核：Hysteria2 / Xray / sing-box ----------
+# 都是先下载到临时文件名、确认能运行，再替换正式文件，避免装到一半把旧的弄坏。
 _latest_hysteria_ver() { # 打印 hysteria 最新版本号（不带 v），失败返回非零
   _hv=$(_http_body "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s|.*/||; s/^v//')
@@ -2347,6 +2430,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
 }
 
 # ---------- 1. 必须是 root ----------
+# 装软件、写系统配置、改防火墙都要管理员（root）权限，普通用户做不了。
 if [ "$(id -u)" -ne 0 ]; then
   die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
 fi
@@ -2378,6 +2462,7 @@ printf "节点分两种：永久节点一直有效；定时节点到点后彻底
 printf "同一个菜单里可以关闭 IPv6：关掉之后，这台服务器只通过 IPv4 访问网站和 App。\n"
 
 # ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
+# 架构就是 CPU 类型：常见服务器是 x86_64（amd64），也有 ARM。下载内核要选对应的版本。
 mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
 XRAY_BIN="/usr/local/bin/xray"
 SB_BIN="/usr/local/bin/sing-box"
@@ -2396,6 +2481,7 @@ esac
 # 64MB NAT 要在装任何大程序之前做完：放开内存申请，并尽量加一块虚拟内存
 prepare_low_memory
 
+# ---------- 2a. 清理上次没装完的半截节点 ----------
 # 上次安装如果在写出 node.txt 之前失败，目录和服务会留下，但 shanjiedian 看不到。
 # 服务开着 Restart=on-failure 就会一直占端口；64MB 机器上还会把后来的更新拖进回滚。
 _drop_partial_node() {
@@ -2548,6 +2634,7 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
   fi
 fi
 
+# ---------- 2d. 已有节点时的主菜单 ----------
 # 已经装过节点：更新（默认）/ 添加节点 / 节点管理 / 取消
 # 选 2 之后先进入种类菜单：永久节点、定时节点，或关闭/开启 IPv6。旧节点继续用。
 # 想删节点选 3，或直接输 shanjiedian
@@ -2606,6 +2693,7 @@ NODE_DIR=/etc/xray-node/nodes/$NODE_ID
 # 提前建会在每次更新时留下一个空编号目录，节点编号越跳越大
 
 # ---------- 2. 装依赖（缺啥装啥，都有就直接跳过） ----------
+# 依赖 = 脚本要用到的系统工具，这里主要是下载用的 curl（或 wget）。用系统自带的软件管理器安装。
 step "[准备] 检查系统工具…"
 _dep_log="/tmp/xray-dep-apt.log"
 # _apt_do <描述> <单次超时秒> -- <apt-get 参数…>
@@ -2925,6 +3013,7 @@ if [ "${_KIND_CHOSEN:-0}" != "1" ]; then
 fi
 
 # ---------- 3. 问：IPv4 还是 IPv6 ----------
+# 分享链接里要写一个服务器地址。绝大多数服务器用 IPv4；只有没有 IPv4 的机器才选 IPv6。
 step "[1/4] 节点里填你服务器的哪个公网地址？"
 printf "  1) IPv4 地址（服务器有公网 IPv4 就选这个，大多数情况都是）\n"
 printf "  2) IPv6 地址（只有纯 IPv6、没有 IPv4 的服务器才选这个）\n"
@@ -2965,6 +3054,7 @@ case "$SERVER_IP" in
 esac
 
 # ---------- 4. 问：协议 ----------
+# 7 种协议任选一种。看不懂就用默认 1（VLESS + REALITY + Vision），目前最不容易被识别。
 step "[2/4] 选一个协议"
 printf "  1) VLESS + REALITY + Vision（推荐，最难被识别）\n"
 printf "  2) VMess + WebSocket（兼容性好，老客户端也支持）\n"
@@ -2992,6 +3082,7 @@ case "$PROTO" in
 esac
 
 # ---------- 5. 问：端口 ----------
+# 默认给一个随机的空闲端口。NAT VPS 的“公网映射端口”是服务商分配给你的外部端口，要写进链接。
 step "[3/4] 节点用哪个端口？"
 case "$PROTO" in
   hy2|tuic) _PORT_PROTO=udp ;;
@@ -3030,6 +3121,7 @@ if [ "$LINK_PORT" != "$PORT" ]; then
 fi
 
 # ---------- 6. REALITY 伪装域名 ----------
+# REALITY 需要“借用”一个真实的大网站来伪装。这个网站要能从你的服务器顺利访问、支持 TLS 1.3。
 NEED_REALITY=0
 case "$PROTO" in vless|trojan|anytls) NEED_REALITY=1 ;; esac
 if [ "$NEED_REALITY" -eq 1 ]; then
@@ -3066,6 +3158,7 @@ else
 fi
 
 # ---------- 7. 随机生成 UUID / 密码 ----------
+# 每个节点都随机生成新的钥匙，不用你自己想密码，也不会和别人撞。
 step "[生成] 随机生成账号和密码…"
 UUID=$(gen_uuid)
 TROJAN_PASS=$(rand_hex 16)
@@ -3083,6 +3176,7 @@ WS_PATH="/$(rand_hex 4)"
 info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
 
 # ---------- 8. 下载内核 ----------
+# 1-4 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria。已经有能用的就不重复下载。
 if [ "$CORE" = "xray" ]; then
   dl_xray
 elif [ "$CORE" = "hysteria" ]; then
@@ -3092,6 +3186,7 @@ else
 fi
 
 # ---------- 9. REALITY 密钥对 ----------
+# REALITY 用一对密钥：私钥只留在服务器上，公钥（pbk）写进分享链接给客户端。shortId（sid）是额外的随机短编号。
 if [ "$NEED_REALITY" -eq 1 ]; then
   step "[密钥] 生成 REALITY 密钥…"
   if [ "$CORE" = "xray" ]; then
@@ -3172,6 +3267,7 @@ trap _abort_partial_node EXIT
 mkdir -p "$NODE_DIR" || die "无法创建节点目录 $NODE_DIR"
 
 # ---------- 9b. 自签证书（Hysteria2 / TUIC 需要） ----------
+# Hysteria2 和 TUIC 基于 QUIC（UDP 上的加密连接），必须有 TLS 证书。没有域名就自己签一张，客户端靠证书指纹或“跳过验证”来连接。
 if [ "$PROTO" = "hy2" ]; then
   step "[证书] 生成自签证书…"
   umask 077
@@ -3218,6 +3314,7 @@ elif [ "$PROTO" = "tuic" ]; then
 fi
 
 # ---------- 10. 写配置文件 ----------
+# 把上面问到和生成的东西（端口、钥匙、伪装域名）写进内核的配置文件，再让内核自己检查一遍格式对不对。
 step "[配置] 写入配置…"
 mkdir -p /etc/xray-node
 
@@ -3461,6 +3558,7 @@ info "配置文件校验通过"
 fi
 
 # ---------- 11. 开机自启（每个节点独立服务，互不干扰） ----------
+# 注册成系统服务并立刻启动，以后服务器重启也会自动启动。
 # 先记下这个节点用的内核，_svc_install 要读它
 echo "$CORE" > "$NODE_DIR/core" 2>/dev/null
 step "[服务] 设置开机自启…"
@@ -3528,6 +3626,7 @@ else
 fi
 
 # ---------- 12. 放行端口 ----------
+# 在这台服务器的防火墙上放行节点端口；云服务器的“安全组”要你自己在控制台放行。
 step "[网络] 放行端口…"
 # 各协议要放行的端口类型：ss 的 network 配的是 tcp,udp，两个都得放；
 # hy2/tuic 走 UDP；其余走 TCP
@@ -3568,6 +3667,7 @@ else
 fi
 
 # ---------- 13. 生成节点链接 ----------
+# 按各协议的通用格式拼出分享链接，客户端（v2rayN、Shadowrocket、NekoBox 等）都能直接导入。
 step "[完成] 生成你的节点…"
 LINK_EXTRA=""
 case "$PROTO" in
@@ -3615,6 +3715,7 @@ case "$PROTO" in
 esac
 
 # ---------- 14. 保存 + jiedian 命令 ----------
+# 链接和参数保存到节点目录的 node.txt，以后输入 jiedian 就能再看到。
 EXPIRE_AT=""
 EXPIRE_SHOW=""
 if [ "$NODE_KIND" = "timed" ]; then
@@ -3697,6 +3798,7 @@ info "已安装 jiedian 命令：以后输入 jiedian 就能看所有节点"
 info "已安装 shanjiedian 命令：输入 shanjiedian 可管理节点（查看/删除）"
 
 # ---------- 14b. BBR 加速：检测，没开就自动开 ----------
+# BBR 是 Linux 内核自带的一种 TCP 加速算法，网络差时速度更稳，打开不影响别的程序。
 step "检查 BBR 加速…"
 _BBR_ON=0
 if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
@@ -3722,6 +3824,7 @@ if [ "$_BBR_ON" = "0" ]; then
 fi
 
 # ---------- 15. 显示结果 ----------
+# 把节点信息打印出来，复制那一行链接到客户端就能用。
 printf "\n节点 %s 安装完成！\n" "$NODE_ID"
 cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
