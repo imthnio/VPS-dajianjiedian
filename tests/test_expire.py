@@ -368,7 +368,7 @@ class InstallPromptTest(unittest.TestCase):
             sysbin = root / "sysbin"
             sysbin.mkdir()
             for tool in Path("/bin").iterdir():
-                if tool.name in ("curl", "wget", "busybox"):
+                if tool.name in ("curl", "wget", "busybox", "dpkg"):
                     continue
                 if os.access(tool, os.X_OK) and not tool.is_dir():
                     (sysbin / tool.name).symlink_to(tool)
