@@ -211,6 +211,35 @@ class IPv6SwitchTest(unittest.TestCase):
             self.assertNotIn("DONE", only.stdout)
             self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
 
+    def test_locked_ipv6_setting_leaves_nodes_untouched(self):
+        # 有些容器 /proc/sys 只读：关不掉 IPv6 时，不能先把节点改成只听 IPv4。
+        if os.geteuid() == 0:
+            self.skipTest("root 能写只读权限的文件，模拟不了")
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, nodes = self.env_for(root)
+            (proc / "all" / "disable_ipv6").chmod(0o444)
+            hy = nodes / "3"
+            hy.mkdir()
+            (hy / "config.yaml").write_text('listen: ":444"\n')
+            (hy / "node.txt").write_text("hysteria2://pass@[2001:db8::1]:444/?insecure=1#xray-node\n")
+            log = Path(root) / "restart.log"
+            env["RESTART_LOG"] = str(log)
+            extra = (
+                "_hy_set_listen() { printf 'listen: \"%s\"\\n' \"$2\" > \"$1\"; }\n"
+                "_svc_restart() { printf '%s\\n' \"$1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 0; }\n"
+                "_ipv6_turn_off\n"
+            )
+            result = subprocess.run(
+                ["sh", "-c", self.script(extra)], input="", text=True,
+                capture_output=True, timeout=10, check=True, env=env,
+            )
+            self.assertEqual((hy / "config.yaml").read_text(), 'listen: ":444"\n')
+            self.assertFalse(log.exists())
+            self.assertIn("hysteria2://pass@[2001:db8::1]", (hy / "node.txt").read_text())
+            self.assertFalse(Path(env["XRAY_IPV6_CONF"]).exists())
+            self.assertIn("不允许修改 IPv6", result.stdout)
+
     def test_disabling_ipv6_rebinds_dual_stack_listeners_to_ipv4(self):
         with tempfile.TemporaryDirectory() as root:
             env, _proc, nodes = self.env_for(root)
