@@ -85,7 +85,7 @@ class PortCheckTest(unittest.TestCase):
         """Without ss/netstat, occupied ports must not look free (else install can false-succeed)."""
         source = INSTALLER.read_text()
         match = re.search(
-            r"(port_in_use\(\) \{.*?\n\})\n\nrand_port",
+            r"(port_in_use\(\) \{.*?\n\})\n\n(?:#[^\n]*\n)*rand_port",
             source,
             re.S,
         )
@@ -118,7 +118,7 @@ class PortCheckTest(unittest.TestCase):
     def test_proc_fallback_requires_a_matching_socket(self):
         source = INSTALLER.read_text()
         match = re.search(
-            r"(wait_for_port\(\) \{.*?\n\})\n\n# 小内存机器",
+            r"(wait_for_port\(\) \{.*?\n\})\n\n(?:#[^\n]*\n)*# 小内存机器",
             source,
             re.S,
         )
@@ -179,7 +179,7 @@ class HysteriaLinkTest(unittest.TestCase):
     def test_existing_hysteria_link_is_repaired_without_changing_credentials(self):
         source = INSTALLER.read_text()
         match = re.search(
-            r"(write_helper_cmds\(\) \{.*?\n\})\n\n_hy_export_env",
+            r"(write_helper_cmds\(\) \{.*?\n\})\n\n(?:#[^\n]*\n)*_hy_export_env",
             source,
             re.S,
         )
@@ -217,7 +217,7 @@ class LegacyMigrationTest(unittest.TestCase):
     def migration_script(self, root):
         source = INSTALLER.read_text()
         match = re.search(
-            r"(if \[ -f /etc/xray-node/node\.txt \] && \[ ! -d /etc/xray-node/nodes \]; then.*?\nfi)\n\n# 已经装过节点",
+            r"(if \[ -f /etc/xray-node/node\.txt \] && \[ ! -d /etc/xray-node/nodes \]; then.*?\nfi)\n\n(?:#[^\n]*\n)*# 已经装过节点",
             source,
             re.S,
         )
@@ -338,7 +338,7 @@ class XrayListenTest(unittest.TestCase):
 class IPv6ValidationTest(unittest.TestCase):
     def function(self):
         source = INSTALLER.read_text()
-        match = re.search(r"(_valid_ip\(\) \{.*?\n\})\n\n# gh_api_dl", source, re.S)
+        match = re.search(r"(_valid_ip\(\) \{.*?\n\})\n\n(?:#[^\n]*\n)*# gh_api_dl", source, re.S)
         self.assertIsNotNone(match)
         return match.group(1)
 
@@ -363,7 +363,7 @@ class IPv6ValidationTest(unittest.TestCase):
 class FstabSwapTest(unittest.TestCase):
     def append_function(self):
         source = INSTALLER.read_text()
-        match = re.search(r"(_fstab_append_swap\(\) \{.*?\n\})\n\n# 64MB", source, re.S)
+        match = re.search(r"(_fstab_append_swap\(\) \{.*?\n\})\n\n(?:#[^\n]*\n)*# 64MB", source, re.S)
         self.assertIsNotNone(match)
         return match.group(1)
 
