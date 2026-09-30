@@ -334,6 +334,15 @@ class InstallPromptTest(unittest.TestCase):
             root = Path(temp)
             bindir = root / "bin"
             bindir.mkdir()
+            # 只把系统自带的基础命令链接进来，去掉 curl/wget/busybox：
+            # 不然机器上本来就有 curl 时，"没有 curl 先装上" 的用例测不到。
+            sysbin = root / "sysbin"
+            sysbin.mkdir()
+            for tool in Path("/bin").iterdir():
+                if tool.name in ("curl", "wget", "busybox"):
+                    continue
+                if os.access(tool, os.X_OK) and not tool.is_dir():
+                    (sysbin / tool.name).symlink_to(tool)
             out = root / "install.sh"
             log = root / "log"
             payload_path = root / "payload.sh"
@@ -352,7 +361,7 @@ class InstallPromptTest(unittest.TestCase):
             )
             command = command.replace(
                 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
-                f'PATH="{bindir}:/bin"',
+                f'PATH="{bindir}:{sysbin}"',
             )
             command = command.replace("/tmp/xray-install.sh", str(out))
             command = command.replace(
@@ -364,7 +373,7 @@ class InstallPromptTest(unittest.TestCase):
                 path.write_text(text)
                 path.chmod(0o755)
             env = os.environ.copy()
-            env["PATH"] = f"{bindir}:/bin"
+            env["PATH"] = f"{bindir}:{sysbin}"
             env["LOG"] = str(log)
             env["PAYLOAD"] = str(payload_path)
             env["BIN"] = str(bindir)
