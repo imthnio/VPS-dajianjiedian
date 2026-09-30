@@ -199,5 +199,105 @@ class DualLinkHeaderTest(unittest.TestCase):
             self.assertIn("203.0.113.2:443", text)
 
 
+class PortRetryTest(unittest.TestCase):
+    def run_block(self, answers):
+        block = between("_port_try=0\n", 'info "端口：$PORT"')
+        script = (
+            "warn() { echo \"WARN $1\"; }\nerr() { echo \"ERR $1\"; }\ndie() { err \"$1\"; exit 1; }\n"
+            + between("ask() {", "\nrand_hex() {")
+            + "\nport_in_use() { [ \"$1\" = 8443 ]; }\n_PORT_PROTO=tcp\n_DEF_PORT=30000\n"
+            + block + "\necho \"PORT=$PORT\"\n"
+        )
+        return subprocess.run(["sh", "-c", script], input=answers, text=True, capture_output=True, timeout=10)
+
+    def test_busy_port_is_asked_again(self):
+        result = self.run_block("8443\n\n")
+        self.assertIn("WARN 端口 8443/TCP 已被其他程序占用", result.stdout)
+        self.assertIn("PORT=30000", result.stdout)
+
+    def test_gives_up_after_three_busy_answers(self):
+        result = self.run_block("8443\n8443\n8443\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERR 端口 8443/TCP 已被其他程序占用", result.stdout)
+
+
+class NftDropChainTest(unittest.TestCase):
+    RULESET = """table ip filter {
+\tchain INPUT {
+\t\ttype filter hook input priority filter; policy drop;
+\t}
+}
+table inet firewalld {
+\tchain filter_INPUT {
+\t\ttype filter hook input priority filter + 10; policy accept;
+\t}
+}
+table inet my_fw {
+\tchain input {
+\t\ttype filter hook input priority filter; policy drop;
+\t\tct state established,related accept
+\t}
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy drop;
+\t}
+}
+"""
+
+    def test_only_native_drop_input_chains_are_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            nft = Path(temp) / "nft"
+            (Path(temp) / "ruleset").write_text(self.RULESET)
+            nft.write_text(f"#!/bin/sh\ncat {temp}/ruleset\n")
+            nft.chmod(0o755)
+            script = between("_nft_drop_chains() {", "\n_set_expire_choice() {") + "\n_nft_drop_chains\n"
+            result = run_sh(script, dict(os.environ, PATH=f"{temp}:/usr/bin:/bin"))
+            self.assertEqual(result.stdout.strip().splitlines(), ["inet my_fw input"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class NatPrivateNicTest(GetIpChoiceTest):
+    def test_private_only_nic_uses_egress_address(self):
+        result = self.run_get("4", '''
+            case "$*" in
+              "-4 route show default table main") echo "default via 10.55.0.1 dev eth0";;
+              "-4 -o addr show dev eth0 scope global") echo "2: eth0 inet 10.55.0.2/24 scope global eth0";;
+              *) return 1;;
+            esac''')
+        self.assertEqual(result.stdout.strip(), "198.51.100.99", result.stderr)
+
+
+class Ipv6OnlyTest(unittest.TestCase):
+    def hint(self, v4_route):
+        script = (
+            "ip() { case \"$*\" in \"-4 route show default\") printf '%s' '" + v4_route + "';; esac; }\n"
+            + between("_gh_hint() {", "\n_latest_tag() {")
+            + "\nprintf '[%s]' \"$(_gh_hint)\"\n"
+        )
+        return run_sh(script).stdout
+
+    def test_hint_only_without_ipv4_route(self):
+        self.assertIn("GitHub 不支持 IPv6", self.hint(""))
+        self.assertEqual(self.hint("default via 203.0.113.1 dev eth0"), "[]")
+
+    def test_download_errors_carry_hint(self):
+        source = INSTALLER.read_text()
+        for core in ("Xray", "sing-box", "Hysteria2"):
+            self.assertIn(core + ' 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)', source)
+
+    def test_ipv6_default_when_no_ipv4_route(self):
+        block = between("_ipdef=1\n", 'ask "请选择" "$_ipdef" _ipver')
+        self.assertIn('ip -4 route show default', block)
+        self.assertIn('_ipdef=2', block)
+
+    def test_unzip_only_needed_for_download(self):
+        body = between("dl_xray() {", "\n}\n")
+        self.assertLess(body.index('Xray 已存在，直接用现有的'), body.index("_ensure_unzip"))
+
+
+class MigrationHelperTest(unittest.TestCase):
+    def test_helpers_refreshed_right_after_migration(self):
+        block = between('info "迁移完成：老节点已转为节点 1', "# ---------- 2d.")
+        self.assertIn("write_helper_cmds", block.split("else", 1)[0])

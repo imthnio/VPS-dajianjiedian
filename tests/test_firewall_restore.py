@@ -298,6 +298,7 @@ class LegacyMigrationTest(unittest.TestCase):
             stubs = (
                 'step() { :; }; warn() { :; }; info() { :; }; sleep() { :; }; '
                 'pkill() { :; }; ss() { :; }; _svc_install() { :; }; '
+                'write_helper_cmds() { echo helpers >> "$SERVICE_LOG.helpers"; }; '
                 'wait_for_port() { return 0; }; die() { exit 2; }; '
                 'systemctl() { printf "%s\\n" "$*" >> "$SERVICE_LOG"; }; '
             )
@@ -319,6 +320,8 @@ class LegacyMigrationTest(unittest.TestCase):
                 service_log.read_text().splitlines(),
                 ["stop xray", "is-active --quiet xray-node@1", "disable xray", "daemon-reload"],
             )
+            # 迁移成功后马上换新版 jiedian/shanjiedian，老版 xiezai 不能留着
+            self.assertEqual(Path(str(service_log) + ".helpers").read_text(), "helpers\n")
 
 
 class XrayListenTest(unittest.TestCase):
