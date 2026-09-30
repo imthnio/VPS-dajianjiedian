@@ -575,6 +575,22 @@ _fw_allow() {
 }
 
 # ---------- 定时节点：选多久后失效 ----------
+# _nft_drop_chains：找出“直接用 nftables 写的、默认拒绝外来连接”的入口链，每行打印“协议族 表 链”。
+# iptables（ip/ip6 filter 表）、ufw、firewalld 的规则上面已经处理过，这里不管。
+# 这种链会在 iptables 放行之后再拦一次，端口照样不通。
+_nft_drop_chains() {
+  command -v nft >/dev/null 2>&1 || return 0
+  nft list ruleset 2>/dev/null | awk '
+    $1 == "table" { fam = $2; tbl = $3 }
+    $1 == "chain" { ch = $2 }
+    /type filter hook input/ && /policy drop/ {
+      if ((fam == "ip" || fam == "ip6") && tbl == "filter") next
+      if (tbl == "firewalld") next
+      print fam, tbl, ch
+    }
+  '
+}
+
 _set_expire_choice() { # 定时节点菜单编号 -> EXPIRE_AFTER（秒）和 EXPIRE_LABEL
   case "$1" in
     1) EXPIRE_AFTER=3600; EXPIRE_LABEL="1 小时" ;;
@@ -1983,6 +1999,14 @@ _latest_tag_web() {
   esac
 }
 
+# 没有 IPv4 出口时补一句原因：GitHub 不支持 IPv6，纯 IPv6 机器直接连不上。
+_gh_hint() {
+  command -v ip >/dev/null 2>&1 || return 0
+  if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+    printf '%s' "（这台机器没有 IPv4，而 GitHub 不支持 IPv6，下载不了。先装 WARP 或设置 NAT64/DNS64，再重跑脚本）"
+  fi
+}
+
 _latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
   _lt_tag=$(_http_body "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s/^v//')
@@ -2253,7 +2277,7 @@ dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内�
   fi
   if [ "$_dl_ok" != "1" ]; then
     rm -f "${HY_BIN}.new"
-    die "Hysteria2 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+    die "Hysteria2 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
   fi
   # 小于 1MB 的多半是错误页，不是内核
   _hy_sz=$(wc -c < "${HY_BIN}.new" 2>/dev/null | tr -d ' ')
@@ -2296,7 +2320,6 @@ _ensure_unzip() {
 
 dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
   step "[下载] 获取 Xray 内核…"
-  _ensure_unzip
   case "$MACH" in
     amd64) XARCH="64" ;;
     arm64) XARCH="arm64-v8a" ;;
@@ -2305,6 +2328,8 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
   if [ "$FORCE_DL" != "1" ] && [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version >/dev/null 2>&1; then
     info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
   else
+    # 机器上已有能用的 Xray 时不需要 unzip，只有真要下载解压才装它
+    _ensure_unzip
     DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
     # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
     # 更新模式（FORCE_DL=1）不走这里，必须拉最新版。
@@ -2349,7 +2374,7 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
           rm -f "$DL_DIR/xray.zip"
         done
       fi
-      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+      [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
@@ -2379,7 +2404,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
   else
     DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
     _ver=$(_latest_tag "SagerNet/sing-box") \
-      || die "获取 sing-box 最新版本失败，检查服务器能否访问 github.com（纯 IPv6 机器连不上 GitHub，要先配好 NAT64 或 WARP）"
+      || die "获取 sing-box 最新版本失败，检查服务器能否访问 github.com$(_gh_hint)"
     # 磁盘上已有完整可用的包就直接用（上次下载完但被中断的情况，不用重新下载）；
     # 更新模式（FORCE_DL=1）不走这里，必须拉最新版。
     # 但缓存的包可能是几个月前的旧版本：验一下版本，旧了就重新下，别装个过期内核
@@ -2427,7 +2452,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
         warn "这个包名下载失败，换下一个包名试试…"
         rm -f "$DL_DIR/sb.tar.gz"
       done
-      [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+      [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
@@ -2640,6 +2665,9 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
         rm -f "$_m_cfg" /etc/xray-node/node.txt /etc/xray-node/fw_info /etc/xray-node/core
         rmdir /usr/local/etc/xray /usr/local/etc/sing-box 2>/dev/null
         info "迁移完成：老节点已转为节点 1，端口 $_m_port/$_m_proto 监听正常"
+        # 马上换成新版的 jiedian / shanjiedian。老版 xiezai 按旧布局一键全删，
+        # 迁移后再用它会删掉共用内核、弄坏节点 1；用户在下面菜单直接取消也不能留着它。
+        write_helper_cmds
       else
         if [ "$_m_manager" = systemd ]; then
           systemctl stop "$_m_new_unit" >/dev/null 2>&1
@@ -3042,8 +3070,15 @@ fi
 step "[1/4] 节点里填你服务器的哪个公网地址？"
 printf "  1) IPv4 地址（服务器有公网 IPv4 就选这个，大多数情况都是）\n"
 printf "  2) IPv6 地址（只有纯 IPv6、没有 IPv4 的服务器才选这个）\n"
-printf "不知道选哪个就回车用默认 1。\n"
-ask "请选择" "1" _ipver
+# 机器上根本没有 IPv4 出口（纯 IPv6 小鸡）时，把默认值改成 2，免得小白回车后选错
+_ipdef=1
+if command -v ip >/dev/null 2>&1 && [ -z "$(ip -4 route show default 2>/dev/null)" ] \
+   && [ -n "$(ip -6 route show default 2>/dev/null)" ]; then
+  _ipdef=2
+  printf "检测到这台机器没有 IPv4 出口、只有 IPv6，所以默认选 2。\n"
+fi
+printf "不知道选哪个就回车用默认 %s。\n" "$_ipdef"
+ask "请选择" "$_ipdef" _ipver
 case "$_ipver" in
   2) IPVER=6 ;;
   *) IPVER=4 ;;
@@ -3115,6 +3150,9 @@ case "$PROTO" in
   *) _PORT_PROTO=tcp ;;
 esac
 _DEF_PORT=$(rand_port "$_PORT_PROTO") || die "找不到空闲端口，请检查这台机器的端口占用情况"
+# 端口被别的程序占着时，直接再问一次（最多 3 次），不用整个脚本重跑。
+_port_try=0
+while true; do
 ask "请输入端口（1-65535）" "$_DEF_PORT" PORT
 case "$PORT" in
   ''|*[!0-9]*) warn "端口不是数字，用默认 $_DEF_PORT"; PORT="$_DEF_PORT" ;;
@@ -3125,12 +3163,20 @@ PORT=$(printf "%s" "$PORT" | sed 's/^0*//')
 if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   warn "端口超出范围，用默认 $_DEF_PORT"; PORT="$_DEF_PORT"
 fi
+_port_busy=""
 case "$_PORT_PROTO" in
-  tcp|both) port_in_use "$PORT" tcp && die "端口 $PORT/TCP 已被其他程序占用，请重跑脚本换一个端口" ;;
+  tcp|both) port_in_use "$PORT" tcp && _port_busy="TCP" ;;
 esac
 case "$_PORT_PROTO" in
-  udp|both) port_in_use "$PORT" udp && die "端口 $PORT/UDP 已被其他程序占用，请重跑脚本换一个端口" ;;
+  udp|both) [ -z "$_port_busy" ] && port_in_use "$PORT" udp && _port_busy="UDP" ;;
 esac
+[ -z "$_port_busy" ] && break
+_port_try=$((_port_try + 1))
+if [ "$_port_try" -ge 3 ]; then
+  die "端口 $PORT/$_port_busy 已被其他程序占用，请重跑脚本换一个端口"
+fi
+warn "端口 $PORT/$_port_busy 已被其他程序占用，请换一个。直接回车就用 $_DEF_PORT（这个是空闲的）。"
+done
 info "端口：$PORT"
 printf "如果是 NAT VPS，且服务商分配的公网端口与上面的端口不同，请填公网端口；普通 VPS 直接回车。\n"
 ask "公网映射端口" "$PORT" LINK_PORT
@@ -3685,6 +3731,16 @@ done
 # 否则机器一重启端口又被墙、节点连不上（ufw/firewalld 自己会持久化，不用管）
 [ "$_FW_SAVE4" = "1" ] && _save_fw 4
 [ "$_FW_SAVE6" = "1" ] && _save_fw 6
+# 自己写的 nftables 防火墙不自动改（改了还要动 /etc/nftables.conf），只告诉你怎么放行。
+_nft_chains=$(_nft_drop_chains)
+if [ -n "$_nft_chains" ]; then
+  warn "这台机器有 nftables 防火墙默认拦截外来连接，脚本没有改它。不放行的话节点连不上。请运行下面的命令放行，并把同样的规则写进 /etc/nftables.conf（重启后才还在）："
+  printf '%s\n' "$_nft_chains" | while read -r _nf_fam _nf_tbl _nf_ch; do
+    for _np in $_FW_PROTOS; do
+      printf '  nft insert rule %s %s %s %s dport %s accept\n' "$_nf_fam" "$_nf_tbl" "$_nf_ch" "$_np" "$PORT"
+    done
+  done
+fi
 if [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
   warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT/UDP，IPv4 和 IPv6 都要放"
 else
