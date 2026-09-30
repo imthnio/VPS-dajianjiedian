@@ -145,5 +145,59 @@ class UninstallNoteTest(unittest.TestCase):
         self.assertIn("开启 IPv6", body)
 
 
+class HysteriaVersionFallbackTest(unittest.TestCase):
+    def test_hysteria_version_survives_api_rate_limit(self):
+        for redirect in ("https://github.com/apernet/hysteria/releases/tag/app/v2.12.3",
+                         "https://github.com/apernet/hysteria/releases/tag/app%2Fv2.12.3"):
+            script = (
+                "_http_body() { return 22; }\n"
+                "curl() { printf '%s' '" + redirect + "'; }\n"
+                + between("_latest_tag_web() {", "\n_latest_tag() {")
+                + between("_latest_hysteria_ver() {", "\n_hysteria_local_ver() {")
+                + "\n_latest_hysteria_ver\n"
+            )
+            result = run_sh(script)
+            self.assertEqual(result.stdout, "2.12.3", result.stderr)
+
+
+class ExpireBinsCleanupTest(unittest.TestCase):
+    def run_drop(self, with_node):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bindir = root / "bin"; bindir.mkdir()
+            nodes = root / "nodes"; nodes.mkdir()
+            if with_node:
+                (nodes / "1").mkdir()
+            for name in ("xray-node-expire", "xray-node-run", "xray-node-expire-loop", "jiedian-other"):
+                (bindir / name).write_text("x")
+            script = between("_drop_expire_bins_if_unused() {", "\narm_expire_watch() {") + "\n_drop_expire_bins_if_unused\n"
+            run_sh(script, dict(os.environ, XRAY_NODE_DIR=str(nodes), XRAY_BIN_DIR=str(bindir)))
+            return sorted(p.name for p in bindir.iterdir())
+
+    def test_removed_when_no_nodes(self):
+        self.assertEqual(self.run_drop(False), ["jiedian-other"])
+
+    def test_kept_when_a_node_exists(self):
+        self.assertEqual(len(self.run_drop(True)), 4)
+
+
+class DualLinkHeaderTest(unittest.TestCase):
+    def test_ipv6_strip_also_fixes_the_two_line_header(self):
+        with tempfile.TemporaryDirectory() as temp:
+            node = Path(temp) / "1"
+            node.mkdir()
+            (node / "node.txt").write_text(
+                " 你的节点（两行是同一个节点：第一行用 IPv4，第二行用 IPv6。不确定就复制第一行）\n"
+                "hysteria2://p@203.0.113.2:443/?insecure=1#xray-node\n"
+                "hysteria2://p@[2001:db8::2]:443/?insecure=1#xray-node\n"
+            )
+            script = between("_ipv6_strip_links() {", "\n_ipv6_turn_off() {") + "\n_ipv6_strip_links\n"
+            run_sh(script, dict(os.environ, XRAY_NODES_DIR=temp))
+            text = (node / "node.txt").read_text()
+            self.assertNotIn("两行", text)
+            self.assertNotIn("[2001:db8::2]", text)
+            self.assertIn("203.0.113.2:443", text)
+
+
 if __name__ == "__main__":
     unittest.main()

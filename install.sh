@@ -863,6 +863,7 @@ _ipv6_strip_links() {
     [ -f "${_d}node.txt" ] || continue
     _tmp="${_d}node.txt.tmp-ipv6off"
     awk '
+      /^ 你的节点（两行是同一个节点/ { print " 你的节点（复制下面整行，粘贴到客户端导入）"; next }
       /^IPv6 链接/ { next }
       /^IPv6 地址:/ { next }
       /^IPv6 端口:/ { next }
@@ -893,6 +894,13 @@ _ipv6_turn_off() {
       y|Y|yes|YES) ;;
       *) info "保持 IPv6 可用。"; return 0 ;;
     esac
+  fi
+  # 有些容器把 /proc/sys 设成只读，根本关不掉 IPv6。先看能不能改，
+  # 改不了就什么都不动：否则节点已被改成只听 IPv4，IPv6 却还开着，IPv6 链接就连不上了。
+  _root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
+  if [ -f "$_root/all/disable_ipv6" ] && [ ! -w "$_root/all/disable_ipv6" ]; then
+    warn "系统不允许修改 IPv6 设置（有些容器被服务商锁住）。IPv6 保持开着，节点也没有改动。"
+    return 0
   fi
   _ipv6_rebind_nodes
   if ! _ipv6_persist off; then
@@ -972,6 +980,7 @@ _choose_node_kind() {
       4) _ipv6_turn_on ;;
       5)
         echo "已退出，没有安装节点"
+        _drop_expire_bins_if_unused
         exit 0
         ;;
       *)
@@ -1243,6 +1252,17 @@ LOOPEOF
 
 # 让系统每分钟自动跑一次到点检查。有 systemd 用它的“定时器”（timer），
 # Alpine 用 OpenRC 服务，都没有就用 cron（Linux 自带的定时任务）。
+# 一个节点都没有时（比如只进来开关 IPv6 就退出、或者第一次安装中途失败），
+# 把开头写出的三个定时小脚本删掉，不在系统里留垃圾。
+_drop_expire_bins_if_unused() {
+  _de_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+  for _de_d in "$_de_nodes"/*/; do
+    [ -d "$_de_d" ] && return 0
+  done
+  _de_bin=${XRAY_BIN_DIR:-/usr/local/bin}
+  rm -f "$_de_bin/xray-node-expire" "$_de_bin/xray-node-run" "$_de_bin/xray-node-expire-loop"
+}
+
 arm_expire_watch() { # 有定时节点才挂上巡检；没有就卸掉以前留下的巡检。
   _aw_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
   _aw_need=0
@@ -2179,6 +2199,10 @@ prepare_low_memory() {
 _latest_hysteria_ver() { # 打印 hysteria 最新版本号（不带 v），失败返回非零
   _hv=$(_http_body "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s|.*/||; s/^v//')
+  # API 被限流时改看 github.com 的跳转地址（tag 形如 app/v2.12.3，斜杠可能被编码成 %2F）
+  if [ -z "$_hv" ]; then
+    _hv=$(_latest_tag_web "apernet/hysteria" | sed 's|.*%2[Ff]||; s|.*/||; s/^v//') || _hv=""
+  fi
   case "$_hv" in ''|*[!0-9A-Za-z.-]*) return 1 ;; esac
   printf '%s' "$_hv"
 }
@@ -2532,6 +2556,7 @@ _abort_partial_node() {
   [ -d "$NODE_DIR" ] && [ ! -f "$NODE_DIR/node.txt" ] || return 0
   _drop_partial_node "$NODE_ID" "$NODE_DIR"
   rmdir "${XRAY_NODES_DIR:-/etc/xray-node/nodes}" 2>/dev/null || true
+  _drop_expire_bins_if_unused
 }
 
 _reap_partial_nodes
@@ -3732,7 +3757,12 @@ fi
 {
   printf "==============================================\n"
   if [ -n "$LINK_EXTRA" ]; then
-    printf " 你的节点（下面两条是同一个节点，复制其中一行）\n"
+    # 两行只差地址。你家网络没有 IPv6 时，IPv6 那行连不上，所以写清楚先用哪行。
+    if [ "$IPVER" = "6" ]; then
+      printf " 你的节点（两行是同一个节点，复制一行就行：第一行用 IPv6 地址，第二行用 IPv4 地址）\n"
+    else
+      printf " 你的节点（两行是同一个节点：第一行用 IPv4，第二行用 IPv6。不确定就复制第一行）\n"
+    fi
   else
     printf " 你的节点（复制下面整行，粘贴到客户端导入）\n"
   fi
