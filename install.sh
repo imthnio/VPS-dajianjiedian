@@ -67,6 +67,8 @@ ask() { # ask "提示文字" "默认值" 变量名
     printf "\n" >&2
     die "没有读到你的选择，已停止，没有继续安装。请重新粘贴 README 里的那一行安装命令。"
   fi
+  # 只去掉两头的空格。不能去掉数字里的 0，否则公网地址 0.0.0.0 会变成 .0.0.0。
+  _a=$(printf '%s' "$_a" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   if [ -z "$_a" ]; then _a="$_d"; fi
   # 不能直接 eval "$_v=$_a"：输入里的 $(...) 或反引号会被执行。
   # 用单引号包裹并转义输入里的单引号，保证原样赋值、什么都不执行。
@@ -918,6 +920,23 @@ _ipv6_turn_off() {
     warn "系统不允许修改 IPv6 设置（有些容器被服务商锁住）。IPv6 保持开着，节点也没有改动。"
     return 0
   fi
+  # 文件能写，不代表写进去的值会留下来。先试一次；读不回来就不要改节点。
+  # 试写会立刻关掉 IPv6。忽略挂断，把原值写回后再改节点，避免连上的会话一断脚本就停。
+  if [ -f "$_root/all/disable_ipv6" ]; then
+    _iv_old=$(tr -d ' \r\n' < "$_root/all/disable_ipv6" 2>/dev/null || true)
+    if [ "$_iv_old" != "1" ]; then
+      trap '' HUP
+      if ! _ipv6_apply 1; then
+        trap - HUP
+        warn "系统不允许修改 IPv6 设置（有些容器被服务商锁住）。IPv6 保持开着，节点也没有改动。"
+        return 0
+      fi
+      if [ "$_iv_old" = "0" ]; then
+        _ipv6_apply 0 || true
+      fi
+      trap - HUP
+    fi
+  fi
   _ipv6_rebind_nodes
   if ! _ipv6_persist off; then
     warn "关闭设置没写上，重启后 IPv6 可能又会打开。"
@@ -967,7 +986,8 @@ _ipv6_switch_menu() {
     case "$_ip6m" in
       1) _ipv6_turn_off ;;
       2) _ipv6_turn_on ;;
-      *) break ;;
+      3) break ;;
+      *) warn "没有这个选项，请重新选择" ;;
     esac
   done
 }
@@ -2740,11 +2760,12 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
+    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6; break ;;
     2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
     5) _ipv6_switch_menu ;;
-    *) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6; break ;;
+    *) warn "没有这个选项，请重新选择" ;;
   esac
   done
 fi
@@ -3099,11 +3120,14 @@ if command -v ip >/dev/null 2>&1 && [ -z "$(ip -4 route show default 2>/dev/null
   printf "检测到这台机器没有 IPv4 出口、只有 IPv6，所以默认选 2。\n"
 fi
 printf "不知道选哪个就回车用默认 %s。\n" "$_ipdef"
-ask "请选择" "$_ipdef" _ipver
-case "$_ipver" in
-  2) IPVER=6 ;;
-  *) IPVER=4 ;;
-esac
+while true; do
+  ask "请选择" "$_ipdef" _ipver
+  case "$_ipver" in
+    1) IPVER=4; break ;;
+    2) IPVER=6; break ;;
+    *) warn "没有这个选项，请重新选择" ;;
+  esac
+done
 printf "正在检测公网 IP…\n"
 if ! SERVER_IP=$(get_ip "$IPVER"); then
   warn "自动检测 IP 失败，请手动输入。"
@@ -3144,16 +3168,19 @@ printf "  4) Shadowsocks（最简单，速度不错）\n"
 printf "  5) AnyTLS + REALITY（新协议，表现不错）\n"
 printf "  6) Hysteria2（UDP，速度快，弱网表现好）\n"
 printf "  7) TUIC（UDP，低延迟）\n"
-ask "请选择" "1" _proto
-case "$_proto" in
-  2) PROTO="vmess" ;;
-  3) PROTO="trojan" ;;
-  4) PROTO="ss" ;;
-  5) PROTO="anytls" ;;
-  6) PROTO="hy2" ;;
-  7) PROTO="tuic" ;;
-  *) PROTO="vless" ;;
-esac
+while true; do
+  ask "请选择" "1" _proto
+  case "$_proto" in
+    1) PROTO="vless"; break ;;
+    2) PROTO="vmess"; break ;;
+    3) PROTO="trojan"; break ;;
+    4) PROTO="ss"; break ;;
+    5) PROTO="anytls"; break ;;
+    6) PROTO="hy2"; break ;;
+    7) PROTO="tuic"; break ;;
+    *) warn "没有这个选项，请重新选择" ;;
+  esac
+done
 # 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。
 # Hysteria2 用官方 hysteria：sing-box 1.14 解压后约 80MB，64MB 内存的 NAT 会在下载或启动时被撑死。
 case "$PROTO" in
@@ -3230,20 +3257,23 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   printf " 10) academy.nvidia.com（英伟达学院，备选用）\n"
   printf " 11) lol.secure.dyn.riotcdn.net（游戏补丁 CDN，备选用）\n"
   printf "不知道选哪个就回车用默认 1。\n"
-  ask "请选择" "1" _dm
-  case "$_dm" in
-    2)  REALITY_DOMAIN="www.cisco.com" ;;
-    3)  REALITY_DOMAIN="www.apple.com" ;;
-    4)  REALITY_DOMAIN="itunes.apple.com" ;;
-    5)  REALITY_DOMAIN="www.python.org" ;;
-    6)  REALITY_DOMAIN="m.media-amazon.com" ;;
-    7)  REALITY_DOMAIN="images-na.ssl-images-amazon.com" ;;
-    8)  REALITY_DOMAIN="download-installer.cdn.mozilla.net" ;;
-    9)  REALITY_DOMAIN="www.lovelive-anime.jp" ;;
-    10) REALITY_DOMAIN="academy.nvidia.com" ;;
-    11) REALITY_DOMAIN="lol.secure.dyn.riotcdn.net" ;;
-    *)  REALITY_DOMAIN="www.samsung.com" ;;
-  esac
+  while true; do
+    ask "请选择" "1" _dm
+    case "$_dm" in
+      1)  REALITY_DOMAIN="www.samsung.com"; break ;;
+      2)  REALITY_DOMAIN="www.cisco.com"; break ;;
+      3)  REALITY_DOMAIN="www.apple.com"; break ;;
+      4)  REALITY_DOMAIN="itunes.apple.com"; break ;;
+      5)  REALITY_DOMAIN="www.python.org"; break ;;
+      6)  REALITY_DOMAIN="m.media-amazon.com"; break ;;
+      7)  REALITY_DOMAIN="images-na.ssl-images-amazon.com"; break ;;
+      8)  REALITY_DOMAIN="download-installer.cdn.mozilla.net"; break ;;
+      9)  REALITY_DOMAIN="www.lovelive-anime.jp"; break ;;
+      10) REALITY_DOMAIN="academy.nvidia.com"; break ;;
+      11) REALITY_DOMAIN="lol.secure.dyn.riotcdn.net"; break ;;
+      *) warn "没有这个选项，请重新选择" ;;
+    esac
+  done
   info "伪装域名：$REALITY_DOMAIN"
 else
   step "[4/4] 这一步跳过（只有 REALITY 协议才需要选伪装域名）"
