@@ -1609,44 +1609,49 @@ _uninstall_all() {
   fi
 }
 
-# 去掉空格和回车符。复制进去时经常带上这些，否则 1234 对不上。
+# 去掉空格和回车符。复制进去时经常带上这些。
 _clean_choice() {
   printf '%s' "$1" | tr -d '[:space:]'
 }
 
-echo "==================== 节点管理 ===================="
 _n_count=0
 _n_ids=""
+_n_max=0
 for _d in "$NODES_DIR"/*/; do
   [ -f "${_d}node.txt" ] || continue
   _n_id=$(basename "$_d")
-  # 编号会跳号（删过的不重用）。必须按节点编号删，不能按菜单序号删，
-  # 否则列表里第 2 项可能是节点 5，输入 2 会把还在用的节点删掉。
+  # 编号会跳号（删过的不重用）。输入几就删节点几，不能按第几行来删。
+  # 否则列表里第 2 行可能是节点 5，输入 2 会把还在用的节点删掉。
   case "$_n_id" in ''|*[!0-9]*) continue ;; esac
   _n_count=$((_n_count + 1))
   _n_ids="$_n_ids $_n_id"
-  printf "  节点 %s：%s\n" "$_n_id" "$(_node_info "$_n_id")"
+  [ "$_n_id" -gt "$_n_max" ] && _n_max="$_n_id"
 done
 if [ "$_n_count" = "0" ]; then
   echo "没有已安装的节点。"
   exit 0
 fi
+# 有节点 1、2、3 时，4 就是删除全部。有节点 1、2、5 时，6 才是删除全部。
+_n_all=$((_n_max + 1))
+echo "==================== 节点管理 ===================="
+_n_sorted=$(printf '%s\n' $_n_ids | sort -n)
+for _n_id in $_n_sorted; do
+  printf "  %s) 删除节点 %s（%s）\n" "$_n_id" "$_n_id" "$(_node_info "$_n_id")"
+done
+printf "  %s) 删除全部节点并卸载干净\n" "$_n_all"
 printf "  0) 取消，什么都不删\n"
-printf "  输入上面的节点编号：只删除那一个\n"
-printf "  输入 1234：删除全部节点并卸载干净\n"
 printf "请选择: "
 read -r _sel || { echo "已取消"; exit 0; }
 _sel=$(_clean_choice "$_sel")
 case "$_sel" in
   0|"") echo "已取消" ;;
-  *[!0-9]*) echo "输入不对，已取消。要删除全部，请输入 1234" ;;
+  *[!0-9]*) echo "输入不对，已取消" ;;
   *)
     # 08 和 8 是同一个节点。先去掉数字前面的 0。
-    # 1234 是删除全部的选项，不能拿去对某一个节点。
     _sel=$(printf '%s' "$_sel" | sed 's/^0*//')
     if [ -z "$_sel" ] || [ "$_sel" = "0" ]; then
       echo "已取消"
-    elif [ "$_sel" = "1234" ]; then
+    elif [ "$_sel" = "$_n_all" ]; then
       printf "这会删除全部 %s 个节点，并卸掉内核、命令和配置。删了就不能用了。\n" "$_n_count"
       printf "确定删除全部节点并卸载干净吗？[y/N]: "
       read -r _ans2 || { echo "已取消"; exit 0; }
@@ -1664,7 +1669,7 @@ case "$_sel" in
           break
         fi
       done
-      [ "$_found" = "1" ] || echo "没有这个节点编号，已取消。要删除全部，请输入 1234"
+      [ "$_found" = "1" ] || echo "没有这个编号，已取消"
     fi
     ;;
 esac
@@ -2757,8 +2762,6 @@ for _nd in /etc/xray-node/nodes/*/; do
   case "$_nn" in ''|*[!0-9]*) continue ;; esac
   [ "$_nn" -ge "$NODE_ID" ] && NODE_ID=$((_nn + 1))
 done
-# 1234 在节点管理里表示删除全部，不能拿来当新节点编号。
-[ "$NODE_ID" = "1234" ] && NODE_ID=1235
 NODE_DIR=/etc/xray-node/nodes/$NODE_ID
 # 注意：目录在这里先不建，留到更新模式之后——更新模式不需要新目录，
 # 提前建会在每次更新时留下一个空编号目录，节点编号越跳越大
