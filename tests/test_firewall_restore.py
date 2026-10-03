@@ -150,27 +150,35 @@ class PortCheckTest(unittest.TestCase):
 
 
 class HysteriaLinkTest(unittest.TestCase):
-    def test_self_signed_link_enables_pin_verification(self):
+    def hy_links(self, **extra):
         source = INSTALLER.read_text()
-        match = re.search(r'^\s*(LINK="hysteria2://[^"\n]+")$', source, re.M)
-        self.assertIsNotNone(match)
-        pin = "A" * 64
+        begin = source.index("  hy2)\n    # 证书：")
+        block = source[begin + len("  hy2)\n"):source.index("\n    ;;\n  tuic)", begin)]
         env = os.environ.copy()
         env.update({
             "HY2_PASS": "secret",
             "HY2_OBFS": "ab" * 16,
+            "HY2_USE_OBFS": "1",
             "LINK_IP": "203.0.113.1",
             "LINK_PORT": "443",
-            "HY2_PIN": pin,
+            "PORT": "443",
+            "IPVER": "4",
+            "HY2_PIN": "A" * 64,
+            "HY_HOP_V4": "1",
+            "HY_HOP_V6": "1",
+            "NAME_ENC": "%E9%A6%99%E6%B8%AFHysteria2",
         })
+        env.update(extra)
         result = subprocess.run(
-            ["sh", "-c", match.group(1) + "\nprintf '%s\\n' \"$LINK\""],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
+            ["sh", "-c", block + "\nprintf '%s\\n%s\\n%s\\n' \"$LINK\" \"$LINK_HY_OFFICIAL\" \"$LINK_EXTRA\""],
+            env=env, capture_output=True, text=True, check=True,
         )
-        url = urlsplit(result.stdout.strip())
+        return result.stdout.split("\n")[:3]
+
+    def test_self_signed_link_enables_pin_verification(self):
+        pin = "A" * 64
+        link, official, extra = self.hy_links()
+        url = urlsplit(link)
         query = parse_qs(url.query)
         self.assertEqual(url.scheme, "hysteria2")
         self.assertEqual(url.hostname, "203.0.113.1")
@@ -181,34 +189,41 @@ class HysteriaLinkTest(unittest.TestCase):
         self.assertEqual(query["obfs"], ["salamander"])
         self.assertEqual(query["obfs-password"], ["ab" * 16])
         self.assertNotIn("mport", query)
+        self.assertEqual(url.fragment, "%E9%A6%99%E6%B8%AFHysteria2")
+        self.assertEqual(official, "")
+        self.assertEqual(extra, "")
+
+    def test_real_certificate_and_no_obfs_keep_the_link_short(self):
+        link, _official, _extra = self.hy_links(HY2_DOMAIN="hy.example.com", HY2_USE_OBFS="0")
+        query = parse_qs(urlsplit(link).query)
+        self.assertEqual(query["sni"], ["hy.example.com"])
+        for key in ("insecure", "pinSHA256", "pcs", "obfs", "obfs-password"):
+            self.assertNotIn(key, query)
 
     def test_hop_ports_go_in_mport_and_leave_the_main_port_alone(self):
-        source = INSTALLER.read_text()
-        match = re.search(r'^\s*(LINK="hysteria2://[^"\n]+")$', source, re.M)
-        self.assertIsNotNone(match)
-        pin = "A" * 64
-        env = os.environ.copy()
-        env.update({
-            "HY2_PASS": "secret",
-            "HY2_OBFS": "cd" * 16,
-            "LINK_IP": "203.0.113.1",
-            "LINK_PORT": "443",
-            "HY2_PIN": pin,
-            "HY_MPORT": "443,20000,20001",
-        })
-        result = subprocess.run(
-            ["sh", "-c", match.group(1) + "\nprintf '%s\\n' \"$LINK\""],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        url = urlsplit(result.stdout.strip())
+        link, official, _extra = self.hy_links(HY_HOP_PORTS="20000,20001-20010")
+        url = urlsplit(link)
         query = parse_qs(url.query)
         self.assertEqual(url.port, 443)
         self.assertNotIn(",", url.netloc)
-        self.assertEqual(query["mport"], ["443,20000,20001"])
+        self.assertEqual(query["mport"], ["443,20000,20001-20010"])
         self.assertEqual(query["obfs"], ["salamander"])
+        self.assertIn("@203.0.113.1:443,20000,20001-20010/?", official)
+        self.assertNotIn("mport", official)
+
+    def test_hop_only_on_the_family_where_forwarding_works(self):
+        link, official, extra = self.hy_links(
+            HY_HOP_PORTS="20000", HY_EXTRA_IP="2001:db8::1", HY_HOP_V6="0",
+        )
+        self.assertIn("mport=443,20000", link)
+        self.assertIn("@[2001:db8::1]:443/?", extra)
+        self.assertNotIn("mport", extra)
+        link, official, extra = self.hy_links(
+            HY_HOP_PORTS="20000", HY_EXTRA_IP="2001:db8::1", HY_HOP_V4="0",
+        )
+        self.assertNotIn("mport", link)
+        self.assertEqual(official, "")
+        self.assertIn("mport=443,20000", extra)
 
     def test_existing_hysteria_link_is_repaired_without_changing_credentials(self):
         source = INSTALLER.read_text()
@@ -656,16 +671,19 @@ class HysteriaHopTest(unittest.TestCase):
         self.assertIn("type: salamander", source)
         self.assertIn("sniGuard: dns-san", source)
         self.assertNotIn('type: "404"', source)
-        self.assertIn("请设置你的端口跳跃%s:", source)
+        self.assertIn("请设置你的端口跳跃%s（输入端口后回车）: ", source)
         self.assertIn("salamander-password=${HY2_OBFS}", source)
         self.assertNotIn('salamander-password=\\"${HY2_OBFS}\\"', source)
         self.assertIn("block-quic=true", source)
         self.assertNotIn("block-quic=false", source)
-        self.assertIn("HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}", source)
-        self.assertIn("改用 iptables 再试一次。", source)
+        # 不再让 Hysteria2 自己写转发规则（它会把端口排序后去听最小的那个）
+        self.assertNotIn("HYSTERIA_FIREWALL_BACKEND", source)
+        self.assertIn("reject(all, udp/443)", source)
+        self.assertIn("ignoreClientBandwidth: true", source)
+        self.assertIn("ExecStartPre=-${_si_plus}/usr/local/bin/xray-node-hop up %i", source)
 
     def run_collect(self, answers, port="443", link_port="443"):
-        function = self.source_between("_hy_hop_taken() {", "\n_hy_listen_for() {")
+        function = self.source_between("_hy_hop_overlap() {", "\n_hy_ask_hop() {")
         script = (
             "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
             "info() { printf 'INFO %s\\n' \"$1\"; }\n"
@@ -684,13 +702,22 @@ class HysteriaHopTest(unittest.TestCase):
         )
 
     def test_ports_are_asked_one_by_one_until_a_blank_line(self):
-        result = self.run_collect("20000\n443\n9\n20000\n20001\n\n")
-        self.assertIn("HOPS=20000,20001\n", result.stdout)
-        self.assertIn("请设置你的端口跳跃1:", result.stdout)
-        self.assertIn("请设置你的端口跳跃2:", result.stdout)
-        self.assertIn("请设置你的端口跳跃3:", result.stdout)
-        self.assertIn("这个端口已经用过了", result.stdout)
+        result = self.run_collect("20000\n443\n9\n20000\n20001\n30000-30010\n30005\n40-30\nabc\n70000\n\n")
+        self.assertIn("HOPS=20000,20001,30000-30010\n", result.stdout)
+        self.assertIn("请设置你的端口跳跃1（输入端口后回车）:", result.stdout)
+        self.assertIn("请设置你的端口跳跃2（输入端口后回车）:", result.stdout)
+        self.assertIn("请设置你的端口跳跃4（输入端口后回车）:", result.stdout)
+        self.assertNotIn("请设置你的端口跳跃5", result.stdout)
+        self.assertIn("前面填过的端口重复了", result.stdout)
         self.assertIn("已经有程序在用", result.stdout)
+        self.assertIn("小的在前", result.stdout)
+        self.assertIn("这个不是端口", result.stdout)
+        self.assertIn("超出 1 到 65535", result.stdout)
+
+    def test_nat_vps_is_told_to_stay_in_the_forwarded_range(self):
+        result = self.run_collect("20000\n\n", port="443", link_port="10443")
+        self.assertIn("NAT 小鸡", result.stdout)
+        self.assertIn("HOPS=20000\n", result.stdout)
 
     def test_two_blank_answers_turn_hopping_off(self):
         result = self.run_collect("\n\n")
@@ -699,13 +726,15 @@ class HysteriaHopTest(unittest.TestCase):
 
     def test_enter_keeps_hopping_off_and_a_bad_number_asks_again(self):
         function = self.source_between("ask() {", "\nrand_hex() {")
-        function += "\n" + self.source_between("_hy_hop_taken() {", "\n_hy_listen_for() {")
+        function += "\n" + self.source_between("_hy_hop_overlap() {", "\n# 混淆（salamander）")
         script = (
             "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
             "info() { printf 'INFO %s\\n' \"$1\"; }\n"
             "die() { printf 'DIE %s\\n' \"$1\" >&2; exit 1; }\n"
             "err() { printf 'ERR %s\\n' \"$1\" >&2; }\n"
             "port_in_use() { return 1; }\n"
+            "_hy_hop_family() { printf 4; }\n"
+            "_hy_hop_probe() { [ -z \"$NO_HOP\" ]; }\n"
             "PORT=443\nLINK_PORT=443\n"
             + function
             + "\n_hy_ask_hop\nprintf 'HOPS=%s\\n' \"$HY_HOP_PORTS\"\n"
@@ -721,14 +750,29 @@ class HysteriaHopTest(unittest.TestCase):
         self.assertIn("不开启端口跳跃", off.stdout)
         again = subprocess.run(
             ["sh", "-c", script],
-            input="9\n1\n20000\n\n",
+            input="9\n1\n20000\n\n1\n",
             text=True,
             capture_output=True,
             check=True,
         )
         self.assertIn("没有这个选项，请重新选择", again.stdout)
         self.assertIn("HOPS=20000\n", again.stdout)
-        self.assertIn("请设置你的端口跳跃1:", again.stdout)
+        self.assertIn("请设置你的端口跳跃1（输入端口后回车）:", again.stdout)
+        redo = subprocess.run(
+            ["sh", "-c", script],
+            input="1\n20000\n\n2\n20005\n\n\n",
+            text=True, capture_output=True, check=True,
+        )
+        self.assertIn("HOPS=20005\n", redo.stdout)
+        env = os.environ.copy()
+        env["NO_HOP"] = "1"
+        blocked = subprocess.run(
+            ["sh", "-c", script], input="1\n", text=True,
+            capture_output=True, check=True, env=env,
+        )
+        self.assertIn("HOPS=\n", blocked.stdout)
+        self.assertIn("做不了端口跳跃", blocked.stdout)
+        self.assertNotIn("请设置你的端口跳跃", blocked.stdout)
 
 
 class HysteriaIpv6ListenTest(unittest.TestCase):
