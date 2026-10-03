@@ -1732,6 +1732,9 @@ arm_expire_watch || true
 _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
   export HYSTERIA_DISABLE_UPDATE_CHECK=1
   export HYSTERIA_LOG_LEVEL=warn
+  if [ -n "$HY2_FW_BACKEND" ]; then
+    export HYSTERIA_FIREWALL_BACKEND="$HY2_FW_BACKEND"
+  fi
   if [ "$LOW_MEM" = "1" ]; then
     export GOGC=30
     if [ "$SWAP_OK" != "1" ] && [ -n "$MEM_MB" ]; then
@@ -1763,6 +1766,13 @@ _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机�
 Environment=HYSTERIA_LOG_LEVEL=warn"
       _si_openrc_env="export HYSTERIA_DISABLE_UPDATE_CHECK=1
 export HYSTERIA_LOG_LEVEL=warn"
+      # 端口跳跃要写防火墙转发。有的机器自带的 nft 写不了，改用 iptables 才能起来。
+      if [ -n "$HY2_FW_BACKEND" ]; then
+        _si_unit_env="${_si_unit_env}
+Environment=HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}"
+        _si_openrc_env="${_si_openrc_env}
+export HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}"
+      fi
       if [ "$LOW_MEM" = "1" ]; then
         _si_unit_env="${_si_unit_env}
 Environment=GOGC=30"
@@ -2249,8 +2259,9 @@ _fstype() { # _fstype <挂载点>
 
 drop_page_cache() {
   sync
+  # 有的容器这个文件看着能写，写的时候仍被拒绝。报错是外壳自己打的，要包住整个重定向。
   if [ -w /proc/sys/vm/drop_caches ]; then
-    printf '3\n' > /proc/sys/vm/drop_caches 2>/dev/null
+    { printf '3\n' > /proc/sys/vm/drop_caches; } 2>/dev/null || true
   fi
 }
 
@@ -3380,6 +3391,7 @@ if [ "$LINK_PORT" != "$PORT" ]; then
 fi
 # 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
 HY_HOP_PORTS=""
+HY2_FW_BACKEND=""
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
 fi
@@ -3891,20 +3903,51 @@ if [ "$_svc_listen_ok" = "1" ]; then
     fi
   fi
 fi
+# 端口在听，并且这个节点自己的服务还在，才算跳跃打开了。
+_hy_hop_up() {
+  _svc_listen_ok=1
+  if ! wait_for_port "$PORT" udp 15; then
+    _svc_listen_ok=0
+    return
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
+    systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
+  elif command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "/etc/xray-node/nodes/${NODE_ID}/config.yaml" >/dev/null 2>&1 || _svc_listen_ok=0
+  fi
+}
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ] \
+  && [ -z "$HY2_FW_BACKEND" ] && command -v iptables >/dev/null 2>&1; then
+  warn "端口跳跃的防火墙规则没写成，改用 iptables 再试一次。"
+  HY2_FW_BACKEND=iptables
+  _svc_restart "$NODE_ID"
+  _hy_hop_up
+  if [ "$_svc_listen_ok" = "1" ]; then
+    info "端口跳跃已打开。"
+  fi
+fi
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ] \
+  && [ "$IPVER" != "6" ] && [ "$HY_LISTEN" = ":$PORT,$HY_HOP_PORTS" ]; then
+  warn "IPv4 和 IPv6 一起做端口转发没成功，改为只在 IPv4 上跳跃。"
+  HY_LISTEN="0.0.0.0:$PORT,$HY_HOP_PORTS"
+  HY_EXTRA_IP=""
+  if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN"; then
+    _svc_restart "$NODE_ID"
+    _hy_hop_up
+    if [ "$_svc_listen_ok" = "1" ]; then
+      info "端口跳跃已改为只走 IPv4。"
+    fi
+  fi
+fi
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
   warn "端口跳跃没能打开（这台机器做不了这些端口的转发），正在改回只用主端口。"
   if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN_BASE"; then
     HY_HOP_PORTS=""
     HY_LISTEN="$HY_LISTEN_BASE"
     _svc_restart "$NODE_ID"
-    _svc_listen_ok=1
-    if ! wait_for_port "$PORT" udp 15; then
-      _svc_listen_ok=0
-    elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
-      systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
-    elif command -v rc-service >/dev/null 2>&1; then
-      rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
-    fi
+    _hy_hop_up
     if [ "$_svc_listen_ok" = "1" ]; then
       info "已改回只用主端口，节点还能连。"
     fi
@@ -4142,20 +4185,21 @@ fi
         fi
       fi
       printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
-      _hy_loon_tail="salamander-password=\"${HY2_OBFS}\""
+      # 混淆密码是纯字母数字，不要加引号。Loon 导入时会把引号也收进混淆参数。
+      _hy_loon_tail="salamander-password=${HY2_OBFS}"
       if [ -n "$HY_HOP_PORTS" ]; then
         _hy_loon_tail="${_hy_loon_tail},server-ports=\"${LINK_PORT},${HY_HOP_PORTS}\",hop-interval=30"
       fi
       printf "Loon 可粘贴这一行:\n"
-      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false,%s\n" \
+      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=true,%s\n" \
         "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail"
       if [ -n "$LINK_EXTRA" ]; then
         if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
-        _hy_loon_tail2="salamander-password=\"${HY2_OBFS}\""
+        _hy_loon_tail2="salamander-password=${HY2_OBFS}"
         if [ -n "$HY_HOP_PORTS" ]; then
           _hy_loon_tail2="${_hy_loon_tail2},server-ports=\"${_loon_port},${HY_HOP_PORTS}\",hop-interval=30"
         fi
-        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false,%s\n" \
+        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=true,%s\n" \
           "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail2"
       fi
       ;;
