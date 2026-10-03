@@ -1898,6 +1898,102 @@ _hy_local_ipv6() { # 打印本机第一个公网 IPv6。临时地址和内网地
   printf '%s' "$_hip6"
 }
 
+# 端口跳跃：多开几个 UDP 端口，客户端换着连。直接回车结束。
+# 填过的端口用逗号串起来，例如 20000,20001。空字符串表示不开。
+_hy_hop_taken() { # _hy_hop_taken <端口> -> 0 表示主端口或已经填过
+  [ "$1" = "$PORT" ] && return 0
+  [ "$1" = "$LINK_PORT" ] && return 0
+  case ",${HY_HOP_PORTS}," in
+    *,"$1",*) return 0 ;;
+  esac
+  return 1
+}
+
+_hy_collect_hop_ports() {
+  HY_HOP_PORTS=""
+  printf "下面一个一个填端口。每填一个就回车。\n"
+  printf "填完以后，下一个编号直接回车，就结束。\n"
+  printf "不要填刚才的主端口。端口是 1 到 65535 的数字，而且不能已经被占用。最多 16 个。\n"
+  if [ "$LINK_PORT" != "$PORT" ]; then
+    printf "你的公网端口和本机端口不一样。这里填的号码会写进链接，也在这台机器上打开。请让服务商把这些端口按相同号码映射进来。\n"
+  fi
+  _hh_n=1
+  _hh_blank=0
+  while [ "$_hh_n" -le 16 ]; do
+    printf "请设置你的端口跳跃%s: " "$_hh_n"
+    if ! read -r _hh_a; then
+      printf "\n" >&2
+      die "没有读到你的选择，已停止，没有继续安装。请重新粘贴 README 里的那一行安装命令。"
+    fi
+    _hh_a=$(printf '%s' "$_hh_a" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [ -z "$_hh_a" ]; then
+      if [ -n "$HY_HOP_PORTS" ]; then
+        break
+      fi
+      _hh_blank=$((_hh_blank + 1))
+      if [ "$_hh_blank" -ge 2 ]; then
+        warn "没有填端口，改为不开启端口跳跃"
+        HY_HOP_PORTS=""
+        break
+      fi
+      warn "还没填端口。再直接回车就改为不开启。"
+      continue
+    fi
+    _hh_blank=0
+    case "$_hh_a" in
+      *[!0-9]*)
+        warn "这个不是端口。请输入 1 到 65535 的数字。"
+        continue
+        ;;
+    esac
+    _hh_a=$(printf '%s' "$_hh_a" | sed 's/^0*//')
+    [ -z "$_hh_a" ] && _hh_a=0
+    if [ "${#_hh_a}" -gt 5 ] || [ "$_hh_a" -lt 1 ] || [ "$_hh_a" -gt 65535 ]; then
+      warn "端口超出 1 到 65535，请重新输入。"
+      continue
+    fi
+    if _hy_hop_taken "$_hh_a"; then
+      warn "这个端口已经用过了（主端口或前面填过），请换一个。"
+      continue
+    fi
+    # 查不到占用情况时不当成已占用，和选主端口时一样。
+    if port_in_use "$_hh_a" udp; then
+      warn "端口 ${_hh_a}/UDP 已经有程序在用，请换一个。"
+      continue
+    fi
+    if [ -z "$HY_HOP_PORTS" ]; then
+      HY_HOP_PORTS="$_hh_a"
+    else
+      HY_HOP_PORTS="${HY_HOP_PORTS},${_hh_a}"
+    fi
+    _hh_n=$((_hh_n + 1))
+  done
+  if [ "$_hh_n" -gt 16 ] && [ -n "$HY_HOP_PORTS" ]; then
+    info "已经有 16 个端口，够用了，不再继续问。"
+  fi
+  if [ -n "$HY_HOP_PORTS" ]; then
+    _hh_show=$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')
+    info "端口跳跃已设置：${_hh_show}"
+  fi
+}
+
+_hy_ask_hop() {
+  HY_HOP_PORTS=""
+  printf "\n是否要开启端口跳跃？\n"
+  printf "开了以后，除了主端口，再多开几个 UDP 端口。客户端会换着端口连，更不容易被一个端口封死。\n"
+  printf "  1) 开启\n"
+  printf "  2) 不开启\n"
+  printf "看不懂就回车，默认不开启。\n"
+  while true; do
+    ask "请选择" "2" _hy_hop_choice
+    case "$_hy_hop_choice" in
+      1) _hy_collect_hop_ports; break ;;
+      2) HY_HOP_PORTS=""; info "不开启端口跳跃"; break ;;
+      *) warn "没有这个选项，请重新选择" ;;
+    esac
+  done
+}
+
 _hy_listen_for() { # _hy_listen_for <端口> <4|6> <非空=两种都听>
   # 官方 Hysteria2 把 0.0.0.0 收成只听 IPv4，把 [::] 收成只听 IPv6。
   # 写成 :端口 才是同一个口同时收两种地址。只有一种地址时维持单栈，
@@ -1947,16 +2043,27 @@ _hy_fix_existing_ipv6() {
       0.0.0.0:*) ;;
       *) continue ;;
     esac
-    _hport=${_hlisten#0.0.0.0:}
+    # 端口跳跃的监听是 0.0.0.0:主端口,跳跃端口。改双栈时把后面的端口原样留下。
+    _hbody=${_hlisten#0.0.0.0:}
+    _hport=${_hbody%%,*}
+    _hhop=""
+    case "$_hbody" in
+      *,*) _hhop=${_hbody#*,} ;;
+    esac
     case "$_hport" in
       ''|*[!0-9]*) continue ;;
     esac
+    case "$_hhop" in
+      *[!0-9,]*) continue ;;
+    esac
+    _hnew=":${_hport}"
+    [ -n "$_hhop" ] && _hnew="${_hnew},${_hhop}"
     _hid=$(basename "$_hd")
     cp -a "$_hcfg" "${_hcfg}.bak-ipv6" || {
       warn "节点 $_hid 无法备份配置，跳过 IPv6"
       continue
     }
-    if ! _hy_set_listen "$_hcfg" ":$_hport"; then
+    if ! _hy_set_listen "$_hcfg" "$_hnew"; then
       mv -f "${_hcfg}.bak-ipv6" "$_hcfg"
       warn "节点 $_hid 没能改成同时听 IPv6"
       continue
@@ -1984,6 +2091,21 @@ _hy_fix_existing_ipv6() {
           *\?*) _hquery=${_hafter#*\?}; _hquery=${_hquery%%#*} ;;
         esac
         if [ -n "$_hpass" ] && [ -n "$_hquery" ]; then
+          # 原来的 mport 开头是 IPv4 公网端口。IPv6 直接连本机端口，开头不一样就要换成这个端口。
+          _hmport=""
+          case "$_hquery" in
+            *'&mport='*) _hmport=${_hquery#*&mport=} ;;
+            mport=*) _hmport=${_hquery#mport=} ;;
+          esac
+          _hmport=${_hmport%%&*}
+          case "$_hmport" in
+            *,*)
+              if [ "${_hmport%%,*}" != "$_hport" ]; then
+                _hnewm="${_hport},${_hmport#*,}"
+                _hquery=$(printf '%s' "$_hquery" | sed "s/mport=${_hmport}/mport=${_hnewm}/")
+              fi
+              ;;
+          esac
           _hlink="hysteria2://${_hpass}@[${_hy6}]:${_hport}/?${_hquery}#xray-node"
           _htmp="${_hd}node.txt.tmp"
           awk -v link="$_hlink" '
@@ -1998,10 +2120,14 @@ _hy_fix_existing_ipv6() {
         fi
       fi
       if command -v ip6tables >/dev/null 2>&1; then
-        if ! ip6tables -C INPUT -p udp --dport "$_hport" -j ACCEPT >/dev/null 2>&1; then
-          _fw_allow "$_hport" udp 6 "${_hd}fw_info" 0
-          [ "$_IPT_ADDED" = "1" ] && _save_fw 6
-        fi
+        _hfw_ports=$_hport
+        [ -n "$_hhop" ] && _hfw_ports="$_hport $(printf '%s' "$_hhop" | tr ',' ' ')"
+        for _hfw in $_hfw_ports; do
+          if ! ip6tables -C INPUT -p udp --dport "$_hfw" -j ACCEPT >/dev/null 2>&1; then
+            _fw_allow "$_hfw" udp 6 "${_hd}fw_info" 0
+            [ "$_IPT_ADDED" = "1" ] && _save_fw 6
+          fi
+        done
       fi
       info "节点 $_hid 的 Hysteria2 已同时听 IPv6：${_hy6}"
     else
@@ -3050,9 +3176,9 @@ if [ "$UPDATE_MODE" = "1" ]; then
           # 在同一目录先写临时文件，再原子替换路径，并保留备份直到全部恢复成功。
           rm -f "${_u_bin}.rollback"
           cp -a "$_u_backup" "${_u_bin}.rollback" ||
-            die "回滚文件写入失败，备份仍在 $_u_backup，请手动恢复"
+            die "回滚文件写入失败，备份仍在 ${_u_backup}，请手动恢复"
           mv -f "${_u_bin}.rollback" "$_u_bin" ||
-            die "回滚替换失败，备份仍在 $_u_backup，请手动恢复"
+            die "回滚替换失败，备份仍在 ${_u_backup}，请手动恢复"
           # 所有共享此内核的节点都要切回旧版本，不能只重启刚才失败的节点。
           for _rd in /etc/xray-node/nodes/*/; do
             [ -f "${_rd}core" ] || continue
@@ -3166,7 +3292,7 @@ printf "  2) VMess + WebSocket（兼容性好，老客户端也支持）\n"
 printf "  3) Trojan + REALITY（和 1 类似，换种协议）\n"
 printf "  4) Shadowsocks（最简单，速度不错）\n"
 printf "  5) AnyTLS + REALITY（新协议，表现不错）\n"
-printf "  6) Hysteria2（UDP，速度快，弱网表现好）\n"
+printf "  6) Hysteria2（UDP，速度快，弱网表现好。会打开混淆，也可以选端口跳跃）\n"
 printf "  7) TUIC（UDP，低延迟）\n"
 while true; do
   ask "请选择" "1" _proto
@@ -3238,6 +3364,11 @@ LINK_PORT=$(printf '%s' "$LINK_PORT" | sed 's/^0*//')
 if [ "$LINK_PORT" != "$PORT" ]; then
   info "节点链接会使用公网端口 ${LINK_PORT}；请确认服务商已把它映射到本机 $PORT"
 fi
+# 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
+HY_HOP_PORTS=""
+if [ "$PROTO" = "hy2" ]; then
+  _hy_ask_hop
+fi
 
 # ---------- 6. REALITY 伪装域名 ----------
 # REALITY 需要“借用”一个真实的大网站来伪装。这个网站要能从你的服务器顺利访问、支持 TLS 1.3。
@@ -3286,6 +3417,7 @@ UUID=$(gen_uuid)
 TROJAN_PASS=$(rand_hex 16)
 ANYTLS_PASS=$(rand_hex 16)
 HY2_PASS=$(rand_hex 16)
+HY2_OBFS=$(rand_hex 16)
 TUIC_PASS=$(rand_hex 16)
 if command -v openssl >/dev/null 2>&1; then
   SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
@@ -3558,7 +3690,10 @@ info "配置文件校验通过"
 
 elif [ "$CORE" = "hysteria" ]; then
 # ---------- 官方 Hysteria2 配置 ----------
-# 伪装用内置 404，不反向代理外网：NAT 上解析不了伪装站时，节点照样能起。
+# 混淆用 salamander：没有混淆时，这些 UDP 包看起来就是 QUIC，容易被认出来。
+# gecko 混淆更花，但 Loon 和不少旧客户端还不认，连不上，所以不用。
+# 伪装页用一段普通网页，不反向代理外网：NAT 上解析不了伪装站时，节点照样能起。
+# 也不用官方自带的 404 页，那一页本身就能被认出来。
 HY_CONF="$NODE_DIR/config.yaml"
 HY_EXTRA_IP=""
 _hy_v6=$(_hy_local_ipv6) || _hy_v6=""
@@ -3569,6 +3704,20 @@ else
   _hy_both=""
 fi
 HY_LISTEN=$(_hy_listen_for "$PORT" "$IPVER" "$_hy_both")
+HY_LISTEN_BASE="$HY_LISTEN"
+# 第一个端口是真正监听的主端口。后面的端口由 Hysteria2 自己做防火墙转发。
+if [ -n "$HY_HOP_PORTS" ]; then
+  HY_LISTEN="${HY_LISTEN},${HY_HOP_PORTS}"
+  _hh_show=$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')
+  info "端口跳跃会把这些 UDP 端口转到主端口 ${PORT}：${_hh_show}"
+fi
+case "$HY2_PASS" in
+  *[!0-9a-f]*|"") die "随机密码生成失败，没有装上节点" ;;
+esac
+case "$HY2_OBFS" in
+  *[!0-9a-f]*|"") die "随机密码生成失败，没有装上节点" ;;
+esac
+[ "${#HY2_PASS}" -eq 32 ] && [ "${#HY2_OBFS}" -eq 32 ] || die "随机密码生成失败，没有装上节点"
 if [ -n "$_hy_both" ]; then
   if [ "$IPVER" = "6" ]; then
     HY_EXTRA_IP=$(get_ip 4) || HY_EXTRA_IP=""
@@ -3603,7 +3752,12 @@ listen: "$HY_LISTEN"
 tls:
   cert: $NODE_DIR/cert.pem
   key: $NODE_DIR/key.pem
-  sniGuard: disable
+  sniGuard: dns-san
+
+obfs:
+  type: salamander
+  salamander:
+    password: "$HY2_OBFS"
 
 auth:
   type: password
@@ -3612,7 +3766,12 @@ auth:
 ignoreClientBandwidth: true
 
 masquerade:
-  type: "404"
+  type: string
+  string:
+    content: "<!DOCTYPE html><html><head><title>Welcome</title></head><body><p>Welcome</p></body></html>"
+    headers:
+      content-type: text/html
+    statusCode: 200
 $_hy_quic
 EOF
 chmod 600 "$HY_CONF" 2>/dev/null
@@ -3718,6 +3877,25 @@ if [ "$_svc_listen_ok" = "1" ]; then
     fi
   fi
 fi
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
+  warn "端口跳跃没能打开（这台机器做不了这些端口的转发），正在改回只用主端口。"
+  if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN_BASE"; then
+    HY_HOP_PORTS=""
+    HY_LISTEN="$HY_LISTEN_BASE"
+    _svc_restart "$NODE_ID"
+    _svc_listen_ok=1
+    if ! wait_for_port "$PORT" udp 15; then
+      _svc_listen_ok=0
+    elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
+      systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
+    fi
+    if [ "$_svc_listen_ok" = "1" ]; then
+      info "已改回只用主端口，节点还能连。"
+    fi
+  fi
+fi
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
   warn "同时听 IPv4 和 IPv6 没成功，改回只听你刚才选的那一种"
   if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
@@ -3762,19 +3940,30 @@ esac
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
 # Hysteria2 两种地址都听时，IPv4 和 IPv6 的防火墙要分别放行。
+# 开了端口跳跃时，监听是 :主端口,跳跃端口，仍然是两种地址都听。
 _FW_FAMILIES="$IPVER"
-if [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
-  if [ "$IPVER" = "6" ]; then _FW_FAMILIES="6 4"; else _FW_FAMILIES="4 6"; fi
+if [ "$PROTO" = "hy2" ]; then
+  case "$HY_LISTEN" in
+    ":$PORT"|":$PORT,$HY_HOP_PORTS")
+      if [ "$IPVER" = "6" ]; then _FW_FAMILIES="6 4"; else _FW_FAMILIES="4 6"; fi
+      ;;
+  esac
+fi
+_FW_PORT_LIST=$PORT
+if [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
+  _FW_PORT_LIST="$PORT $(printf '%s' "$HY_HOP_PORTS" | tr ',' ' ')"
 fi
 _FW_SAVE4=0
 _FW_SAVE6=0
 _fw_front=1
 for _fw_family in $_FW_FAMILIES; do
-  for _np in $_FW_PROTOS; do
-    _fw_allow "$PORT" "$_np" "$_fw_family" "$NODE_DIR/fw_info" "$_fw_front"
-    if [ "$_IPT_ADDED" = "1" ]; then
-      if [ "$_fw_family" = "6" ]; then _FW_SAVE6=1; else _FW_SAVE4=1; fi
-    fi
+  for _fw_port in $_FW_PORT_LIST; do
+    for _np in $_FW_PROTOS; do
+      _fw_allow "$_fw_port" "$_np" "$_fw_family" "$NODE_DIR/fw_info" "$_fw_front"
+      if [ "$_IPT_ADDED" = "1" ]; then
+        if [ "$_fw_family" = "6" ]; then _FW_SAVE6=1; else _FW_SAVE4=1; fi
+      fi
+    done
   done
   _fw_front=0
 done
@@ -3787,13 +3976,26 @@ _nft_chains=$(_nft_drop_chains)
 if [ -n "$_nft_chains" ]; then
   warn "这台机器有 nftables 防火墙默认拦截外来连接，脚本没有改它。不放行的话节点连不上。请运行下面的命令放行，并把同样的规则写进 /etc/nftables.conf（重启后才还在）："
   printf '%s\n' "$_nft_chains" | while read -r _nf_fam _nf_tbl _nf_ch; do
-    for _np in $_FW_PROTOS; do
-      printf '  nft insert rule %s %s %s %s dport %s accept\n' "$_nf_fam" "$_nf_tbl" "$_nf_ch" "$_np" "$PORT"
+    for _fw_port in $_FW_PORT_LIST; do
+      for _np in $_FW_PROTOS; do
+        printf '  nft insert rule %s %s %s %s dport %s accept\n' "$_nf_fam" "$_nf_tbl" "$_nf_ch" "$_np" "$_fw_port"
+      done
     done
   done
 fi
-if [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
-  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT/UDP，IPv4 和 IPv6 都要放"
+if [ "$PROTO" = "hy2" ]; then
+  _hy_cloud="UDP ${LINK_PORT}"
+  if [ -n "$HY_HOP_PORTS" ]; then
+    _hh_show=$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')
+    _hy_cloud="${_hy_cloud}，以及端口跳跃 ${_hh_show}"
+  fi
+  case "$HY_LISTEN" in
+    ":$PORT"|":$PORT,$HY_HOP_PORTS") _hy_cloud="${_hy_cloud}。IPv4 和 IPv6 都要放" ;;
+  esac
+  if [ -n "$HY_HOP_PORTS" ] && [ "$LINK_PORT" != "$PORT" ]; then
+    _hy_cloud="${_hy_cloud}。NAT 小鸡要把跳跃端口按相同号码映射进来"
+  fi
+  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 ${_hy_cloud}"
 else
   warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
 fi
@@ -3827,7 +4029,13 @@ case "$PROTO" in
   hy2)
     # 官方 Hysteria2 客户端连接自签证书须同时设置 insecure=1 与 pinSHA256；
     # pcs 供支持 Xray 分享字段的客户端使用，指纹仍会校验证书。
-    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
+    # 跳跃端口不写进主机名（1.2.3.4:443,20000 这种）。v2rayN 会整行导入失败。
+    # 主端口留在原处，跳跃端口放 mport。不认识 mport 的客户端只用主端口，也能连。
+    HY_MPORT=""
+    if [ -n "$HY_HOP_PORTS" ]; then
+      HY_MPORT="${LINK_PORT},${HY_HOP_PORTS}"
+    fi
+    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}&obfs=salamander&obfs-password=${HY2_OBFS}${HY_MPORT:+&mport=${HY_MPORT}}#xray-node"
     LINK_EXTRA=""
     if [ -n "$HY_EXTRA_IP" ]; then
       case "$HY_EXTRA_IP" in
@@ -3836,7 +4044,11 @@ case "$PROTO" in
       esac
       # IPv6 没有 IPv4 那种公网端口映射，客户端直接连本机监听端口。
       if [ "$IPVER" = "6" ]; then _hy_xport="$LINK_PORT"; else _hy_xport="$PORT"; fi
-      LINK_EXTRA="hysteria2://${HY2_PASS}@${_hy_xip}:${_hy_xport}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}#xray-node"
+      _hy_mport_x=""
+      if [ -n "$HY_HOP_PORTS" ]; then
+        _hy_mport_x="${_hy_xport},${HY_HOP_PORTS}"
+      fi
+      LINK_EXTRA="hysteria2://${HY2_PASS}@${_hy_xip}:${_hy_xport}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}&obfs=salamander&obfs-password=${HY2_OBFS}${_hy_mport_x:+&mport=${_hy_mport_x}}#xray-node"
     fi
     PROTO_NAME="Hysteria2"
     ;;
@@ -3895,6 +4107,16 @@ fi
     hy2)
       printf "SNI: www.samsung.com\n"
       printf "证书指纹: %s\n" "$HY2_PIN"
+      printf "混淆: 已开启。别人不容易直接看出这是代理。\n"
+      printf "混淆类型: salamander\n"
+      printf "混淆密码: %s\n" "$HY2_OBFS"
+      printf "请用上面的整行链接导入。手填时，节点密码和混淆密码是两个，不要填反。\n"
+      if [ -n "$HY_MPORT" ]; then
+        _hy_mshow=$(printf '%s' "$HY_MPORT" | sed 's/,/、/g')
+        printf "端口跳跃: %s\n" "$_hy_mshow"
+        printf "支持跳跃的客户端会在这些端口之间换着连。不支持的客户端只用主端口，也能连。\n"
+        printf "云服务器安全组要把这些 UDP 端口都放行。\n"
+      fi
       if [ -n "$HY_EXTRA_IP" ]; then
         if [ "$IPVER" = "6" ]; then
           printf "另一地址（IPv4）: %s\n" "$HY_EXTRA_IP"
@@ -3906,13 +4128,21 @@ fi
         fi
       fi
       printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
+      _hy_loon_tail="salamander-password=\"${HY2_OBFS}\""
+      if [ -n "$HY_HOP_PORTS" ]; then
+        _hy_loon_tail="${_hy_loon_tail},server-ports=\"${LINK_PORT},${HY_HOP_PORTS}\",hop-interval=30"
+      fi
       printf "Loon 可粘贴这一行:\n"
-      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
-        "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN"
+      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false,%s\n" \
+        "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail"
       if [ -n "$LINK_EXTRA" ]; then
         if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
-        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false\n" \
-          "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_PIN"
+        _hy_loon_tail2="salamander-password=\"${HY2_OBFS}\""
+        if [ -n "$HY_HOP_PORTS" ]; then
+          _hy_loon_tail2="${_hy_loon_tail2},server-ports=\"${_loon_port},${HY_HOP_PORTS}\",hop-interval=30"
+        fi
+        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=false,%s\n" \
+          "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail2"
       fi
       ;;
     tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
