@@ -37,6 +37,21 @@
 # systemd 服务：Linux 管“后台程序”的系统。把节点注册成服务后，程序挂了会自动拉起，
 #       服务器重启后也会自动启动。Alpine 等系统用的是 OpenRC，作用一样。
 # 定时节点：到时间后自动彻底删除的节点，适合临时给别人用。
+# 节点名：客户端里显示的名字，自动写成“地区+协议”，比如 香港Vless-Reality、美国Hysteria2。
+#       地区按服务器公网 IP 查；同名的会在后面加 2、3…
+# 端口跳跃：Hysteria2 的客户端在好几个 UDP 端口之间换着连，单个端口被限速或封掉时不容易断。
+#       服务器上只有主端口真的在听，其它端口靠 nat 转发过去。
+# nat 转发：Linux 防火墙的一项功能，把发到某个端口的包改成发到另一个端口（REDIRECT）。
+# 母鸡 / 小鸡：母鸡是独立服务器或开虚拟机的宿主机（比如装了 PVE 的独服）；小鸡是从母鸡上
+#       分出来的 VPS（KVM、OpenVZ、LXC、NAT 小鸡等）。KVM 小鸡和母鸡一般都能做端口跳跃；
+#       OpenVZ、LXC 小鸡常常没有 nat 转发的权限，脚本会先试，做不了就说明原因并关掉跳跃。
+# 混淆（salamander）：Hysteria2 给每个包再加一层“乱码”，让它看起来不像 QUIC。
+#       开了以后客户端也必须填同一个混淆密码。
+# 拦截 QUIC：QUIC 是走 UDP 443 端口的新版网页协议。代理走 QUIC 常常更慢、更容易断，
+#       服务器端直接拒绝 UDP 443，浏览器和 App 会自动改走普通的 TCP，更稳。
+# 镜像 / NAT64：只有 IPv6 的机器连不上只有 IPv4 的 github.com。镜像是“替你转一手”的网站；
+#       NAT64 是一种公共 DNS，让 IPv6 机器也能借道访问 IPv4 网站。脚本下载时临时用一下，用完还原。
+# 校验值（SHA256）：文件的“指纹”。下载完和官方公布的指纹对一下，一样才说明文件没被改过。
 # 所有节点都放在 /etc/xray-node/nodes/<编号>/ 目录里，一个节点一个目录，互不影响。
 # ============================================================
 
@@ -804,6 +819,391 @@ _choose_expire_duration() {
   fi
 }
 
+# ---------- 节点名：地区 + 协议 ----------
+# 分享链接最后 # 后面是节点名，客户端列表里显示的就是它。按“服务器所在地区 + 协议”起名，
+# 比如 香港Vless-Reality、美国Hysteria2。地区用公网 IP 查（几个免费查询网站轮流试，每个最多等 6 秒），
+# 都查不到就写“未知地区”。同名时在后面加 2、3……
+_cc_name() { # _cc_name <两位国家代码> -> 中文地区名，不认识就原样打印代码
+  case "$1" in
+    HK) echo 香港 ;; TW) echo 台湾 ;; MO) echo 澳门 ;; CN) echo 中国 ;; JP) echo 日本 ;; KR) echo 韩国 ;;
+    SG) echo 新加坡 ;; US) echo 美国 ;; CA) echo 加拿大 ;; GB) echo 英国 ;; DE) echo 德国 ;; FR) echo 法国 ;;
+    NL) echo 荷兰 ;; RU) echo 俄罗斯 ;; IN) echo 印度 ;; AU) echo 澳大利亚 ;; NZ) echo 新西兰 ;; MY) echo 马来西亚 ;;
+    TH) echo 泰国 ;; VN) echo 越南 ;; PH) echo 菲律宾 ;; ID) echo 印度尼西亚 ;; KH) echo 柬埔寨 ;; MN) echo 蒙古 ;;
+    TR) echo 土耳其 ;; AE) echo 阿联酋 ;; SA) echo 沙特 ;; IL) echo 以色列 ;; IT) echo 意大利 ;; ES) echo 西班牙 ;;
+    PT) echo 葡萄牙 ;; CH) echo 瑞士 ;; AT) echo 奥地利 ;; BE) echo 比利时 ;; SE) echo 瑞典 ;; NO) echo 挪威 ;;
+    FI) echo 芬兰 ;; DK) echo 丹麦 ;; PL) echo 波兰 ;; CZ) echo 捷克 ;; UA) echo 乌克兰 ;; IE) echo 爱尔兰 ;;
+    LU) echo 卢森堡 ;; RO) echo 罗马尼亚 ;; BG) echo 保加利亚 ;; HU) echo 匈牙利 ;; GR) echo 希腊 ;; LT) echo 立陶宛 ;;
+    LV) echo 拉脱维亚 ;; EE) echo 爱沙尼亚 ;; IS) echo 冰岛 ;; MD) echo 摩尔多瓦 ;; RS) echo 塞尔维亚 ;; HR) echo 克罗地亚 ;;
+    BR) echo 巴西 ;; AR) echo 阿根廷 ;; CL) echo 智利 ;; MX) echo 墨西哥 ;; CO) echo 哥伦比亚 ;; PE) echo 秘鲁 ;;
+    ZA) echo 南非 ;; EG) echo 埃及 ;; NG) echo 尼日利亚 ;; KE) echo 肯尼亚 ;; PK) echo 巴基斯坦 ;; BD) echo 孟加拉 ;;
+    KZ) echo 哈萨克斯坦 ;; GE) echo 格鲁吉亚 ;; AM) echo 亚美尼亚 ;; IR) echo 伊朗 ;; QA) echo 卡塔尔 ;; BH) echo 巴林 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+_geo_cc() { # _geo_cc <公网 IP> <4|6> -> 两位国家代码
+  _gc_ip="$1"; _gc_f="-$2"
+  for _gc_u in "https://ipinfo.io/${_gc_ip}/country" "https://api.ip.sb/geoip/${_gc_ip}" \
+               "https://ipwho.is/${_gc_ip}" "http://ip-api.com/line/${_gc_ip}?fields=countryCode" \
+               "https://v6.ipinfo.io/${_gc_ip}/country"; do
+    _gc_out=""
+    if command -v curl >/dev/null 2>&1; then
+      _gc_out=$(curl -fsSL --max-time 6 --connect-timeout 4 "$_gc_f" -A "curl/8" "$_gc_u" 2>/dev/null)
+    elif command -v wget >/dev/null 2>&1; then
+      _gc_out=$(wget -qO- -T 6 "$_gc_u" 2>/dev/null)
+    fi
+    _gc=$(printf '%s' "$_gc_out" | tr ',{}' '\n\n\n' | awk '
+      /"country_code"/ { sub(/.*"country_code"[[:space:]]*:[[:space:]]*"/, ""); sub(/".*/, ""); print; exit }
+      /^[A-Za-z][A-Za-z][[:space:]]*$/ { gsub(/[[:space:]]/, ""); print; exit }
+    ' | tr 'a-z' 'A-Z')
+    case "$_gc" in
+      [A-Z][A-Z]) printf '%s' "$_gc"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+_urlenc() { # _urlenc <文字> -> 百分号编码（中文节点名放进链接 # 后面要这样写）
+  printf '%s' "$1" | od -An -v -tx1 | tr -s ' \n' '\n\n' | awk '
+    $0 == "" { next }
+    {
+      h = tolower($0)
+      d = index("0123456789abcdef", substr(h, 1, 1)) * 16 + index("0123456789abcdef", substr(h, 2, 1)) - 17
+      if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) || (d >= 97 && d <= 122) || d == 45 || d == 46 || d == 95 || d == 126)
+        printf "%c", d
+      else
+        printf "%%%s", toupper(h)
+    }
+  '
+}
+
+_node_name() { # _node_name <协议显示名> -> 不和已有节点重名的名字
+  _nn_base="${NODE_REGION:-未知地区}$1"
+  _nn="$_nn_base"
+  _nn_i=1
+  while :; do
+    _nn_dup=0
+    for _nn_f in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/name; do
+      [ -f "$_nn_f" ] || continue
+      [ "$(cat "$_nn_f" 2>/dev/null)" = "$_nn" ] && { _nn_dup=1; break; }
+    done
+    [ "$_nn_dup" = "0" ] && break
+    _nn_i=$((_nn_i + 1))
+    _nn="${_nn_base}${_nn_i}"
+  done
+  printf '%s' "$_nn"
+}
+
+# ---------- 机器类型：母鸡还是小鸡 ----------
+# 母鸡 = 独立服务器/宿主机（上面可能跑着 PVE、KVM 虚拟机）；小鸡 = 从母鸡上分出来的 VPS。
+# 小鸡分 KVM（完整虚拟机，什么都能做）、LXC / OpenVZ（容器，内核和宿主共用，常常不给改防火墙 nat 表）。
+_virt_kind() { # 打印 none / kvm / lxc / openvz / docker / 其它
+  _vk=""
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    _vk=$(systemd-detect-virt -c 2>/dev/null)
+    [ "$_vk" = "none" ] && _vk=""
+    if [ -z "$_vk" ]; then
+      _vk=$(systemd-detect-virt -v 2>/dev/null)
+    fi
+  fi
+  if [ -z "$_vk" ] || [ "$_vk" = "none" ]; then
+    if [ -f /proc/user_beancounters ] || { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }; then
+      _vk=openvz
+    elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || [ "$(cat /run/container_type 2>/dev/null)" = "lxc" ]; then
+      _vk=lxc
+    elif [ -f /.dockerenv ] || grep -qa 'container=docker' /proc/1/environ 2>/dev/null; then
+      _vk=docker
+    elif grep -q '^flags.* hypervisor' /proc/cpuinfo 2>/dev/null; then
+      _vk=kvm
+    else
+      _vk=none
+    fi
+  fi
+  printf '%s' "$_vk"
+}
+
+# 端口跳跃打不开时，用大白话说原因。$1 是系统给的报错原文。
+_hop_explain() {
+  _he_kind=$(_virt_kind)
+  case "$_he_kind" in
+    openvz)
+      warn "这是 OpenVZ 小鸡。它和宿主机共用内核，服务商一般不给容器做端口转发（nat 表），所以端口跳跃用不了。"
+      warn "想用端口跳跃：换 KVM 小鸡，或者问服务商能不能给你的容器打开 iptables nat。"
+      ;;
+    lxc|lxc-libvirt|systemd-nspawn|docker|podman|container-other|wsl)
+      warn "这是 ${_he_kind} 容器。容器用的是宿主机的内核，宿主没把端口转发（nat）权限交给容器，所以端口跳跃用不了。"
+      warn "宿主机是你自己的（比如 PVE 母鸡）：在宿主上运行 modprobe nf_nat nft_chain_nat nft_redir，再给这个容器打开 nesting/特权后重试；或者直接在宿主上把这些 UDP 端口转发进来。"
+      warn "宿主机是服务商的：问服务商能不能开 nat，或者换 KVM 小鸡。"
+      ;;
+    *)
+      if [ -d /etc/pve ]; then
+        warn "这是 PVE 母鸡。PVE 自带防火墙时，请确认内核里有 nf_nat、nft_chain_nat、nft_redir 这几个模块（运行 modprobe 它们）。"
+      else
+        warn "这台机器的内核没有给端口转发用的 nat 功能，或者防火墙工具（nft / iptables）用不了。"
+      fi
+      ;;
+  esac
+  [ -n "$1" ] && warn "系统原话：$(printf '%s' "$1" | cut -c1-300)"
+}
+
+# 保证有 nft 或 iptables 其中一个。都没有时先装 nftables（很小），装不上再装 iptables。
+_hop_ensure_tool() {
+  command -v nft >/dev/null 2>&1 && return 0
+  command -v iptables >/dev/null 2>&1 && return 0
+  _have_pkgman || return 1
+  _pkg_add "正在安装 nftables（端口跳跃要用它做转发）" nftables
+  hash -r 2>/dev/null || true
+  command -v nft >/dev/null 2>&1 && return 0
+  _pkg_add "nftables 没装上，改装 iptables" iptables
+  hash -r 2>/dev/null || true
+  command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1
+}
+
+# 正式问端口之前先试一次：建一张临时转发表，马上删掉。做不了就不浪费你的时间去填端口。
+_hy_hop_probe() { # _hy_hop_probe <4|6|46>
+  install_hop_bin || { warn "端口跳跃小程序没写进去"; return 1; }
+  if ! _hop_ensure_tool; then
+    _hop_explain "没有 nft，也没有 iptables，而且装不上"
+    return 1
+  fi
+  _hp_err=$(XRAY_HOP_PROBE_FAMILY="$1" /usr/local/bin/xray-node-hop probe 2>&1 >/dev/null)
+  _hp_rc=$?
+  if [ "$_hp_rc" -ne 0 ]; then
+    _hop_explain "$_hp_err"
+    return 1
+  fi
+  return 0
+}
+
+# ---------- 端口跳跃小程序 xray-node-hop ----------
+# 端口跳跃 = 客户端在好几个 UDP 端口之间换着连，服务器上只有主端口真的在听。
+# 其它“跳跃端口”收到的包，要靠 Linux 防火墙的 nat 转发（REDIRECT）转给主端口。
+# 以前把跳跃端口写进 Hysteria2 的 listen，让它自己写防火墙。它会把端口从小到大排序，
+# 拿最小的那个当主端口去听。主端口不是最小的时，脚本等的主端口永远没人听，
+# 于是误报“这台机器做不了转发”。现在 Hysteria2 只听主端口，转发由下面这个小程序管：
+#   1. 先用 nftables 的 inet 表（一张表同时管 IPv4 和 IPv6）
+#   2. 老内核不支持 inet 的 nat，就分成 ip 表和 ip6 表
+#   3. 没有 nft 或 nft 写不进去，再用 iptables / ip6tables
+# 只转发“发给本机”的包（fib daddr type local / addrtype LOCAL）。
+# 母鸡（宿主机）上跑着虚拟机时，发给虚拟机的同号端口不会被抢走。
+# 服务启动前自动打开，服务停止后自动拆掉；重启服务器后跟着服务一起回来。
+install_hop_bin() { # 写出 /usr/local/bin/xray-node-hop。重复运行只覆盖脚本。
+  _hb_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  mkdir -p "$_hb_dir" 2>/dev/null || return 1
+  cat > "$_hb_dir/xray-node-hop" <<'HOPEOF' || return 1
+#!/bin/sh
+# 端口跳跃转发：把跳跃端口收到的 UDP 包转给节点的主端口。
+#   xray-node-hop up <编号>     打开转发（节点服务启动前自动调用）
+#   xray-node-hop down <编号>   拆掉转发（节点服务停止后、删节点时自动调用）
+#   xray-node-hop check <编号>  规则真的在系统里就返回 0，并打印用的是哪种方式
+#   xray-node-hop probe        试一下这台机器能不能做转发，试完马上拆掉，不留规则
+# 节点目录里的 hop 文件：main=主端口  ports=跳跃端口(逗号分隔，可写 20000-20010)  family=4/6/46
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+STATE_DIR=${XRAY_HOP_STATE:-/run/xray-node-hop}
+act=$1
+id=$2
+[ "$act" = "probe" ] && id=probe
+case "$id" in
+  probe) ;;
+  ''|*[!0-9]*) echo "节点编号不对：$id" >&2; exit 2 ;;
+esac
+TABLE="xray_node_hop_$id"
+CHAIN="XRAY-NODE-HOP-$id"
+ERRF="${TMPDIR:-/tmp}/xray-node-hop.$$.err"
+trap 'rm -f "$ERRF"' EXIT
+
+_load() {
+  main=""; ports=""; family=46
+  if [ "$id" = "probe" ]; then
+    main=2; ports=1; family=${XRAY_HOP_PROBE_FAMILY:-46}
+    return 0
+  fi
+  [ -f "$NODES_DIR/$id/hop" ] || return 1
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      main) main=$_v ;;
+      ports) ports=$_v ;;
+      family) family=$_v ;;
+    esac
+  done < "$NODES_DIR/$id/hop"
+  case "$main" in ''|*[!0-9]*) return 1 ;; esac
+  case "$ports" in ''|*[!0-9,-]*) return 1 ;; esac
+  case "$family" in 4|6|46) ;; *) family=46 ;; esac
+  return 0
+}
+
+# 有的内核不会自动加载 nat 模块。能加载就先加载，加载不了（容器里常见）也继续试。
+_mods() {
+  _mp=${XRAY_HOP_MODPROBE:-modprobe}
+  command -v "$_mp" >/dev/null 2>&1 || return 0
+  for _m in "$@"; do "$_mp" -q "$_m" >/dev/null 2>&1 || true; done
+}
+
+# 这台机器在帮别人转发（母鸡、软路由）时，必须只转“发给本机”的包。
+_forwarding() {
+  [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && return 0
+  [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" = "1" ] && return 0
+  return 1
+}
+
+_nft_rules() { # _nft_rules <inet|ip|ip6> <1=只转发给本机的包>
+  printf 'table %s %s {\n  chain prerouting {\n    type nat hook prerouting priority -100; policy accept;\n' "$1" "$TABLE"
+  _nr_pre=""
+  if [ "$1" = "inet" ]; then
+    case "$family" in
+      4) _nr_pre="meta nfproto ipv4 " ;;
+      6) _nr_pre="meta nfproto ipv6 " ;;
+    esac
+  fi
+  [ "$2" = "1" ] && _nr_pre="${_nr_pre}fib daddr type local "
+  for _p in $(printf '%s' "$ports" | tr ',' ' '); do
+    printf '    %sudp dport %s counter redirect to :%s\n' "$_nr_pre" "$_p" "$main"
+  done
+  printf '  }\n}\n'
+}
+
+_nft_apply() { # _nft_apply <inet|ip|ip6> <1|0>：先删同名旧表再整张写入，重复运行不会叠规则
+  { printf 'table %s %s {}\ndelete table %s %s\n' "$1" "$TABLE" "$1" "$TABLE"; _nft_rules "$1" "$2"; } \
+    | nft -f - 2>>"$ERRF"
+}
+
+_nft_del() {
+  command -v nft >/dev/null 2>&1 || return 0
+  for _f in inet ip ip6; do
+    nft delete table "$_f" "$TABLE" >/dev/null 2>&1 || true
+  done
+}
+
+_ipt_del() { # _ipt_del <iptables|ip6tables>：拆掉本节点的跳转规则和自建链
+  _ib=$1
+  command -v "$_ib" >/dev/null 2>&1 || return 0
+  "$_ib" -w -t nat -S PREROUTING 2>/dev/null | grep -- "-j ${CHAIN}\$" | sed 's/^-A //' | while read -r _line; do
+    set -f
+    # shellcheck disable=SC2086
+    set -- $_line
+    set +f
+    "$_ib" -w -t nat -D "$@" >/dev/null 2>&1 || true
+  done
+  "$_ib" -w -t nat -F "$CHAIN" >/dev/null 2>&1 || true
+  "$_ib" -w -t nat -X "$CHAIN" >/dev/null 2>&1 || true
+}
+
+_ipt_apply() { # _ipt_apply <iptables|ip6tables> <1|0>
+  command -v "$1" >/dev/null 2>&1 || { echo "没有 $1" >>"$ERRF"; return 1; }
+  _ipt_del "$1"
+  "$1" -w -t nat -N "$CHAIN" 2>>"$ERRF" || return 1
+  "$1" -w -t nat -A "$CHAIN" -p udp -j REDIRECT --to-ports "$main" 2>>"$ERRF" || { _ipt_del "$1"; return 1; }
+  for _p in $(printf '%s' "$ports" | tr ',' ' '); do
+    _pp=$(printf '%s' "$_p" | tr '-' ':')
+    if [ "$2" = "1" ]; then
+      "$1" -w -t nat -A PREROUTING -p udp -m addrtype --dst-type LOCAL --dport "$_pp" -j "$CHAIN" 2>>"$ERRF" \
+        || { _ipt_del "$1"; return 1; }
+    else
+      "$1" -w -t nat -A PREROUTING -p udp --dport "$_pp" -j "$CHAIN" 2>>"$ERRF" \
+        || { _ipt_del "$1"; return 1; }
+    fi
+  done
+  return 0
+}
+
+_down_all() {
+  _nft_del
+  _ipt_del iptables
+  _ipt_del ip6tables
+  rm -f "$STATE_DIR/$id"
+}
+
+# 依次尝试。成功时 got 记下方式和真正打开的地址族。
+_up() {
+  got=""
+  : > "$ERRF"
+  _mods nf_tables nf_nat nft_chain_nat nft_redir nft_fib nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 \
+    nft_chain_nat_ipv4 nft_chain_nat_ipv6 nft_redir_ipv4 nft_redir_ipv6 \
+    iptable_nat ip6table_nat xt_REDIRECT xt_addrtype
+  _locs=1
+  _forwarding || _locs="1 0"
+  for _loc in $_locs; do
+    if command -v nft >/dev/null 2>&1; then
+      if _nft_apply inet "$_loc"; then got="nft-inet $family"; return 0; fi
+      _nft_del
+      _g4=0; _g6=0
+      case "$family" in *4*) _nft_apply ip "$_loc" && _g4=1 ;; esac
+      case "$family" in *6*) _nft_apply ip6 "$_loc" && _g6=1 ;; esac
+      if [ "$family" = "46" ] && [ "$_g4$_g6" = "11" ]; then got="nft 46"; return 0; fi
+      if [ "$family" = "4" ] && [ "$_g4" = "1" ]; then got="nft 4"; return 0; fi
+      if [ "$family" = "6" ] && [ "$_g6" = "1" ]; then got="nft 6"; return 0; fi
+      if [ "$family" = "46" ] && [ "$_g4" = "1" ]; then got="nft 4"; return 0; fi
+      if [ "$family" = "46" ] && [ "$_g6" = "1" ]; then got="nft 6"; return 0; fi
+      _nft_del
+    fi
+    _g4=0; _g6=0
+    case "$family" in *4*) _ipt_apply iptables "$_loc" && _g4=1 ;; esac
+    case "$family" in *6*) _ipt_apply ip6tables "$_loc" && _g6=1 ;; esac
+    if [ "$_g4$_g6" = "11" ]; then got="iptables 46"; return 0; fi
+    if [ "$_g4" = "1" ]; then got="iptables 4"; return 0; fi
+    if [ "$_g6" = "1" ]; then got="iptables 6"; return 0; fi
+    _ipt_del iptables
+    _ipt_del ip6tables
+  done
+  return 1
+}
+
+_check() {
+  if command -v nft >/dev/null 2>&1; then
+    for _f in inet ip ip6; do
+      nft list table "$_f" "$TABLE" 2>/dev/null | grep -q "redirect to :$main" && return 0
+    done
+  fi
+  for _b in iptables ip6tables; do
+    command -v "$_b" >/dev/null 2>&1 || continue
+    "$_b" -w -t nat -S PREROUTING 2>/dev/null | grep -q -- "-j ${CHAIN}\$" \
+      && "$_b" -w -t nat -S "$CHAIN" 2>/dev/null | grep -q -- "--to-ports $main" && return 0
+  done
+  return 1
+}
+
+case "$act" in
+  up)
+    _load || { _down_all; exit 0; }
+    _down_all
+    if _up; then
+      mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$got" > "$STATE_DIR/$id"
+      echo "端口跳跃已打开：$got"
+      exit 0
+    fi
+    echo "端口跳跃没打开。系统说：$(tr '\n' ' ' < "$ERRF" | cut -c1-400)" >&2
+    exit 1
+    ;;
+  down)
+    _down_all
+    exit 0
+    ;;
+  check)
+    _load || exit 1
+    _check || exit 1
+    cat "$STATE_DIR/$id" 2>/dev/null || echo "规则在"
+    exit 0
+    ;;
+  probe)
+    _load
+    _down_all
+    if _up; then
+      _down_all
+      echo "$got"
+      exit 0
+    fi
+    _down_all
+    tr '\n' ' ' < "$ERRF" | cut -c1-400 >&2
+    exit 1
+    ;;
+esac
+echo "用法：xray-node-hop up|down|check <节点编号>，或 xray-node-hop probe" >&2
+exit 2
+HOPEOF
+  chmod 700 "$_hb_dir/xray-node-hop" || return 1
+}
+
 # ---------- IPv6 开关 ----------
 # IPv6 是新一代的 IP 地址（长这样：2001:db8::1）。有的服务器 IPv6 线路很差，
 # 访问网站时优先走 IPv6 反而又慢又不稳。菜单里的“关闭 IPv6”就是让这台服务器
@@ -991,6 +1391,8 @@ _ipv6_rebind_nodes() {
               [ -n "$_hop" ] && _newlisten="${_newlisten},${_hop}"
               cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
               if _hy_set_listen "$_cfg" "$_newlisten"; then
+                # 端口跳跃也改成只转发 IPv4
+                [ -f "${_d}hop" ] && sed -i 's/^family=.*/family=4/' "${_d}hop" 2>/dev/null
                 _svc_restart "$_id"
                 if wait_for_port "$_port" udp 15; then
                   rm -f "${_cfg}.bak-ipv6off"
@@ -1355,6 +1757,9 @@ _delete_node() {
     _stop_outside "$_d_id"
     _del_fw "$NODES_DIR/$_d_id/fw_info"
   fi
+  # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
+  _x_hop="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop"
+  [ -x "$_x_hop" ] && "$_x_hop" down "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
   echo "节点 ${_d_id} 已到时间，已经彻底删除。"
   _log "节点 ${_d_id} 已到时间，已彻底删除（服务已停、链接作废、配置和防火墙规则已清除）"
@@ -1447,6 +1852,8 @@ _is_due() {
 }
 
 if _is_due "$_dir/expire"; then
+  # Hysteria2 用普通用户跑时删不了文件，直接不启动；root 身份的到期巡检一分钟内会删掉它。
+  [ -w "$_nodes" ] || exit 0
   if [ -x "$_bin_dir/xray-node-expire" ]; then
     XRAY_EXPIRE_FROM_SERVICE="$_id" "$_bin_dir/xray-node-expire" --delete "$_id" || true
   fi
@@ -1473,7 +1880,9 @@ while true; do
   sleep 60
 done
 LOOPEOF
-  chmod 700 "$_eb_bin/xray-node-expire" "$_eb_bin/xray-node-run" "$_eb_bin/xray-node-expire-loop" || return 1
+  chmod 700 "$_eb_bin/xray-node-expire" "$_eb_bin/xray-node-expire-loop" || return 1
+  # xray-node-run 要让普通用户 xray-node 也能执行（Hysteria2 用它启动），里面没有任何秘密。
+  chmod 755 "$_eb_bin/xray-node-run" || return 1
 }
 
 # 让系统每分钟自动跑一次到点检查。有 systemd 用它的“定时器”（timer），
@@ -1722,6 +2131,8 @@ _stop_remove_svc() {
   # 兜底：按该节点的配置文件路径精确杀进程，不碰其它节点的进程
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.json" >/dev/null 2>&1
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.yaml" >/dev/null 2>&1
+  # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
+  [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_x_id" >/dev/null 2>&1
   sleep 1
 }
 
@@ -1804,6 +2215,10 @@ _uninstall_all() {
       esac
     done < /etc/xray-node/our_bins
   fi
+  # 脚本自己建的运行用户 xray-node 也删掉
+  if [ -f /etc/xray-node/svc_user_created ] && id xray-node >/dev/null 2>&1; then
+    userdel xray-node >/dev/null 2>&1 || true
+  fi
   # 删掉配置、节点、日志
   rm -rf /etc/xray-node
   rm -f /var/log/xray-node-*.log
@@ -1812,6 +2227,8 @@ _uninstall_all() {
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
+  rm -f /usr/local/bin/xray-node-hop
+  rm -rf /run/xray-node-hop
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
   # IPv6 开关是整台服务器的设置，不跟着节点删。关过的话提醒一下怎么打开。
   if [ -f /etc/sysctl.d/99-xray-node-ipv6.conf ]; then
@@ -1908,9 +2325,6 @@ arm_expire_watch || true
 _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里的 Environment 保持一致。
   export HYSTERIA_DISABLE_UPDATE_CHECK=1
   export HYSTERIA_LOG_LEVEL=warn
-  if [ -n "$HY2_FW_BACKEND" ]; then
-    export HYSTERIA_FIREWALL_BACKEND="$HY2_FW_BACKEND"
-  fi
   if [ "$LOW_MEM" = "1" ]; then
     export GOGC=30
     if [ "$SWAP_OK" != "1" ] && [ -n "$MEM_MB" ]; then
@@ -1919,6 +2333,50 @@ _hy_export_env() { # 给没有 systemd 的启动方式用。和 unit 文件里�
       [ "$_hy_gomem" -gt 32 ] && _hy_gomem=32
       export GOMEMLIMIT="${_hy_gomem}MiB"
     fi
+  fi
+}
+
+# systemd 够新（>= 231）、内核够新（>= 4.3）才改用普通用户跑 Hysteria2。
+_svc_can_drop_root() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] || return 1
+  _scd_v=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}' | sed 's/[^0-9].*//')
+  case "$_scd_v" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_scd_v" -ge 231 ] || return 1
+  _scd_k=$(uname -r 2>/dev/null)
+  _scd_maj=${_scd_k%%.*}; _scd_rest=${_scd_k#*.}; _scd_min=${_scd_rest%%[!0-9]*}
+  case "$_scd_maj$_scd_min" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_scd_maj" -gt 4 ] || { [ "$_scd_maj" -eq 4 ] && [ "$_scd_min" -ge 3 ]; }
+}
+
+# 建一个不能登录的系统用户 xray-node，专门用来跑 Hysteria2。
+_ensure_svc_user() {
+  id xray-node >/dev/null 2>&1 && return 0
+  command -v useradd >/dev/null 2>&1 || return 1
+  _esu_sh=/usr/sbin/nologin
+  [ -x "$_esu_sh" ] || _esu_sh=/sbin/nologin
+  [ -x "$_esu_sh" ] || _esu_sh=/bin/false
+  useradd --system --no-create-home --home-dir /nonexistent --shell "$_esu_sh" xray-node >/dev/null 2>&1 || return 1
+  mkdir -p /etc/xray-node 2>/dev/null
+  : > /etc/xray-node/svc_user_created
+  return 0
+}
+
+# _hy_perms <节点id> <运行用户>：用普通用户跑时，让它只能读自己的配置、证书（节点链接 node.txt 仍然只有 root 能看）。
+_hy_perms() {
+  _hp_d=/etc/xray-node/nodes/$1
+  [ -d "$_hp_d" ] || return 0
+  if [ "$2" != "xray-node" ] || ! id xray-node >/dev/null 2>&1; then
+    chmod 700 "$_hp_d" 2>/dev/null
+    return 0
+  fi
+  chmod 711 /etc/xray-node /etc/xray-node/nodes 2>/dev/null
+  chgrp xray-node "$_hp_d" 2>/dev/null && chmod 750 "$_hp_d"
+  for _hp_f in config.yaml cert.pem key.pem core expire; do
+    [ -f "$_hp_d/$_hp_f" ] || continue
+    chgrp xray-node "$_hp_d/$_hp_f" 2>/dev/null && chmod 640 "$_hp_d/$_hp_f"
+  done
+  if grep -q '^acme:' "$_hp_d/config.yaml" 2>/dev/null; then
+    mkdir -p "$_hp_d/acme" && chown -R xray-node:xray-node "$_hp_d/acme" 2>/dev/null && chmod 700 "$_hp_d/acme"
   fi
 }
 
@@ -1942,13 +2400,6 @@ _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机�
 Environment=HYSTERIA_LOG_LEVEL=warn"
       _si_openrc_env="export HYSTERIA_DISABLE_UPDATE_CHECK=1
 export HYSTERIA_LOG_LEVEL=warn"
-      # 端口跳跃要写防火墙转发。有的机器自带的 nft 写不了，改用 iptables 才能起来。
-      if [ -n "$HY2_FW_BACKEND" ]; then
-        _si_unit_env="${_si_unit_env}
-Environment=HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}"
-        _si_openrc_env="${_si_openrc_env}
-export HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}"
-      fi
       if [ "$LOW_MEM" = "1" ]; then
         _si_unit_env="${_si_unit_env}
 Environment=GOGC=30"
@@ -1971,6 +2422,22 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
   SVC_UNIT="$_si_unit"
   _si_svc="xray-node-${_si_id}"
   install_expire_bins || true
+  install_hop_bin || true
+  # Hysteria2 用普通用户 xray-node 运行（只给“绑 1024 以下端口”这一项权限），
+  # 万一程序有漏洞，别人也拿不到 root。端口跳跃的转发规则要 root 才能写，
+  # 所以用 systemd 的 “+” 前缀单独以 root 身份跑 xray-node-hop。
+  # 老 systemd（< 231，比如 CentOS 7）不认 “+” 前缀；老内核（< 4.3）不支持只给一项权限。这两种情况照旧用 root。
+  _si_user=root
+  _si_plus=""
+  _si_harden=""
+  if [ "$_si_core" = "hysteria" ] && [ ! -f /etc/xray-node/hy_root ] && _svc_can_drop_root && _ensure_svc_user; then
+    _si_user=xray-node
+    _si_plus="+"
+    _si_harden="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true"
+  fi
+  [ "$_si_core" = "hysteria" ] && _hy_perms "$_si_id" "$_si_user"
   # 包装脚本在到期时直接退出，避免重启后过期节点又把端口打开。
   if [ -x /usr/local/bin/xray-node-run ]; then
     _si_bin=/usr/local/bin/xray-node-run
@@ -1990,15 +2457,25 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
     else
       _si_tpl_exec="${_si_tpl_bin} ${_si_tpl_args}"
     fi
+    _si_hop_pre=""
+    _si_hop_post=""
+    if [ "$_si_core" = "hysteria" ]; then
+      # 端口跳跃：启动前打开转发，停止后拆掉（没开跳跃的节点什么都不做）。前面的 “-” 表示失败也照样启动主端口。
+      _si_hop_pre="ExecStartPre=-${_si_plus}/usr/local/bin/xray-node-hop up %i"
+      _si_hop_post="ExecStopPost=-${_si_plus}/usr/local/bin/xray-node-hop down %i"
+    fi
     cat > "$_si_tpl" <<EOF
 [Unit]
 Description=${_si_tpl_desc}
 After=network.target
 [Service]
 Type=simple
-User=root
+User=${_si_user}
 ${_si_unit_env}
+${_si_harden}
+${_si_hop_pre}
 ExecStart=${_si_tpl_exec}
+${_si_hop_post}
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -2014,6 +2491,12 @@ EOF
       warn "节点 $_si_id 服务好像没起来，运行 systemctl status $_si_unit 看看原因"
     fi
   elif command -v rc-service >/dev/null 2>&1; then
+    _si_rc_hop_up=":"
+    _si_rc_hop_down=":"
+    if [ "$_si_core" = "hysteria" ]; then
+      _si_rc_hop_up="/usr/local/bin/xray-node-hop up ${_si_id} >/dev/null 2>&1 || true"
+      _si_rc_hop_down="/usr/local/bin/xray-node-hop down ${_si_id} >/dev/null 2>&1 || true"
+    fi
     cat > /etc/init.d/${_si_svc} <<RCEOF
 #!/sbin/openrc-run
 ${_si_openrc_env}
@@ -2036,6 +2519,11 @@ start_pre() {
         fi
     fi
     checkpath -f -m 0644 -o root:root "\$output_log"
+    # 端口跳跃：启动前打开转发（没开跳跃的节点什么都不做）
+    ${_si_rc_hop_up}
+}
+stop_post() {
+    ${_si_rc_hop_down}
 }
 RCEOF
     chmod +x /etc/init.d/${_si_svc}
@@ -2053,6 +2541,7 @@ RCEOF
     warn "没找到 systemd/OpenRC，改用后台方式启动（重启后需手动再跑一次脚本）"
     if [ "$_si_core" = "hysteria" ]; then
       _hy_export_env
+      /usr/local/bin/xray-node-hop up "$_si_id" >/dev/null 2>&1 || true
     fi
     pkill -f "$_si_cfg" >/dev/null 2>&1
     # _si_args 故意不加引号，拆成多个参数
@@ -2098,38 +2587,56 @@ _hy_local_ipv6() { # 打印本机第一个公网 IPv6。临时地址和内网地
   printf '%s' "$_hip6"
 }
 
-# 端口跳跃：多开几个 UDP 端口，客户端换着连。直接回车结束。
-# 填过的端口用逗号串起来，例如 20000,20001。空字符串表示不开。
-_hy_hop_taken() { # _hy_hop_taken <端口> -> 0 表示主端口或已经填过
-  [ "$1" = "$PORT" ] && return 0
-  [ "$1" = "$LINK_PORT" ] && return 0
-  case ",${HY_HOP_PORTS}," in
-    *,"$1",*) return 0 ;;
-  esac
+# 端口跳跃：除了主端口，再多给几个 UDP 端口，客户端会在这些端口之间换着连。
+# 每个端口一个一个填，直接回车就结束。也可以填 20000-20010 这种一段连续的端口。
+# 填过的端口用逗号串起来，例如 20000,20001,30000-30010。空字符串表示不开。
+_hy_hop_family() { # 这个节点会听哪几种地址：46 = IPv4 和 IPv6 都听
+  if _hy_local_ipv6 >/dev/null 2>&1 && _hy_local_ipv4 >/dev/null 2>&1; then
+    printf '46'
+  else
+    printf '%s' "$IPVER"
+  fi
+}
+
+_hy_hop_overlap() { # _hy_hop_overlap <起> <止> -> 0 表示和主端口或已经填过的端口重叠
+  for _ho_p in $PORT $LINK_PORT $(printf '%s' "$HY_HOP_PORTS" | tr ',' ' '); do
+    _ho_a=${_ho_p%-*}; _ho_b=${_ho_p#*-}
+    [ "$1" -le "$_ho_b" ] && [ "$2" -ge "$_ho_a" ] && return 0
+  done
   return 1
+}
+
+_hy_hop_busy() { # _hy_hop_busy <起> <止> -> 打印第一个已被占用的 UDP 端口
+  if [ "$1" = "$2" ]; then
+    port_in_use "$1" udp && { printf '%s' "$1"; return 0; }
+    return 1
+  fi
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -uln 2>/dev/null | awk -v a="$1" -v b="$2" '
+    NR > 1 { n = split($4, x, ":"); p = x[n] + 0; if (p >= a && p <= b) { print p; found = 1; exit } }
+    END { exit !found }
+  '
 }
 
 _hy_collect_hop_ports() {
   HY_HOP_PORTS=""
-  printf "下面一个一个填端口。每填一个就回车。\n"
-  printf "填完以后，下一个编号直接回车，就结束。\n"
-  printf "不要填刚才的主端口。端口是 1 到 65535 的数字，而且不能已经被占用。最多 16 个。\n"
+  printf "下面一个一个填跳跃端口，每填一个就回车。填完以后，下一个直接回车就结束。\n"
+  printf "可以填一个端口（比如 20001），也可以填一段（比如 20000-20010）。不要和主端口 %s 重复。最多 16 项。\n" "$PORT"
   if [ "$LINK_PORT" != "$PORT" ]; then
-    printf "你的公网端口和本机端口不一样。这里填的号码会写进链接，也在这台机器上打开。请让服务商把这些端口按相同号码映射进来。\n"
+    printf "你这台是 NAT 小鸡（公网端口 %s 和本机端口 %s 不一样）。跳跃端口必须在服务商分给你的端口范围里，\n" "$LINK_PORT" "$PORT"
+    printf "而且服务商要按相同号码转发进来（公网 20001 进来就到本机 20001）。不在范围里的端口填了也连不上。\n"
   fi
   _hh_n=1
   _hh_blank=0
   while [ "$_hh_n" -le 16 ]; do
-    printf "请设置你的端口跳跃%s: " "$_hh_n"
+    printf "请设置你的端口跳跃%s（输入端口后回车）: " "$_hh_n"
     if ! read -r _hh_a; then
       printf "\n" >&2
       die "没有读到你的选择，已停止，没有继续安装。请重新粘贴 README 里的那一行安装命令。"
     fi
-    _hh_a=$(printf '%s' "$_hh_a" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    _hh_a=$(printf '%s' "$_hh_a" | tr -d ' \t\r')
     if [ -z "$_hh_a" ]; then
-      if [ -n "$HY_HOP_PORTS" ]; then
-        break
-      fi
+      [ -n "$HY_HOP_PORTS" ] && break
       _hh_blank=$((_hh_blank + 1))
       if [ "$_hh_blank" -ge 2 ]; then
         warn "没有填端口，改为不开启端口跳跃"
@@ -2141,57 +2648,216 @@ _hy_collect_hop_ports() {
     fi
     _hh_blank=0
     case "$_hh_a" in
-      *[!0-9]*)
-        warn "这个不是端口。请输入 1 到 65535 的数字。"
+      *[!0-9-]*|-*|*-|*-*-*)
+        warn "这个不是端口。请输入 1 到 65535 的数字，或者 20000-20010 这种一段。"
         continue
         ;;
     esac
-    _hh_a=$(printf '%s' "$_hh_a" | sed 's/^0*//')
-    [ -z "$_hh_a" ] && _hh_a=0
-    if [ "${#_hh_a}" -gt 5 ] || [ "$_hh_a" -lt 1 ] || [ "$_hh_a" -gt 65535 ]; then
+    _hh_lo=${_hh_a%-*}; _hh_hi=${_hh_a#*-}
+    _hh_lo=$(printf '%s' "$_hh_lo" | sed 's/^0*//'); [ -z "$_hh_lo" ] && _hh_lo=0
+    _hh_hi=$(printf '%s' "$_hh_hi" | sed 's/^0*//'); [ -z "$_hh_hi" ] && _hh_hi=0
+    if [ "${#_hh_lo}" -gt 5 ] || [ "${#_hh_hi}" -gt 5 ] || [ "$_hh_lo" -lt 1 ] || [ "$_hh_hi" -gt 65535 ] || [ "$_hh_hi" -lt 1 ] || [ "$_hh_lo" -gt 65535 ]; then
       warn "端口超出 1 到 65535，请重新输入。"
       continue
     fi
-    if _hy_hop_taken "$_hh_a"; then
-      warn "这个端口已经用过了（主端口或前面填过），请换一个。"
+    if [ "$_hh_lo" -gt "$_hh_hi" ]; then
+      warn "一段端口要小的在前、大的在后，比如 20000-20010。请重新输入。"
       continue
     fi
-    # 查不到占用情况时不当成已占用，和选主端口时一样。
-    if port_in_use "$_hh_a" udp; then
-      warn "端口 ${_hh_a}/UDP 已经有程序在用，请换一个。"
+    if _hy_hop_overlap "$_hh_lo" "$_hh_hi"; then
+      warn "和主端口或前面填过的端口重复了，请换一个。"
       continue
     fi
-    if [ -z "$HY_HOP_PORTS" ]; then
-      HY_HOP_PORTS="$_hh_a"
-    else
-      HY_HOP_PORTS="${HY_HOP_PORTS},${_hh_a}"
+    if _hh_busy=$(_hy_hop_busy "$_hh_lo" "$_hh_hi"); then
+      warn "端口 ${_hh_busy}/UDP 已经有程序在用。转发过来会抢走它的流量，请换一个。"
+      continue
     fi
+    if [ "$_hh_lo" = "$_hh_hi" ]; then _hh_item="$_hh_lo"; else _hh_item="${_hh_lo}-${_hh_hi}"; fi
+    HY_HOP_PORTS="${HY_HOP_PORTS:+${HY_HOP_PORTS},}${_hh_item}"
     _hh_n=$((_hh_n + 1))
   done
   if [ "$_hh_n" -gt 16 ] && [ -n "$HY_HOP_PORTS" ]; then
-    info "已经有 16 个端口，够用了，不再继续问。"
-  fi
-  if [ -n "$HY_HOP_PORTS" ]; then
-    _hh_show=$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')
-    info "端口跳跃已设置：${_hh_show}"
+    info "已经填了 16 项，够用了，不再继续问。"
   fi
 }
 
 _hy_ask_hop() {
   HY_HOP_PORTS=""
-  printf "\n是否要开启端口跳跃？\n"
-  printf "开了以后，除了主端口，再多开几个 UDP 端口。客户端会换着端口连，更不容易被一个端口封死。\n"
+  printf "\n是否开启端口跳跃？\n"
+  printf "开了以后，除了主端口，再多开几个 UDP 端口，客户端隔一会儿换一个端口连。\n"
+  printf "有的地方运营商会把长时间用的单个 UDP 端口限速或掐断，换着端口就不容易被盯上。\n"
   printf "  1) 开启\n"
   printf "  2) 不开启\n"
   printf "看不懂就回车，默认不开启。\n"
   while true; do
     ask "请选择" "2" _hy_hop_choice
     case "$_hy_hop_choice" in
-      1) _hy_collect_hop_ports; break ;;
-      2) HY_HOP_PORTS=""; info "不开启端口跳跃"; break ;;
+      1) break ;;
+      2) info "不开启端口跳跃"; return 0 ;;
       *) warn "没有这个选项，请重新选择" ;;
     esac
   done
+  printf "先试一下这台机器能不能做端口转发…\n"
+  if ! _hy_hop_probe "$(_hy_hop_family)"; then
+    warn "这台机器做不了端口跳跃，改为不开启。节点照样能用，只用主端口 ${PORT}。"
+    return 0
+  fi
+  info "这台机器可以做端口跳跃"
+  while true; do
+    _hy_collect_hop_ports
+    [ -n "$HY_HOP_PORTS" ] || return 0
+    printf "\n你设置的端口跳跃：主端口 %s，跳跃端口 %s\n" "$PORT" "$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')"
+    printf "  1) 确认，就用这些\n"
+    printf "  2) 重新填\n"
+    printf "  3) 不开启端口跳跃了\n"
+    ask "请选择" "1" _hy_hop_ok
+    case "$_hy_hop_ok" in
+      2) continue ;;
+      3) HY_HOP_PORTS=""; info "不开启端口跳跃"; return 0 ;;
+      *) info "端口跳跃已设置：$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')"; return 0 ;;
+    esac
+  done
+}
+
+# 混淆（salamander）：把每个 UDP 包再用混淆密码打乱一遍。外面看不出这是 QUIC，
+# 不知道混淆密码的人来探测，服务器一声不吭，像没开这个端口。
+# 代价：没有“伪装网站”效果了，而且客户端必须支持 salamander（主流客户端都支持）。
+_hy_ask_obfs() {
+  printf "\n要不要打开 Hysteria2 混淆（salamander）？\n"
+  printf "  1) 打开（推荐在中国大陆用：包看起来是一串乱码，认不出是 QUIC；别人来探测，服务器不回应）\n"
+  printf "  2) 不打开（看起来就是普通的 HTTP/3 网站，别人来探测会看到一个真实网页；很老的客户端也能连）\n"
+  printf "看不懂就回车，默认打开。\n"
+  while true; do
+    ask "请选择" "1" _hy_obfs_choice
+    case "$_hy_obfs_choice" in
+      1) HY2_USE_OBFS=1; info "混淆：打开"; return 0 ;;
+      2) HY2_USE_OBFS=0; info "混淆：不打开，用伪装网站"; return 0 ;;
+      *) warn "没有这个选项，请重新选择" ;;
+    esac
+  done
+}
+
+# 自己有域名（已经解析到这台服务器）时，可以申请正规证书（Let's Encrypt），客户端不用“跳过证书验证”。
+# 没有域名就用自签证书 + 证书指纹（pinSHA256）：客户端只认这一张证书，别人冒充不了，同样安全。
+# 申请证书要外面能连到这台机器的 TCP 80（或 443）端口，NAT 小鸡一般做不到，所以 NAT 小鸡直接用自签。
+_hy_ask_domain() {
+  HY2_DOMAIN=""; HY2_ACME_TYPE=""
+  printf "\n有没有已经解析到这台服务器的域名？\n"
+  printf "有的话用它申请正规证书；没有就直接回车，用自签证书加证书指纹，一样安全。\n"
+  ask "你的域名（没有就回车）" "" _hy_dom
+  _hy_dom=$(printf '%s' "$_hy_dom" | tr 'A-Z' 'a-z')
+  if [ -z "$_hy_dom" ]; then
+    info "证书：自签证书（链接里带证书指纹）"
+    return 0
+  fi
+  case "$_hy_dom" in
+    *[!a-z0-9.-]*|.*|*.|*..*|*.*.*.*.*.*.*) _hy_dom_bad=1 ;;
+    *.*) _hy_dom_bad=0 ;;
+    *) _hy_dom_bad=1 ;;
+  esac
+  if [ "$_hy_dom_bad" = "1" ]; then
+    warn "「${_hy_dom}」不像域名，改用自签证书"
+    return 0
+  fi
+  if [ "$LINK_PORT" != "$PORT" ]; then
+    warn "NAT 小鸡一般收不到申请证书用的 80/443 端口请求，改用自签证书"
+    return 0
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    _hy_dom_ips=$(getent ahosts "$_hy_dom" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    if [ -z "$_hy_dom_ips" ]; then
+      warn "查不到 ${_hy_dom} 的解析，改用自签证书。先去域名后台加一条 A/AAAA 记录指向 ${SERVER_IP}"
+      return 0
+    fi
+    case " $_hy_dom_ips " in
+      *" $SERVER_IP "*) ;;
+      *)
+        warn "${_hy_dom} 解析到 ${_hy_dom_ips}，不是这台服务器 ${SERVER_IP}（开了 CDN 小云朵也会这样）。改用自签证书"
+        return 0
+        ;;
+    esac
+  fi
+  if ! port_in_use 80 tcp; then
+    HY2_ACME_TYPE=http
+  elif ! port_in_use 443 tcp; then
+    HY2_ACME_TYPE=tls
+  else
+    warn "这台机器的 TCP 80 和 443 都被别的程序占着，申请不了证书，改用自签证书"
+    return 0
+  fi
+  HY2_DOMAIN="$_hy_dom"
+  info "证书：给 ${HY2_DOMAIN} 申请正规证书（启动时自动申请，申请不下来会自动改回自签证书）"
+}
+
+# 写 Hysteria2 的配置文件。证书申请失败时会用自签证书再写一次，所以单独做成函数。
+_hy_write_config() {
+  if [ -n "$HY2_DOMAIN" ]; then
+    _hy_tls="acme:
+  domains:
+    - $HY2_DOMAIN
+  dir: $NODE_DIR/acme
+  type: $HY2_ACME_TYPE"
+  else
+    _hy_tls="tls:
+  cert: $NODE_DIR/cert.pem
+  key: $NODE_DIR/key.pem
+  sniGuard: dns-san"
+  fi
+  _hy_obfs_blk=""
+  if [ "$HY2_USE_OBFS" = "1" ]; then
+    _hy_obfs_blk="
+obfs:
+  type: salamander
+  salamander:
+    password: \"$HY2_OBFS\"
+"
+  fi
+  if [ "$HY2_USE_OBFS" = "1" ]; then
+    # 开了混淆，不知道混淆密码的人根本走不到伪装页这一步，放一段普通网页就够了，不额外连外网。
+    _hy_masq="masquerade:
+  type: string
+  string:
+    content: \"<!DOCTYPE html><html><head><title>Welcome</title></head><body><p>Welcome</p></body></html>\"
+    headers:
+      content-type: text/html
+    statusCode: 200"
+  else
+    # 没开混淆时，别人用浏览器（HTTP/3）来探测，看到的是一个真实网站的内容。
+    _hy_masq="masquerade:
+  type: proxy
+  proxy:
+    url: https://www.samsung.com/
+    rewriteHost: true"
+    # 有正规证书时，同一个端口的 TCP 也开一个 HTTPS 网站：真网站都是 TCP 和 UDP 一起开的。
+    if [ -n "$HY2_DOMAIN" ] && [ "$HY_TCP_MASQ" = "1" ]; then
+      _hy_masq="${_hy_masq}
+  listenHTTPS: \":$PORT\""
+    fi
+  fi
+  cat > "$HY_CONF" <<EOF
+listen: "$HY_LISTEN"
+
+$_hy_tls
+$_hy_obfs_blk
+auth:
+  type: password
+  password: "$HY2_PASS"
+
+# 不听客户端报的带宽，统一用 BBR 拥塞控制，不会因为客户端乱填带宽把线路挤爆。
+ignoreClientBandwidth: true
+# 测速接口关掉，别人不能拿它来识别这是 Hysteria2。
+speedTest: false
+
+# 拦截 QUIC：经过节点的 UDP 443（QUIC/HTTP3）直接拒绝，App 会自动改走 TCP，更快更稳。
+# 只管“经过节点出去”的流量，不影响 Hysteria2 自己收发的 UDP。
+acl:
+  inline:
+    - reject(all, udp/443)
+
+$_hy_masq
+$_hy_quic
+EOF
+  chmod 600 "$HY_CONF" 2>/dev/null
 }
 
 _hy_listen_for() { # _hy_listen_for <端口> <4|6> <非空=两种都听>
@@ -2218,6 +2884,65 @@ _hy_set_listen() { # _hy_set_listen <config.yaml> <listen值>
   ' "$1" > "$_hs_tmp" && mv -f "$_hs_tmp" "$1" || return 1
   chmod 600 "$1" 2>/dev/null
   return 0
+}
+
+_hy_read_listen() { # _hy_read_listen <config.yaml>：打印 listen 的值（去掉引号）
+  awk '
+    /^listen:/ {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^listen:[[:space:]]*/, "", line)
+      gsub(/^"|"$/, "", line)
+      print line
+      exit
+    }
+  ' "$1" 2>/dev/null
+}
+
+_hop_set_family() { # _hop_set_family <节点目录> <4|6|46>：改端口跳跃要管哪种地址
+  [ -f "$1/hop" ] || return 0
+  sed -i "s/^family=.*/family=$2/" "$1/hop" 2>/dev/null
+}
+
+# 以前的端口跳跃把所有端口都写在 listen 里（:主端口,跳跃端口…），Hysteria2 会去听最小的那个。
+# 更新时改成新写法：listen 只写主端口，跳跃端口写进 hop 文件，由 xray-node-hop 转发。
+# 改完端口没起来就恢复原来的配置。
+_hy_migrate_hop_all() {
+  for _mh_d in /etc/xray-node/nodes/*/; do
+    [ -f "${_mh_d}core" ] && [ -f "${_mh_d}config.yaml" ] || continue
+    [ "$(tr -d ' \r\n' < "${_mh_d}core")" = "hysteria" ] || continue
+    _mh_cfg="${_mh_d}config.yaml"
+    _mh_l=$(_hy_read_listen "$_mh_cfg")
+    case "$_mh_l" in *,*) ;; *) continue ;; esac
+    case "$_mh_l" in
+      0.0.0.0:*) _mh_pre="0.0.0.0:"; _mh_fam=4 ;;
+      \[::\]:*) _mh_pre="[::]:"; _mh_fam=6 ;;
+      :*) _mh_pre=":"; _mh_fam=46 ;;
+      *) continue ;;
+    esac
+    _mh_body=${_mh_l#"$_mh_pre"}
+    _mh_main=${_mh_body%%,*}
+    _mh_hops=${_mh_body#*,}
+    case "$_mh_main" in ''|*[!0-9]*) continue ;; esac
+    case "$_mh_hops" in ''|*[!0-9,-]*) continue ;; esac
+    _mh_id=$(basename "$_mh_d")
+    cp -a "$_mh_cfg" "${_mh_cfg}.bak-hop" || continue
+    printf 'main=%s\nports=%s\nfamily=%s\n' "$_mh_main" "$_mh_hops" "$_mh_fam" > "${_mh_d}hop"
+    chmod 600 "${_mh_d}hop" 2>/dev/null
+    if _hy_set_listen "$_mh_cfg" "${_mh_pre}${_mh_main}"; then
+      _svc_restart "$_mh_id"
+      if wait_for_port "$_mh_main" udp 15; then
+        rm -f "${_mh_cfg}.bak-hop"
+        info "节点 $_mh_id 的端口跳跃改成了新写法：主端口 $_mh_main，跳跃端口 $_mh_hops"
+        continue
+      fi
+    fi
+    mv -f "${_mh_cfg}.bak-hop" "$_mh_cfg"
+    [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_mh_id" >/dev/null 2>&1
+    rm -f "${_mh_d}hop"
+    _svc_restart "$_mh_id"
+    warn "节点 $_mh_id 换成新的端口跳跃写法后没起来，已恢复原来的配置"
+  done
 }
 
 _hy_fix_existing_ipv6() {
@@ -2281,6 +3006,10 @@ _hy_fix_existing_ipv6() {
     if [ "$_hy_up" = "1" ]; then
       rm -f "${_hcfg}.bak-ipv6"
       HY_IPV6_FIXED=1
+      if [ -f "${_hd}hop" ]; then
+        _hop_set_family "$_hd" 46
+        /usr/local/bin/xray-node-hop up "$_hid" >/dev/null 2>&1 || true
+      fi
       if [ -f "${_hd}node.txt" ] && ! grep -F "[${_hy6}]" "${_hd}node.txt" >/dev/null 2>&1; then
         _hline=$(grep -m1 '^hysteria2://' "${_hd}node.txt" 2>/dev/null)
         _hrest=${_hline#hysteria2://}
@@ -2306,7 +3035,10 @@ _hy_fix_existing_ipv6() {
               fi
               ;;
           esac
-          _hlink="hysteria2://${_hpass}@[${_hy6}]:${_hport}/?${_hquery}#xray-node"
+          # 节点名沿用原来那行链接 # 后面的名字
+          _hfrag="xray-node"
+          case "$_hafter" in *'#'*) _hfrag=${_hafter#*#} ;; esac
+          _hlink="hysteria2://${_hpass}@[${_hy6}]:${_hport}/?${_hquery}#${_hfrag}"
           _htmp="${_hd}node.txt.tmp"
           awk -v link="$_hlink" '
             { print }
@@ -2320,8 +3052,8 @@ _hy_fix_existing_ipv6() {
         fi
       fi
       if command -v ip6tables >/dev/null 2>&1; then
+        # 跳跃端口经过 nat 转发后就是主端口，本机防火墙只放主端口。
         _hfw_ports=$_hport
-        [ -n "$_hhop" ] && _hfw_ports="$_hport $(printf '%s' "$_hhop" | tr ',' ' ')"
         for _hfw in $_hfw_ports; do
           if ! ip6tables -C INPUT -p udp --dport "$_hfw" -j ACCEPT >/dev/null 2>&1; then
             _fw_allow "$_hfw" udp 6 "${_hd}fw_info" 0
@@ -2900,6 +3632,13 @@ for _sec_file in /etc/xray-node/nodes/*/config.json /etc/xray-node/nodes/*/node.
   /etc/xray-node/our_bins /etc/xray-node/node.txt /etc/xray-node/core /etc/xray-node/fw_info; do
   [ -f "$_sec_file" ] && chmod 600 "$_sec_file"
 done
+# 上面把目录都收成只有 root 能进。用普通用户 xray-node 跑的 Hysteria2 还要能读自己的配置和证书。
+if grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
+  for _sec_dir in /etc/xray-node/nodes/*/; do
+    [ "$(tr -d ' \r\n' < "${_sec_dir}core" 2>/dev/null)" = "hysteria" ] || continue
+    _hy_perms "$(basename "$_sec_dir")" xray-node
+  done
+fi
 
 printf "\n${BOLD}==============================================${NC}\n"
 printf "${BOLD}   Xray 节点一键安装（小白版）${NC}\n"
@@ -2959,6 +3698,7 @@ _drop_partial_node() {
   fi
   pkill -f "${_dp_dir%/}/config.json" >/dev/null 2>&1
   pkill -f "${_dp_dir%/}/config.yaml" >/dev/null 2>&1
+  [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_dp_id" >/dev/null 2>&1
   rm -rf "$_dp_dir"
 }
 
@@ -3110,14 +3850,14 @@ fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   while true; do
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐。Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
+  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法；Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
   printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
-    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_fix_existing_ipv6; break ;;
+    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; break ;;
     2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
@@ -3507,6 +4247,14 @@ if ! SERVER_IP=$(get_ip "$IPVER"); then
   [ -z "$SERVER_IP" ] && die "没有 IP 装不了，先去查一下你的服务器 IP 再来"
 fi
 info "服务器 IP：$SERVER_IP"
+# 节点名 = 地区 + 协议，比如 香港Vless-Reality。查不到地区就写“未知地区”。
+printf "正在查这台服务器在哪个国家/地区（用来给节点起名）…\n"
+NODE_REGION=""
+if _cc=$(_geo_cc "$SERVER_IP" "$IPVER"); then
+  NODE_REGION=$(_cc_name "$_cc")
+fi
+[ -n "$NODE_REGION" ] || NODE_REGION="未知地区"
+info "服务器地区：$NODE_REGION"
 # 用户经常把 IPv6 连方括号一起粘贴。这里先剥掉，下面再加一层，避免链成 [[地址]]。
 case "$SERVER_IP" in
   \[*\]) SERVER_IP=${SERVER_IP#\[}; SERVER_IP=${SERVER_IP%\]} ;;
@@ -3525,7 +4273,7 @@ printf "  2) VMess + WebSocket（兼容性好，老客户端也支持）\n"
 printf "  3) Trojan + REALITY（和 1 类似，换种协议）\n"
 printf "  4) Shadowsocks（最简单，速度不错）\n"
 printf "  5) AnyTLS + REALITY（新协议，表现不错）\n"
-printf "  6) Hysteria2（UDP，速度快，弱网表现好。会打开混淆，也可以选端口跳跃）\n"
+printf "  6) Hysteria2（UDP，速度快，弱网表现好。可以选混淆和端口跳跃）\n"
 printf "  7) TUIC（UDP，低延迟）\n"
 while true; do
   ask "请选择" "1" _proto
@@ -3599,9 +4347,13 @@ if [ "$LINK_PORT" != "$PORT" ]; then
 fi
 # 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
 HY_HOP_PORTS=""
-HY2_FW_BACKEND=""
+HY2_USE_OBFS=1
+HY2_DOMAIN=""
+HY2_ACME_TYPE=""
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
+  _hy_ask_obfs
+  _hy_ask_domain
 fi
 
 # ---------- 6. REALITY 伪装域名 ----------
@@ -3928,10 +4680,10 @@ info "配置文件校验通过"
 
 elif [ "$CORE" = "hysteria" ]; then
 # ---------- 官方 Hysteria2 配置 ----------
-# 混淆用 salamander：没有混淆时，这些 UDP 包看起来就是 QUIC，容易被认出来。
-# gecko 混淆更花，但 Loon 和不少旧客户端还不认，连不上，所以不用。
-# 伪装页用一段普通网页，不反向代理外网：NAT 上解析不了伪装站时，节点照样能起。
-# 也不用官方自带的 404 页，那一页本身就能被认出来。
+# 混淆用 salamander（可以在提问时关掉）。gecko 混淆更花，但 Loon 和不少旧客户端还不认，所以不用。
+# 开了混淆时伪装页用一段普通网页；没开混淆时反向代理一个真实网站，探测的人看到的是真网页。
+# 跳跃端口不写进 listen：Hysteria2 会把 listen 里的端口从小到大排，拿最小的当主端口，
+# 和我们的主端口对不上。跳跃端口由 xray-node-hop 写转发规则，转到主端口。
 HY_CONF="$NODE_DIR/config.yaml"
 HY_EXTRA_IP=""
 _hy_v6=$(_hy_local_ipv6) || _hy_v6=""
@@ -3942,13 +4694,6 @@ else
   _hy_both=""
 fi
 HY_LISTEN=$(_hy_listen_for "$PORT" "$IPVER" "$_hy_both")
-HY_LISTEN_BASE="$HY_LISTEN"
-# 第一个端口是真正监听的主端口。后面的端口由 Hysteria2 自己做防火墙转发。
-if [ -n "$HY_HOP_PORTS" ]; then
-  HY_LISTEN="${HY_LISTEN},${HY_HOP_PORTS}"
-  _hh_show=$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')
-  info "端口跳跃会把这些 UDP 端口转到主端口 ${PORT}：${_hh_show}"
-fi
 case "$HY2_PASS" in
   *[!0-9a-f]*|"") die "随机密码生成失败，没有装上节点" ;;
 esac
@@ -3984,35 +4729,19 @@ quic:
   maxConnReceiveWindow: $_hy_qc
   maxIncomingStreams: 16"
 fi
-cat > "$HY_CONF" <<EOF
-listen: "$HY_LISTEN"
-
-tls:
-  cert: $NODE_DIR/cert.pem
-  key: $NODE_DIR/key.pem
-  sniGuard: dns-san
-
-obfs:
-  type: salamander
-  salamander:
-    password: "$HY2_OBFS"
-
-auth:
-  type: password
-  password: "$HY2_PASS"
-
-ignoreClientBandwidth: true
-
-masquerade:
-  type: string
-  string:
-    content: "<!DOCTYPE html><html><head><title>Welcome</title></head><body><p>Welcome</p></body></html>"
-    headers:
-      content-type: text/html
-    statusCode: 200
-$_hy_quic
-EOF
-chmod 600 "$HY_CONF" 2>/dev/null
+HY_TCP_MASQ=0
+if [ -n "$HY2_DOMAIN" ] && [ "$HY2_USE_OBFS" != "1" ] && ! port_in_use "$PORT" tcp; then
+  HY_TCP_MASQ=1
+fi
+_hy_write_config
+# 端口跳跃的设置交给 xray-node-hop：服务启动前打开转发，停掉后拆掉。
+rm -f "$NODE_DIR/hop"
+if [ -n "$HY_HOP_PORTS" ]; then
+  if [ -n "$_hy_both" ]; then HY_HOP_FAMILY=46; else HY_HOP_FAMILY="$IPVER"; fi
+  printf 'main=%s\nports=%s\nfamily=%s\n' "$PORT" "$HY_HOP_PORTS" "$HY_HOP_FAMILY" > "$NODE_DIR/hop"
+  chmod 600 "$NODE_DIR/hop" 2>/dev/null
+  info "端口跳跃会把这些 UDP 端口转到主端口 ${PORT}：$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')"
+fi
 info "配置文件已写入"
 
 else
@@ -4094,6 +4823,18 @@ fi
 # 先记下这个节点用的内核，_svc_install 要读它
 echo "$CORE" > "$NODE_DIR/core" 2>/dev/null
 step "[服务] 设置开机自启…"
+# 申请证书时 Let's Encrypt 要从外面连 TCP 80（或 443），所以启动前先放行。记在 fw_info.acme，删节点时一起撤销。
+if [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ]; then
+  if [ "$HY2_ACME_TYPE" = "tls" ]; then _acme_port=443; else _acme_port=80; fi
+  : > "$NODE_DIR/fw_info.acme"
+  if [ -n "$_hy_both" ]; then _acme_fams="4 6"; else _acme_fams="$IPVER"; fi
+  _acme_front=1
+  for _acme_fam in $_acme_fams; do
+    _fw_allow "$_acme_port" tcp "$_acme_fam" "$NODE_DIR/fw_info.acme" "$_acme_front"
+    [ "$_IPT_ADDED" = "1" ] && _save_fw "$_acme_fam"
+    _acme_front=0
+  done
+fi
 _svc_install "$NODE_ID"
 
 # ---------- 11b. 硬检查：端口必须真的在监听 ----------
@@ -4128,10 +4869,10 @@ if [ "$_svc_listen_ok" = "1" ]; then
     fi
   fi
 fi
-# 端口在听，并且这个节点自己的服务还在，才算跳跃打开了。
-_hy_hop_up() {
+# 端口在听，并且这个节点自己的服务还在，才算起来了。
+_svc_recheck() { # _svc_recheck [等几秒]
   _svc_listen_ok=1
-  if ! wait_for_port "$PORT" udp 15; then
+  if ! wait_for_port "$PORT" udp "${1:-15}"; then
     _svc_listen_ok=0
     return
   fi
@@ -4143,55 +4884,69 @@ _hy_hop_up() {
     pgrep -f "/etc/xray-node/nodes/${NODE_ID}/config.yaml" >/dev/null 2>&1 || _svc_listen_ok=0
   fi
 }
-if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ] \
-  && [ -z "$HY2_FW_BACKEND" ] && command -v iptables >/dev/null 2>&1; then
-  warn "端口跳跃的防火墙规则没写成，改用 iptables 再试一次。"
-  HY2_FW_BACKEND=iptables
+# 申请正规证书要先连上 Let's Encrypt，最多多等一会儿；申请不下来就改回自签证书。
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ]; then
+  info "正在给 ${HY2_DOMAIN} 申请证书，最多再等 60 秒…"
+  _svc_recheck 60
+  if [ "$_svc_listen_ok" != "1" ]; then
+    warn "证书没申请下来（常见原因：域名没解析到这台机器、80/443 端口被云安全组挡住）。改用自签证书，节点照样能用。"
+    HY2_DOMAIN=""
+    HY_TCP_MASQ=0
+    _hy_write_config
+    _svc_restart "$NODE_ID"
+    _svc_recheck
+  fi
+fi
+# 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ ! -f /etc/xray-node/hy_root ] \
+  && grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
+  warn "用普通用户身份跑不起来，改用 root 再试一次"
+  : > /etc/xray-node/hy_root
   _svc_restart "$NODE_ID"
-  _hy_hop_up
-  if [ "$_svc_listen_ok" = "1" ]; then
-    info "端口跳跃已打开。"
-  fi
-fi
-if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ] \
-  && [ "$IPVER" != "6" ] && [ "$HY_LISTEN" = ":$PORT,$HY_HOP_PORTS" ]; then
-  warn "IPv4 和 IPv6 一起做端口转发没成功，改为只在 IPv4 上跳跃。"
-  HY_LISTEN="0.0.0.0:$PORT,$HY_HOP_PORTS"
-  HY_EXTRA_IP=""
-  if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN"; then
-    _svc_restart "$NODE_ID"
-    _hy_hop_up
-    if [ "$_svc_listen_ok" = "1" ]; then
-      info "端口跳跃已改为只走 IPv4。"
-    fi
-  fi
-fi
-if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
-  warn "端口跳跃没能打开（这台机器做不了这些端口的转发），正在改回只用主端口。"
-  if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN_BASE"; then
-    HY_HOP_PORTS=""
-    HY_LISTEN="$HY_LISTEN_BASE"
-    _svc_restart "$NODE_ID"
-    _hy_hop_up
-    if [ "$_svc_listen_ok" = "1" ]; then
-      info "已改回只用主端口，节点还能连。"
-    fi
-  fi
+  _svc_recheck
 fi
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
   warn "同时听 IPv4 和 IPv6 没成功，改回只听你刚才选的那一种"
   if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
   HY_EXTRA_IP=""
   if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN"; then
+    [ -f "$NODE_DIR/hop" ] && sed -i "s/^family=.*/family=${IPVER}/" "$NODE_DIR/hop" 2>/dev/null
     _svc_restart "$NODE_ID"
-    _svc_listen_ok=1
-    if ! wait_for_port "$PORT" udp 15; then
-      _svc_listen_ok=0
-    elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
-      systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
-    elif command -v rc-service >/dev/null 2>&1; then
-      rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
+    _svc_recheck
+  fi
+fi
+# 端口跳跃：不靠“从本机连跳跃端口”来验（本机发给自己的包根本不经过 PREROUTING，永远测不通），
+# 而是看转发规则是不是真的写进了系统。服务启动时已经自动打开过一次。
+HY_HOP_V4=1
+HY_HOP_V6=1
+if [ "$_svc_listen_ok" = "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
+  _hop_state=$(/usr/local/bin/xray-node-hop check "$NODE_ID" 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    _hop_err=$(/usr/local/bin/xray-node-hop up "$NODE_ID" 2>&1)
+    _hop_state=$(/usr/local/bin/xray-node-hop check "$NODE_ID" 2>/dev/null) || _hop_state=""
+  fi
+  if [ -z "$_hop_state" ]; then
+    warn "端口跳跃没能打开，节点改为只用主端口 ${PORT}（节点照样能用）。原因："
+    _hop_explain "$_hop_err"
+    /usr/local/bin/xray-node-hop down "$NODE_ID" >/dev/null 2>&1
+    rm -f "$NODE_DIR/hop"
+    HY_HOP_PORTS=""
+  else
+    _hop_fam=${_hop_state##* }
+    _hop_want=$(sed -n 's/^family=//p' "$NODE_DIR/hop" 2>/dev/null)
+    case "$_hop_fam" in
+      4|6|46) ;;
+      *) _hop_fam="$_hop_want" ;;
+    esac
+    if [ "$_hop_want" = "46" ] && [ "$_hop_fam" = "4" ]; then
+      HY_HOP_V6=0
+      warn "IPv6 上做不了端口转发，端口跳跃只在 IPv4 上生效（IPv6 那行链接只用主端口）"
+    elif [ "$_hop_want" = "46" ] && [ "$_hop_fam" = "6" ]; then
+      HY_HOP_V4=0
+      warn "IPv4 上做不了端口转发，端口跳跃只在 IPv6 上生效（IPv4 那行链接只用主端口）"
     fi
+    [ "$_hop_fam" != "$_hop_want" ] && sed -i "s/^family=.*/family=${_hop_fam}/" "$NODE_DIR/hop" 2>/dev/null
+    info "端口跳跃已打开（${_hop_state}）。服务每次启动都会自动打开，停掉时自动拆掉，重启服务器后也在。"
   fi
 fi
 if [ "$_svc_listen_ok" = "1" ]; then
@@ -4222,7 +4977,8 @@ esac
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
 # Hysteria2 两种地址都听时，IPv4 和 IPv6 的防火墙要分别放行。
-# 开了端口跳跃时，监听是 :主端口,跳跃端口，仍然是两种地址都听。
+# 端口跳跃的跳跃端口不用在本机防火墙放行：nat 转发发生在防火墙检查之前，
+# 防火墙看到的已经是主端口。云服务器的安全组在机器外面，那里还是要放行跳跃端口。
 _FW_FAMILIES="$IPVER"
 if [ "$PROTO" = "hy2" ]; then
   case "$HY_LISTEN" in
@@ -4232,9 +4988,6 @@ if [ "$PROTO" = "hy2" ]; then
   esac
 fi
 _FW_PORT_LIST=$PORT
-if [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]; then
-  _FW_PORT_LIST="$PORT $(printf '%s' "$HY_HOP_PORTS" | tr ',' ' ')"
-fi
 _FW_SAVE4=0
 _FW_SAVE6=0
 _fw_front=1
@@ -4251,6 +5004,26 @@ for _fw_family in $_FW_FAMILIES; do
 done
 # 纯 iptables 的规则默认重启就丢：刚才亲手加了规则就存盘，
 # 否则机器一重启端口又被墙、节点连不上（ufw/firewalld 自己会持久化，不用管）
+# Hysteria2 有正规证书时：同端口的 TCP 伪装网站、申请证书用的 80/443 也要放行。
+if [ "$PROTO" = "hy2" ]; then
+  _hy_tcp_ports=""
+  [ "$HY_TCP_MASQ" = "1" ] && _hy_tcp_ports="$PORT"
+  # 申请证书用的端口启动前已经放行过，这里只把记录并进 fw_info。
+  if [ -f "$NODE_DIR/fw_info.acme" ]; then
+    cat "$NODE_DIR/fw_info.acme" >> "$NODE_DIR/fw_info"
+    rm -f "$NODE_DIR/fw_info.acme"
+  fi
+  _fw_front=1
+  for _fw_family in $_FW_FAMILIES; do
+    for _fw_port in $_hy_tcp_ports; do
+      _fw_allow "$_fw_port" tcp "$_fw_family" "$NODE_DIR/fw_info" "$_fw_front"
+      if [ "$_IPT_ADDED" = "1" ]; then
+        if [ "$_fw_family" = "6" ]; then _FW_SAVE6=1; else _FW_SAVE4=1; fi
+      fi
+    done
+    _fw_front=0
+  done
+fi
 [ "$_FW_SAVE4" = "1" ] && _save_fw 4
 [ "$_FW_SAVE6" = "1" ] && _save_fw 6
 # 自己写的 nftables 防火墙不自动改（改了还要动 /etc/nftables.conf），只告诉你怎么放行。
@@ -4274,6 +5047,8 @@ if [ "$PROTO" = "hy2" ]; then
   case "$HY_LISTEN" in
     ":$PORT"|":$PORT,$HY_HOP_PORTS") _hy_cloud="${_hy_cloud}。IPv4 和 IPv6 都要放" ;;
   esac
+  [ -n "$_hy_tcp_ports" ] && _hy_cloud="${_hy_cloud}；还有 TCP $(printf '%s' "$_hy_tcp_ports" | sed 's/^ *//; s/ /、/g')"
+  [ -n "$HY2_DOMAIN" ] && _hy_cloud="${_hy_cloud}；申请证书用的 TCP ${_acme_port} 也要放（续期还要用）"
   if [ -n "$HY_HOP_PORTS" ] && [ "$LINK_PORT" != "$PORT" ]; then
     _hy_cloud="${_hy_cloud}。NAT 小鸡要把跳跃端口按相同号码映射进来"
   fi
@@ -4286,38 +5061,61 @@ fi
 # 按各协议的通用格式拼出分享链接，客户端（v2rayN、Shadowrocket、NekoBox 等）都能直接导入。
 step "[完成] 生成你的节点…"
 LINK_EXTRA=""
+LINK_HY_OFFICIAL=""
+_hy_mport_x=""
+case "$PROTO" in
+  vless)  PROTO_NAME="VLESS + REALITY + Vision"; _nm_proto="Vless-Reality" ;;
+  trojan) PROTO_NAME="Trojan + REALITY"; _nm_proto="Trojan-Reality" ;;
+  vmess)  PROTO_NAME="VMess + WebSocket"; _nm_proto="Vmess" ;;
+  ss)     PROTO_NAME="Shadowsocks"; _nm_proto="Shadowsocks" ;;
+  anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS-Reality" ;;
+  hy2)    PROTO_NAME="Hysteria2"; _nm_proto="Hysteria2" ;;
+  tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
+esac
+NODE_NAME=$(_node_name "$_nm_proto")
+printf '%s\n' "$NODE_NAME" > "$NODE_DIR/name"
+NAME_ENC=$(_urlenc "$NODE_NAME")
+[ -n "$NAME_ENC" ] || NAME_ENC="xray-node"
 case "$PROTO" in
   vless)
-    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
-    PROTO_NAME="VLESS + REALITY + Vision"
+    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   trojan)
-    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
-    PROTO_NAME="Trojan + REALITY"
+    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   vmess)
-    _json="{\"v\":\"2\",\"ps\":\"xray-node\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
+    _json="{\"v\":\"2\",\"ps\":\"${NODE_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
     LINK="vmess://$(printf "%s" "$_json" | b64url)"
-    PROTO_NAME="VMess + WebSocket"
     ;;
   ss)
-    LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#xray-node"
-    PROTO_NAME="Shadowsocks"
+    LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
     ;;
   anytls)
-    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#xray-node"
-    PROTO_NAME="AnyTLS + REALITY"
+    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   hy2)
-    # 官方 Hysteria2 客户端连接自签证书须同时设置 insecure=1 与 pinSHA256；
-    # pcs 供支持 Xray 分享字段的客户端使用，指纹仍会校验证书。
-    # 跳跃端口不写进主机名（1.2.3.4:443,20000 这种）。v2rayN 会整行导入失败。
-    # 主端口留在原处，跳跃端口放 mport。不认识 mport 的客户端只用主端口，也能连。
+    # 证书：有正规证书时只写 sni；自签证书时写 insecure=1 + pinSHA256（官方客户端要两个一起写，
+    #   指纹仍然会校验，别人冒充不了）。pcs 给认 Xray 分享字段的客户端用，意思一样。
+    # 端口跳跃：主端口留在地址里，跳跃端口放 mport（v2rayN、Clash Verge 等认这个）。
+    #   官方客户端认“地址:主端口,跳跃端口”这种写法，下面单独给一行。
+    HY2_SNI=${HY2_DOMAIN:-www.samsung.com}
+    if [ -n "$HY2_DOMAIN" ]; then
+      _hy_q="sni=${HY2_SNI}&alpn=h3"
+    else
+      _hy_q="insecure=1&sni=${HY2_SNI}&peer=${HY2_SNI}&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}"
+    fi
+    if [ "$HY2_USE_OBFS" = "1" ]; then
+      _hy_q="${_hy_q}&obfs=salamander&obfs-password=${HY2_OBFS}"
+    fi
+    if [ "$IPVER" = "6" ]; then _hy_hop_main="$HY_HOP_V6"; _hy_hop_x="$HY_HOP_V4"; else _hy_hop_main="$HY_HOP_V4"; _hy_hop_x="$HY_HOP_V6"; fi
     HY_MPORT=""
-    if [ -n "$HY_HOP_PORTS" ]; then
+    if [ -n "$HY_HOP_PORTS" ] && [ "$_hy_hop_main" = "1" ]; then
       HY_MPORT="${LINK_PORT},${HY_HOP_PORTS}"
     fi
-    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}&obfs=salamander&obfs-password=${HY2_OBFS}${HY_MPORT:+&mport=${HY_MPORT}}#xray-node"
+    LINK="hysteria2://${HY2_PASS}@${LINK_IP}:${LINK_PORT}/?${_hy_q}${HY_MPORT:+&mport=${HY_MPORT}}#${NAME_ENC}"
+    if [ -n "$HY_MPORT" ]; then
+      LINK_HY_OFFICIAL="hysteria2://${HY2_PASS}@${LINK_IP}:${HY_MPORT}/?${_hy_q}#${NAME_ENC}"
+    fi
     LINK_EXTRA=""
     if [ -n "$HY_EXTRA_IP" ]; then
       case "$HY_EXTRA_IP" in
@@ -4327,16 +5125,14 @@ case "$PROTO" in
       # IPv6 没有 IPv4 那种公网端口映射，客户端直接连本机监听端口。
       if [ "$IPVER" = "6" ]; then _hy_xport="$LINK_PORT"; else _hy_xport="$PORT"; fi
       _hy_mport_x=""
-      if [ -n "$HY_HOP_PORTS" ]; then
+      if [ -n "$HY_HOP_PORTS" ] && [ "$_hy_hop_x" = "1" ]; then
         _hy_mport_x="${_hy_xport},${HY_HOP_PORTS}"
       fi
-      LINK_EXTRA="hysteria2://${HY2_PASS}@${_hy_xip}:${_hy_xport}/?insecure=1&sni=www.samsung.com&peer=www.samsung.com&alpn=h3&pinSHA256=${HY2_PIN}&pcs=${HY2_PIN}&obfs=salamander&obfs-password=${HY2_OBFS}${_hy_mport_x:+&mport=${_hy_mport_x}}#xray-node"
+      LINK_EXTRA="hysteria2://${HY2_PASS}@${_hy_xip}:${_hy_xport}/?${_hy_q}${_hy_mport_x:+&mport=${_hy_mport_x}}#${NAME_ENC}"
     fi
-    PROTO_NAME="Hysteria2"
     ;;
   tuic)
-    LINK="tuic://${UUID}:${TUIC_PASS}@${LINK_IP}:${LINK_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.samsung.com&allow_insecure=1#xray-node"
-    PROTO_NAME="TUIC"
+    LINK="tuic://${UUID}:${TUIC_PASS}@${LINK_IP}:${LINK_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.samsung.com&allow_insecure=1#${NAME_ENC}"
     ;;
 esac
 
@@ -4371,6 +5167,7 @@ fi
   printf "%s\n" "$LINK"
   if [ -n "$LINK_EXTRA" ]; then printf "%s\n" "$LINK_EXTRA"; fi
   printf -- "----------------------------------------------\n"
+  printf "节点名: %s\n" "$NODE_NAME"
   printf "协议: %s\n" "$PROTO_NAME"
   printf "地址: %s\n" "$SERVER_IP"
   printf "端口: %s\n" "$LINK_PORT"
@@ -4387,17 +5184,26 @@ fi
     vless|trojan|anytls) printf "伪装域名: %s\n" "$REALITY_DOMAIN" ;;
     vmess)        printf "WS 路径: %s\n" "$WS_PATH" ;;
     hy2)
-      printf "SNI: www.samsung.com\n"
-      printf "证书指纹: %s\n" "$HY2_PIN"
-      printf "混淆: 已开启。别人不容易直接看出这是代理。\n"
-      printf "混淆类型: salamander\n"
-      printf "混淆密码: %s\n" "$HY2_OBFS"
-      printf "请用上面的整行链接导入。手填时，节点密码和混淆密码是两个，不要填反。\n"
-      if [ -n "$HY_MPORT" ]; then
-        _hy_mshow=$(printf '%s' "$HY_MPORT" | sed 's/,/、/g')
-        printf "端口跳跃: %s\n" "$_hy_mshow"
-        printf "支持跳跃的客户端会在这些端口之间换着连。不支持的客户端只用主端口，也能连。\n"
-        printf "云服务器安全组要把这些 UDP 端口都放行。\n"
+      printf "SNI: %s\n" "$HY2_SNI"
+      if [ -n "$HY2_DOMAIN" ]; then
+        printf "证书: 正规证书（Let's Encrypt，%s），客户端不要打开「跳过证书验证」。\n" "$HY2_DOMAIN"
+      else
+        printf "证书指纹: %s\n" "$HY2_PIN"
+      fi
+      if [ "$HY2_USE_OBFS" = "1" ]; then
+        printf "混淆: 已开启（salamander）。别人不容易直接看出这是代理。\n"
+        printf "混淆密码: %s\n" "$HY2_OBFS"
+        printf "请用上面的整行链接导入。手填时，节点密码和混淆密码是两个，不要填反。\n"
+      else
+        printf "混淆: 没开。别人探测时看到的是一个普通网站。\n"
+      fi
+      if [ -n "$HY_HOP_PORTS" ]; then
+        printf "端口跳跃: 主端口 %s，跳跃端口 %s\n" "$LINK_PORT" "$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')"
+        printf "v2rayN、Clash Verge、小火箭等导入上面那行（跳跃端口在 mport 里）。导入后没看到跳跃端口，就在节点设置的「端口跳跃/端口范围」里手填：%s\n" "$HY_HOP_PORTS"
+        if [ -n "$LINK_HY_OFFICIAL" ]; then
+          printf "官方 Hysteria2 客户端用这一行（端口直接写在地址后面）：\n%s\n" "$LINK_HY_OFFICIAL"
+        fi
+        printf "云服务器安全组要把主端口和这些跳跃端口的 UDP 都放行。\n"
       fi
       if [ -n "$HY_EXTRA_IP" ]; then
         if [ "$IPVER" = "6" ]; then
@@ -4409,27 +5215,52 @@ fi
           fi
         fi
       fi
-      printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
+      if [ -z "$HY2_DOMAIN" ]; then
+        printf "官方 Hysteria2 客户端：自签证书须同时启用 insecure 和证书指纹锁定；如果指纹为空，填入上面的值。\n"
+      fi
       # 混淆密码是纯字母数字，不要加引号。Loon 导入时会把引号也收进混淆参数。
-      _hy_loon_tail="salamander-password=${HY2_OBFS}"
-      if [ -n "$HY_HOP_PORTS" ]; then
-        _hy_loon_tail="${_hy_loon_tail},server-ports=\"${LINK_PORT},${HY_HOP_PORTS}\",hop-interval=30"
+      _hy_loon_cert="skip-cert-verify=false,tls-cert-sha256=${HY2_PIN}"
+      [ -n "$HY2_DOMAIN" ] && _hy_loon_cert="skip-cert-verify=false"
+      _hy_loon_obfs=""
+      [ "$HY2_USE_OBFS" = "1" ] && _hy_loon_obfs=",salamander-password=${HY2_OBFS}"
+      _hy_loon_tail=""
+      if [ -n "$HY_MPORT" ]; then
+        _hy_loon_tail=",server-ports=\"${HY_MPORT}\",hop-interval=30"
       fi
       printf "Loon 可粘贴这一行:\n"
-      printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=true,%s\n" \
-        "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail"
+      printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail"
       if [ -n "$LINK_EXTRA" ]; then
         if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
-        _hy_loon_tail2="salamander-password=${HY2_OBFS}"
-        if [ -n "$HY_HOP_PORTS" ]; then
-          _hy_loon_tail2="${_hy_loon_tail2},server-ports=\"${_loon_port},${HY_HOP_PORTS}\",hop-interval=30"
+        _hy_loon_tail2=""
+        if [ -n "$_hy_mport_x" ]; then
+          _hy_loon_tail2=",server-ports=\"${_hy_mport_x}\",hop-interval=30"
         fi
-        printf "Hysteria2 = Hysteria2,%s,%s,\"%s\",sni=www.samsung.com,skip-cert-verify=false,tls-cert-sha256=%s,alpn=\"h3\",udp=true,block-quic=true,%s\n" \
-          "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_PIN" "$_hy_loon_tail2"
+        printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
+          "${NODE_NAME}-v6" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2"
+      fi
+      # mihomo（Clash Meta、Clash Verge、FlClash 用的内核）原生支持端口跳跃：ports + hop-interval。
+      printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
+      printf "  - name: %s\n    type: hysteria2\n    server: %s\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
+      if [ -n "$HY_MPORT" ]; then
+        printf "    ports: %s\n    hop-interval: 30\n" "$HY_MPORT"
+      fi
+      printf "    password: %s\n    sni: %s\n    alpn: [h3]\n" "$HY2_PASS" "$HY2_SNI"
+      if [ -z "$HY2_DOMAIN" ]; then
+        printf "    fingerprint: %s\n" "$(printf '%s' "$HY2_PIN" | tr 'A-F' 'a-f')"
+      fi
+      if [ "$HY2_USE_OBFS" = "1" ]; then
+        printf "    obfs: salamander\n    obfs-password: %s\n" "$HY2_OBFS"
       fi
       ;;
     tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
   esac
+  if { [ "$PROTO" = "anytls" ] || [ "$PROTO" = "tuic" ]; } && [ -z "$SB_ROUTE" ]; then
+    printf "拦截 QUIC: 机器上的 sing-box 太老，服务器上没打开，请在客户端里打开。\n"
+  else
+    printf "拦截 QUIC: 已在服务器上打开。经过节点的 UDP 443（QUIC/HTTP3）会被拒绝，App 自动改走 TCP，更快更稳，客户端不用另外设置。\n"
+  fi
+  printf "想在客户端也拦：Loon 打开 block-quic；Clash / mihomo 在 rules 最前面加一行 - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT\n"
   printf -- "----------------------------------------------\n"
   if [ "$NODE_KIND" = "timed" ]; then
     printf "种类: 定时节点\n"
