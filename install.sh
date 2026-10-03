@@ -52,6 +52,8 @@
 # 镜像 / NAT64：只有 IPv6 的机器连不上只有 IPv4 的 github.com。镜像是“替你转一手”的网站；
 #       NAT64 是一种公共 DNS，让 IPv6 机器也能借道访问 IPv4 网站。脚本下载时临时用一下，用完还原。
 # 校验值（SHA256）：文件的“指纹”。下载完和官方公布的指纹对一下，一样才说明文件没被改过。
+# 巡检：每分钟自动查一次的小程序 xray-node-watch。防火墙服务重启会把端口跳跃的转发规则清掉，
+#   它发现少了就自动补回去；用自己的域名申请证书时，它只在申请/续期期间打开 TCP 80（或 443），平时关着。
 # 所有节点都放在 /etc/xray-node/nodes/<编号>/ 目录里，一个节点一个目录，互不影响。
 # ============================================================
 
@@ -415,7 +417,8 @@ _dns64_off() {
     rm -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak.none
   fi
   _DNS64_ON=0
-  trap - INT TERM HUP
+  # 换回 DNS 后，Ctrl+C 恢复成“直接退出”。正在装节点时，退出会顺带清理装了一半的节点。
+  trap 'exit 130' INT TERM HUP
 }
 
 # 上次脚本被强行关掉、DNS 没来得及换回时，这次开头先换回去。
@@ -1107,6 +1110,20 @@ _ipt_apply() { # _ipt_apply <iptables|ip6tables> <1|0>
   return 0
 }
 
+# 服务启动时的 up 和巡检时的 up 可能同时发生，排队一个一个来，免得 iptables 规则加重
+_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  exec 9>"$STATE_DIR/.lock" || return 0
+  # busybox 的 flock 没有 -w（限时等待），所以自己数：最多等 20 秒，等不到也照常干活
+  _lk=0
+  while ! flock -n 9 2>/dev/null; do
+    _lk=$((_lk + 1))
+    [ "$_lk" -ge 20 ] && break
+    sleep 1
+  done
+}
+
 _down_all() {
   _nft_del
   _ipt_del iptables
@@ -1165,6 +1182,7 @@ _check() {
 
 case "$act" in
   up)
+    _lock
     _load || { _down_all; exit 0; }
     _down_all
     if _up; then
@@ -1176,6 +1194,7 @@ case "$act" in
     exit 1
     ;;
   down)
+    _lock
     _down_all
     exit 0
     ;;
@@ -1186,6 +1205,7 @@ case "$act" in
     exit 0
     ;;
   probe)
+    _lock
     _load
     _down_all
     if _up; then
@@ -1202,6 +1222,415 @@ echo "用法：xray-node-hop up|down|check <节点编号>，或 xray-node-hop pr
 exit 2
 HOPEOF
   chmod 700 "$_hb_dir/xray-node-hop" || return 1
+}
+
+# ---------- 巡检小程序 xray-node-watch ----------
+# 每分钟跑一次，平时几乎什么都不做，只做两件事：
+#   1. 端口跳跃规则自愈：防火墙服务（nftables、firewalld、ufw、iptables、netfilter-persistent）
+#      重启或重载时，经常把所有规则清空，跳跃端口就不通了。发现规则没了就补回去。
+#   2. 证书续期端口：用自己的域名申请正规证书时，TCP 80（或 443）只在申请和快到期续期时打开，平时关着。
+# 有 systemd 用定时器（timer），还会挂在防火墙服务后面：防火墙一重启/重载，马上补一次。
+# Alpine 用 OpenRC 后台服务，都没有就用 cron，再没有就在后台循环。
+# 没有节点需要它时（没开跳跃、也没有要管的证书端口），自动卸掉。
+install_watch_bin() { # 写出 /usr/local/bin/xray-node-watch。重复运行只覆盖脚本。
+  _wb_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  mkdir -p "$_wb_dir" 2>/dev/null || return 1
+  # 先写到临时文件再换上去：后台正在跑的巡检不会读到写了一半的脚本
+  cat > "$_wb_dir/xray-node-watch.tmp" <<'WATCHEOF' || return 1
+#!/bin/sh
+# xray-node 巡检小程序。用法：
+#   xray-node-watch tick [--now]  巡检一次（--now：证书端口那部分也马上查，不等一小时）
+#   xray-node-watch arm           有节点需要就挂上每分钟的巡检，没有就卸掉
+#   xray-node-watch disarm        卸掉巡检（全部卸载时用）
+#   xray-node-watch loop          没有 systemd / OpenRC / cron 时，在后台一直循环巡检
+#   xray-node-watch acme-open|acme-close|acme-drop <节点编号>   打开 / 关上 / 删掉证书用的端口
+#   xray-node-watch undo <防火墙记录文件>   撤销记录里本脚本加过的放行（装到一半失败时用）
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+BIN_DIR=${XRAY_BIN_DIR:-/usr/local/bin}
+STATE_DIR=${XRAY_WATCH_STATE:-/run/xray-node-watch}
+SD_DIR=${XRAY_SYSTEMD_DIR:-/etc/systemd/system}
+SD_RUN=${XRAY_SYSTEMD_RUN:-/run/systemd/system}
+INITD=${XRAY_INITD:-/etc/init.d}
+CRON_DIR=${XRAY_CRON_DIR:-/etc/cron.d}
+PIDF=${XRAY_WATCH_PID:-/run/xray-node-watch.pid}
+LOG=${XRAY_WATCH_LOG:-/var/log/xray-node-watch.log}
+SELF="$BIN_DIR/xray-node-watch"
+HOP="$BIN_DIR/xray-node-hop"
+# 各系统里防火墙服务的名字。机器上有哪个，就把巡检挂在哪个后面。
+FW_UNITS="nftables.service firewalld.service ufw.service netfilter-persistent.service iptables.service ip6tables.service"
+FW_UNIT_DIRS=${XRAY_FW_UNIT_DIRS:-"$SD_DIR /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system"}
+# 证书剩不到 32 天就打开续期端口（Let's Encrypt 证书 90 天，剩 30 天左右开始续期）
+ACME_WINDOW=${XRAY_ACME_WINDOW:-2764800}
+
+_log() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  # 日志超过 64KB 只留最后 200 行，不会越写越大
+  if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+    tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$1" >> "$LOG" 2>/dev/null
+}
+
+_has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d "$SD_RUN" ]; }
+
+# 节点服务正在跑吗？没在跑的节点不补规则、不开端口。
+_active() {
+  if _has_systemd; then
+    systemctl is-active --quiet "hysteria-node@$1"
+    return
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-$1" status >/dev/null 2>&1
+    return
+  fi
+  for _ap in /proc/[0-9]*/cmdline; do
+    case "$_ap" in "/proc/$$/"*) continue ;; esac
+    tr '\000' ' ' < "$_ap" 2>/dev/null | grep -qF "$NODES_DIR/$1/config.yaml" && return 0
+  done
+  return 1
+}
+
+# ---- 端口跳跃规则自愈 ----
+_heal_hop() {
+  [ -x "$HOP" ] || return 0
+  for _hd in "$NODES_DIR"/*/; do
+    [ -f "${_hd}hop" ] || continue
+    # 还在安装中的节点（没有 node.txt）由安装脚本自己管
+    [ -f "${_hd}node.txt" ] || continue
+    _hid=$(basename "$_hd")
+    case "$_hid" in ''|*[!0-9]*) continue ;; esac
+    _active "$_hid" || continue
+    _hfail="$STATE_DIR/hop-$_hid.fail"
+    # 规则还在：什么都不做（绝大多数时候都是这样，只花一次 nft list 的工夫）
+    if "$HOP" check "$_hid" >/dev/null 2>&1; then
+      rm -f "$_hfail"
+      continue
+    fi
+    # 刚补失败过：5 分钟内不再重试，免得一直折腾
+    if [ -f "$_hfail" ] && [ -n "$(find "$_hfail" -mmin -5 2>/dev/null)" ]; then
+      continue
+    fi
+    if _herr=$("$HOP" up "$_hid" 2>&1 >/dev/null); then
+      rm -f "$_hfail"
+      _log "节点 $_hid 的端口跳跃规则不见了（多半是防火墙服务重启或重载过），已经补回"
+    else
+      : > "$_hfail"
+      _log "节点 $_hid 的端口跳跃规则补不回来：$(printf '%s' "$_herr" | tr '\n' ' ' | cut -c1-300)"
+    fi
+  done
+}
+
+# ---- 防火墙放行：按记录文件打开 / 撤销 ----
+# 记录文件每行：端口 协议 ufw加过 firewalld加过 iptables加过 地址族（和 fw_info 一样）。
+# 只动当初本脚本亲手加的那几种，你自己设的规则不碰。
+_fw_save() { # iptables 改了要存盘，重启后才一致
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  elif [ -f /etc/alpine-release ]; then
+    if [ "$1" = "6" ]; then _fs_svc=ip6tables; else _fs_svc=iptables; fi
+    if [ -f "/etc/init.d/$_fs_svc" ]; then "/etc/init.d/$_fs_svc" save >/dev/null 2>&1 || true; fi
+  fi
+}
+
+_fw_undo() {
+  [ -f "$1" ] || return 0
+  _u4=0; _u6=0
+  while read -r _fp _fpr _fu _ff _fi _ffam; do
+    case "$_fp" in ''|*[!0-9]*) continue ;; esac
+    case "$_fpr" in tcp|udp) ;; *) continue ;; esac
+    if [ "$_fu" = "1" ] && command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_fp/$_fpr" >/dev/null 2>&1 || true
+    fi
+    if [ "$_ff" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_fp/$_fpr" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if [ "$_fi" = "1" ]; then
+      if [ "$_ffam" = "6" ]; then _fb=ip6tables; _u6=1; else _fb=iptables; _u4=1; fi
+      command -v "$_fb" >/dev/null 2>&1 && "$_fb" -D INPUT -p "$_fpr" --dport "$_fp" -j ACCEPT >/dev/null 2>&1
+    fi
+  done < "$1"
+  [ "$_u4" = "1" ] && _fw_save 4
+  [ "$_u6" = "1" ] && _fw_save 6
+  return 0
+}
+
+_fw_redo() { # 已经放行的不重复加
+  [ -f "$1" ] || return 0
+  _r4=0; _r6=0
+  while read -r _fp _fpr _fu _ff _fi _ffam; do
+    case "$_fp" in ''|*[!0-9]*) continue ;; esac
+    case "$_fpr" in tcp|udp) ;; *) continue ;; esac
+    if [ "$_fu" = "1" ] && command -v ufw >/dev/null 2>&1; then
+      ufw status 2>/dev/null | grep -qE "^${_fp}/${_fpr}[[:space:]]" || ufw allow "$_fp/$_fpr" >/dev/null 2>&1
+    fi
+    if [ "$_ff" = "1" ] && command -v firewall-cmd >/dev/null 2>&1; then
+      if ! firewall-cmd --query-port="$_fp/$_fpr" >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="$_fp/$_fpr" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1
+      fi
+    fi
+    if [ "$_fi" = "1" ]; then
+      if [ "$_ffam" = "6" ]; then _fb=ip6tables; else _fb=iptables; fi
+      if command -v "$_fb" >/dev/null 2>&1 && ! "$_fb" -C INPUT -p "$_fpr" --dport "$_fp" -j ACCEPT >/dev/null 2>&1; then
+        "$_fb" -I INPUT -p "$_fpr" --dport "$_fp" -j ACCEPT >/dev/null 2>&1
+        if [ "$_ffam" = "6" ]; then _r6=1; else _r4=1; fi
+      fi
+    fi
+  done < "$1"
+  [ "$_r4" = "1" ] && _fw_save 4
+  [ "$_r6" = "1" ] && _fw_save 6
+  return 0
+}
+
+# ---- 证书续期端口 ----
+# 节点目录里的 fw_acme 记着为申请证书打开的端口，fw_acme.state 写着现在是 open 还是 closed。
+_acme_open() {
+  _ao="$NODES_DIR/$1"
+  [ -f "$_ao/fw_acme" ] || return 0
+  _fw_redo "$_ao/fw_acme"
+  echo open > "$_ao/fw_acme.state"
+}
+
+_acme_close() {
+  _ac="$NODES_DIR/$1"
+  [ -f "$_ac/fw_acme" ] || return 0
+  # 已经关着就不再删：免得把你后来自己加的同样规则删掉
+  [ "$(cat "$_ac/fw_acme.state" 2>/dev/null)" = "closed" ] && return 0
+  _fw_undo "$_ac/fw_acme"
+  echo closed > "$_ac/fw_acme.state"
+}
+
+_acme_need() { # 返回 0 = 现在需要打开（还没拿到证书，或者快到期要续期）
+  _an_d="$NODES_DIR/$1"
+  _active "$1" || return 1
+  _an_crt=$(find "$_an_d/acme" -type f -name '*.crt' 2>/dev/null | head -1)
+  [ -n "$_an_crt" ] || return 0
+  # 没有 openssl 看不了到期时间，只好一直开着，保证能续期
+  command -v openssl >/dev/null 2>&1 || return 0
+  openssl x509 -checkend "$ACME_WINDOW" -noout -in "$_an_crt" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+_acme_tick() {
+  _at_stamp="$STATE_DIR/acme.stamp"
+  # 证书一天才变一次，一小时查一次就够
+  if [ "$1" != "--now" ] && [ -f "$_at_stamp" ] && [ -n "$(find "$_at_stamp" -mmin -60 2>/dev/null)" ]; then
+    return 0
+  fi
+  : > "$_at_stamp"
+  for _ad in "$NODES_DIR"/*/; do
+    [ -f "${_ad}fw_acme" ] || continue
+    # 还在安装中的节点（没有 node.txt）正在申请证书，别去关它的端口
+    [ -f "${_ad}node.txt" ] || continue
+    _aid=$(basename "$_ad")
+    case "$_aid" in ''|*[!0-9]*) continue ;; esac
+    _ast=$(cat "${_ad}fw_acme.state" 2>/dev/null)
+    if _acme_need "$_aid"; then
+      [ "$_ast" = "open" ] || _log "节点 $_aid 的证书要申请或续期了，临时打开证书用的端口"
+      _acme_open "$_aid"
+    elif [ "$_ast" != "closed" ]; then
+      _acme_close "$_aid"
+      _log "节点 $_aid 的证书已经是新的，证书用的端口关上了"
+    fi
+  done
+}
+
+_tick() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  # 定时器和防火墙钩子同时触发时，只让一个在干活
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$STATE_DIR/tick.lock"
+    flock -n 8 || return 0
+  fi
+  # 先开关证书端口，再补跳跃规则：firewalld 重载时可能把跳跃规则一起清掉，放在后面补更稳
+  _acme_tick "$1"
+  _heal_hop
+}
+
+# ---- 挂上 / 卸掉巡检 ----
+_needed() {
+  for _nd in "$NODES_DIR"/*/; do
+    [ -f "${_nd}hop" ] && return 0
+    [ -f "${_nd}fw_acme" ] && return 0
+  done
+  return 1
+}
+
+_fw_units_present() { # 打印机器上真的有的防火墙服务
+  for _fu in $FW_UNITS; do
+    for _fdir in $FW_UNIT_DIRS; do
+      if [ -f "$_fdir/$_fu" ]; then printf '%s ' "$_fu"; break; fi
+    done
+  done
+}
+
+_arm_systemd() {
+  cat > "$SD_DIR/xray-node-watch.service" <<EOF
+[Unit]
+Description=xray-node watch: restore port-hopping rules, open certificate port when renewing
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=$SELF tick
+EOF
+  cat > "$SD_DIR/xray-node-watch.timer" <<EOF
+[Unit]
+Description=Run xray-node watch every minute
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+  _units=$(_fw_units_present)
+  _units=${_units% }
+  if [ -n "$_units" ]; then
+    # PartOf：防火墙服务重启时，这个小服务也跟着重启（也就是马上巡检一次）。
+    # ReloadPropagatedFrom：防火墙服务 reload 时，这里也跟着跑一次。
+    # After：等防火墙把它自己的规则写完再补，免得刚补上又被清掉。
+    cat > "$SD_DIR/xray-node-watch-fw.service" <<EOF
+[Unit]
+Description=Restore xray-node port-hopping rules after the firewall restarts or reloads
+After=${_units}
+PartOf=${_units}
+ReloadPropagatedFrom=${_units}
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF tick --now
+ExecReload=$SELF tick --now
+[Install]
+WantedBy=multi-user.target ${_units}
+EOF
+  elif [ -f "$SD_DIR/xray-node-watch-fw.service" ]; then
+    # 防火墙服务被卸掉了：钩子也撤掉，连同开机自启的链接
+    systemctl disable --now xray-node-watch-fw.service >/dev/null 2>&1 || true
+    rm -f "$SD_DIR/xray-node-watch-fw.service"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now xray-node-watch.timer >/dev/null 2>&1 || return 1
+  if [ -n "$_units" ]; then
+    systemctl reenable xray-node-watch-fw.service >/dev/null 2>&1 || systemctl enable xray-node-watch-fw.service >/dev/null 2>&1 || true
+    systemctl restart xray-node-watch-fw.service >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+_disarm_systemd() {
+  _has_systemd || return 0
+  [ -f "$SD_DIR/xray-node-watch.timer" ] || [ -f "$SD_DIR/xray-node-watch-fw.service" ] || return 0
+  systemctl disable --now xray-node-watch.timer >/dev/null 2>&1 || true
+  systemctl disable --now xray-node-watch-fw.service >/dev/null 2>&1 || true
+  rm -f "$SD_DIR/xray-node-watch.timer" "$SD_DIR/xray-node-watch.service" "$SD_DIR/xray-node-watch-fw.service"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+_arm_openrc() {
+  cat > "$INITD/xray-node-watch" <<EOF
+#!/sbin/openrc-run
+name="xray-node-watch"
+description="xray-node watch: restore port-hopping rules, open certificate port when renewing"
+command="$SELF"
+command_args="loop"
+command_background="yes"
+pidfile="/run/xray-node-watch-openrc.pid"
+depend() { after net firewall; }
+EOF
+  chmod 755 "$INITD/xray-node-watch" || return 1
+  rc-update add xray-node-watch default >/dev/null 2>&1 || true
+  rc-service xray-node-watch status >/dev/null 2>&1 || rc-service xray-node-watch start >/dev/null 2>&1 || true
+  return 0
+}
+
+_disarm_openrc() {
+  [ -f "$INITD/xray-node-watch" ] || return 0
+  rc-service xray-node-watch stop >/dev/null 2>&1 || true
+  rc-update del xray-node-watch default >/dev/null 2>&1 || true
+  rm -f "$INITD/xray-node-watch"
+}
+
+_kill_loop() {
+  [ -f "$PIDF" ] || return 0
+  _kp=$(tr -d ' \r\n' < "$PIDF" 2>/dev/null)
+  case "$_kp" in ''|*[!0-9]*) ;; *) kill "$_kp" >/dev/null 2>&1 || true ;; esac
+  rm -f "$PIDF"
+}
+
+_disarm() {
+  _disarm_systemd
+  _disarm_openrc
+  rm -f "$CRON_DIR/xray-node-watch"
+  _kill_loop
+}
+
+_arm() {
+  if ! _needed; then
+    _disarm
+    return 0
+  fi
+  if _has_systemd && [ -d "$SD_DIR" ] && [ -w "$SD_DIR" ]; then
+    _arm_systemd && return 0
+  fi
+  if command -v rc-update >/dev/null 2>&1 && [ -d "$INITD" ] && [ -w "$INITD" ]; then
+    _arm_openrc && return 0
+  fi
+  if [ -d "$CRON_DIR" ] && [ -w "$CRON_DIR" ]; then
+    cat > "$CRON_DIR/xray-node-watch" <<EOF
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root $SELF tick
+EOF
+    return 0
+  fi
+  # 什么服务管理器都没有：后台循环。已经在跑就不再开第二个。
+  if [ -f "$PIDF" ]; then
+    _op=$(tr -d ' \r\n' < "$PIDF" 2>/dev/null)
+    case "$_op" in ''|*[!0-9]*) ;; *) kill -0 "$_op" 2>/dev/null && return 0 ;; esac
+  fi
+  nohup "$SELF" loop >/dev/null 2>&1 &
+  echo $! > "$PIDF" 2>/dev/null || true
+  return 2
+}
+
+_id_ok() { case "$1" in ''|*[!0-9]*) echo "节点编号不对：$1" >&2; exit 2 ;; esac; }
+
+case "$1" in
+  tick) _tick "$2" ;;
+  arm) _arm; exit $? ;;
+  disarm) _disarm ;;
+  loop)
+    while :; do
+      "$SELF" tick
+      sleep 60
+    done
+    ;;
+  acme-open) _id_ok "$2"; _acme_open "$2" ;;
+  acme-close) _id_ok "$2"; _acme_close "$2" ;;
+  acme-drop)
+    _id_ok "$2"
+    _acme_close "$2"
+    rm -f "$NODES_DIR/$2/fw_acme" "$NODES_DIR/$2/fw_acme.state"
+    ;;
+  undo) _fw_undo "$2" ;;
+  *) echo "用法：xray-node-watch tick|arm|disarm|loop|acme-open|acme-close|acme-drop <编号>|undo <文件>" >&2; exit 2 ;;
+esac
+exit 0
+WATCHEOF
+  chmod 700 "$_wb_dir/xray-node-watch.tmp" || return 1
+  mv -f "$_wb_dir/xray-node-watch.tmp" "$_wb_dir/xray-node-watch" || return 1
+}
+
+# 挂上 / 卸掉巡检。返回前说明一下，不让小白以为多了个来路不明的服务。
+arm_node_watch() {
+  install_watch_bin || { warn "巡检小程序没写进去：防火墙重启后端口跳跃可能要等节点重启才回来"; return 0; }
+  _anw_bin="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  "$_anw_bin" arm
+  if [ $? -eq 2 ]; then
+    warn "这台机器没有 systemd、OpenRC 或 cron，巡检先在后台跑着。服务器重启后，请再运行一次安装脚本。"
+  fi
+  return 0
 }
 
 # ---------- IPv6 开关 ----------
@@ -1760,7 +2189,12 @@ _delete_node() {
   # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
   _x_hop="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop"
   [ -x "$_x_hop" ] && "$_x_hop" down "$_d_id" >/dev/null 2>&1
+  # 证书用的端口如果还开着，也关上
+  _x_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  [ -x "$_x_watch" ] && "$_x_watch" acme-drop "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
+  # 没有节点再需要巡检了，就把巡检一起卸掉
+  [ -x "$_x_watch" ] && "$_x_watch" arm >/dev/null 2>&1
   echo "节点 ${_d_id} 已到时间，已经彻底删除。"
   _log "节点 ${_d_id} 已到时间，已彻底删除（服务已停、链接作废、配置和防火墙规则已清除）"
 }
@@ -2150,7 +2584,11 @@ _del_node() {
   _stop_remove_svc "$_d_id"
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   _del_fw_rules "$NODES_DIR/$_d_id/fw_info"
+  # 证书用的端口如果还开着，也关上
+  [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch acme-drop "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
+  # 没有节点再需要巡检了，就把巡检一起卸掉（全部卸载时最后统一处理）
+  [ "$2" != "skip_confirm" ] && [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch arm >/dev/null 2>&1
   echo "节点 $_d_id 已删除，其它节点不受影响。"
 }
 
@@ -2161,6 +2599,8 @@ _uninstall_all() {
     [ -d "$_d" ] || continue
     _del_node "$(basename "$_d")" skip_confirm
   done
+  # 巡检（每分钟检查端口跳跃规则、证书端口的小程序）也卸掉
+  [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch disarm >/dev/null 2>&1
   # _svc_install 建的 systemd 模板（xray-node@.service / singbox-node@.service）
   # 不是按节点实例建的，上面的循环删不掉，不清会残留在系统里
   if [ -d /run/systemd/system ]; then
@@ -2227,8 +2667,8 @@ _uninstall_all() {
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
-  rm -f /usr/local/bin/xray-node-hop
-  rm -rf /run/xray-node-hop
+  rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
+  rm -rf /run/xray-node-hop /run/xray-node-watch
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
   # IPv6 开关是整台服务器的设置，不跟着节点删。关过的话提醒一下怎么打开。
   if [ -f /etc/sysctl.d/99-xray-node-ipv6.conf ]; then
@@ -2319,6 +2759,8 @@ for _hy_node in /etc/xray-node/nodes/*/; do
 done
 install_expire_bins || true
 arm_expire_watch || true
+# 端口跳跃 / 证书端口的巡检：有节点要用就挂上，没有就卸掉
+arm_node_watch || true
 }
 
 # ---------- 服务（让节点在后台一直跑、开机自启） ----------
@@ -3699,6 +4141,15 @@ _drop_partial_node() {
   pkill -f "${_dp_dir%/}/config.json" >/dev/null 2>&1
   pkill -f "${_dp_dir%/}/config.yaml" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_dp_id" >/dev/null 2>&1
+  # 装到一半为这个节点放行的防火墙端口（证书用的 fw_acme、节点自己的 fw_info）也撤掉
+  _dp_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  _dp_d="${_dp_dir%/}"
+  if [ -x "$_dp_watch" ]; then
+    if [ -f "$_dp_d/fw_acme" ] && [ "$(cat "$_dp_d/fw_acme.state" 2>/dev/null)" != "closed" ]; then
+      "$_dp_watch" undo "$_dp_d/fw_acme" >/dev/null 2>&1
+    fi
+    [ -f "$_dp_d/fw_info" ] && "$_dp_watch" undo "$_dp_d/fw_info" >/dev/null 2>&1
+  fi
   rm -rf "$_dp_dir"
 }
 
@@ -3841,6 +4292,7 @@ if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
 arm_expire_watch || true
+arm_node_watch || true
 _NODE_COUNT=0
 if [ -d /etc/xray-node/nodes ]; then
   for _nd in /etc/xray-node/nodes/*/; do
@@ -4504,6 +4956,8 @@ fi
 # node.txt 写成功后才算装完。中途失败要停掉刚拉起的服务并删掉这个目录，
 # 否则重启循环占着端口，而且管理命令看不到它。
 trap _abort_partial_node EXIT
+# 按 Ctrl+C 或连接断开时，也要走上面的清理（不然装了一半的服务和放行的端口会留下）
+trap 'exit 130' INT TERM HUP
 mkdir -p "$NODE_DIR" || die "无法创建节点目录 $NODE_DIR"
 
 # ---------- 9b. 自签证书（Hysteria2 / TUIC 需要） ----------
@@ -4823,17 +5277,29 @@ fi
 # 先记下这个节点用的内核，_svc_install 要读它
 echo "$CORE" > "$NODE_DIR/core" 2>/dev/null
 step "[服务] 设置开机自启…"
-# 申请证书时 Let's Encrypt 要从外面连 TCP 80（或 443），所以启动前先放行。记在 fw_info.acme，删节点时一起撤销。
+# 申请证书时 Let's Encrypt 要从外面连 TCP 80（或 443），所以启动前先放行。
+# 放行了哪些记在节点目录的 fw_acme 里：装到一半失败时撤销；申请成功后先关上，
+# 快到期要续期时，巡检程序 xray-node-watch 会自动再打开，续好了再关上。
+# 端口本来就是开着的（你自己放行过），就什么都不记，也不去关它。
 if [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ]; then
   if [ "$HY2_ACME_TYPE" = "tls" ]; then _acme_port=443; else _acme_port=80; fi
-  : > "$NODE_DIR/fw_info.acme"
+  install_watch_bin || true
+  # 看证书哪天到期要用 openssl，没有就装上（很小）。装不上的话证书端口只好一直开着。
+  command -v openssl >/dev/null 2>&1 || _pkg_add "正在安装 openssl（用来看证书什么时候到期）" openssl
+  : > "$NODE_DIR/fw_acme"
+  chmod 600 "$NODE_DIR/fw_acme" 2>/dev/null
   if [ -n "$_hy_both" ]; then _acme_fams="4 6"; else _acme_fams="$IPVER"; fi
   _acme_front=1
   for _acme_fam in $_acme_fams; do
-    _fw_allow "$_acme_port" tcp "$_acme_fam" "$NODE_DIR/fw_info.acme" "$_acme_front"
+    _fw_allow "$_acme_port" tcp "$_acme_fam" "$NODE_DIR/fw_acme" "$_acme_front"
     [ "$_IPT_ADDED" = "1" ] && _save_fw "$_acme_fam"
     _acme_front=0
   done
+  if awk '$3 == 1 || $4 == 1 || $5 == 1 { found = 1 } END { exit !found }' "$NODE_DIR/fw_acme"; then
+    echo open > "$NODE_DIR/fw_acme.state"
+  else
+    rm -f "$NODE_DIR/fw_acme"
+  fi
 fi
 _svc_install "$NODE_ID"
 
@@ -4897,6 +5363,25 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ];
     _svc_recheck
   fi
 fi
+# 证书端口：申请成功了就先关上（快到期时巡检程序会自动再打开）；改用自签证书了就整个撤掉。
+_hy_acme_ports_done() {
+  [ "$PROTO" = "hy2" ] && [ -f "$NODE_DIR/fw_acme" ] || return 0
+  _hap_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  [ -x "$_hap_watch" ] || return 0
+  if [ -z "$HY2_DOMAIN" ]; then
+    "$_hap_watch" acme-drop "$NODE_ID"
+    info "已撤销为申请证书临时放行的 TCP ${_acme_port}"
+    return 0
+  fi
+  [ "$_svc_listen_ok" = "1" ] || return 0
+  [ -n "$(find "$NODE_DIR/acme" -type f -name '*.crt' 2>/dev/null | head -1)" ] || return 0
+  if command -v openssl >/dev/null 2>&1; then
+    "$_hap_watch" acme-close "$NODE_ID"
+    info "证书已申请好。为申请证书临时放行的 TCP ${_acme_port} 已关上；快到期时会自动打开续期，续好再关。"
+  else
+    warn "没有 openssl，看不了证书哪天到期，TCP ${_acme_port} 只好一直开着，保证能续期。"
+  fi
+}
 # 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ ! -f /etc/xray-node/hy_root ] \
   && grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
@@ -4915,6 +5400,7 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$P
     _svc_recheck
   fi
 fi
+_hy_acme_ports_done
 # 端口跳跃：不靠“从本机连跳跃端口”来验（本机发给自己的包根本不经过 PREROUTING，永远测不通），
 # 而是看转发规则是不是真的写进了系统。服务启动时已经自动打开过一次。
 HY_HOP_V4=1
@@ -5008,11 +5494,7 @@ done
 if [ "$PROTO" = "hy2" ]; then
   _hy_tcp_ports=""
   [ "$HY_TCP_MASQ" = "1" ] && _hy_tcp_ports="$PORT"
-  # 申请证书用的端口启动前已经放行过，这里只把记录并进 fw_info。
-  if [ -f "$NODE_DIR/fw_info.acme" ]; then
-    cat "$NODE_DIR/fw_info.acme" >> "$NODE_DIR/fw_info"
-    rm -f "$NODE_DIR/fw_info.acme"
-  fi
+  # 申请证书用的端口单独记在 fw_acme，由巡检程序按需开关，这里不管。
   _fw_front=1
   for _fw_family in $_FW_FAMILIES; do
     for _fw_port in $_hy_tcp_ports; do
@@ -5048,7 +5530,7 @@ if [ "$PROTO" = "hy2" ]; then
     ":$PORT"|":$PORT,$HY_HOP_PORTS") _hy_cloud="${_hy_cloud}。IPv4 和 IPv6 都要放" ;;
   esac
   [ -n "$_hy_tcp_ports" ] && _hy_cloud="${_hy_cloud}；还有 TCP $(printf '%s' "$_hy_tcp_ports" | sed 's/^ *//; s/ /、/g')"
-  [ -n "$HY2_DOMAIN" ] && _hy_cloud="${_hy_cloud}；申请证书用的 TCP ${_acme_port} 也要放（续期还要用）"
+  [ -n "$HY2_DOMAIN" ] && _hy_cloud="${_hy_cloud}；申请证书用的 TCP ${_acme_port} 也要放（续期还要用。本机防火墙平时关着它，快到期时脚本自动打开）"
   if [ -n "$HY_HOP_PORTS" ] && [ "$LINK_PORT" != "$PORT" ]; then
     _hy_cloud="${_hy_cloud}。NAT 小鸡要把跳跃端口按相同号码映射进来"
   fi
