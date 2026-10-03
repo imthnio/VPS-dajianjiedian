@@ -1521,7 +1521,8 @@ _del_node() {
   [ -d "$NODES_DIR/$_d_id" ] || { echo "节点 $_d_id 不存在"; return 1; }
   if [ "$2" != "skip_confirm" ]; then
     printf "确定删除节点 %s（%s）吗？删掉后这个节点就不能用了。[y/N]: " "$_d_id" "$(_node_info "$_d_id")"
-    read -r _ans
+    read -r _ans || { echo "已取消"; return 0; }
+    _ans=$(_clean_choice "$_ans")
     case "$_ans" in y|Y|yes|YES) ;; *) echo "已取消"; return 0 ;; esac
   fi
   echo "正在删除节点 ${_d_id}…"
@@ -1608,7 +1609,7 @@ _uninstall_all() {
   fi
 }
 
-# 去掉空格、制表符和回车符。复制或 Windows 终端经常带上这些，否则 all 对不上。
+# 去掉空格和回车符。复制进去时经常带上这些，否则 1234 对不上。
 _clean_choice() {
   printf '%s' "$1" | tr -d '[:space:]'
 }
@@ -1632,45 +1633,39 @@ if [ "$_n_count" = "0" ]; then
 fi
 printf "  0) 取消，什么都不删\n"
 printf "  输入上面的节点编号：只删除那一个\n"
-printf "  输入 all：删除全部节点并卸载干净\n"
+printf "  输入 1234：删除全部节点并卸载干净\n"
 printf "请选择: "
 read -r _sel || { echo "已取消"; exit 0; }
 _sel=$(_clean_choice "$_sel")
-_sel=$(printf '%s' "$_sel" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
 case "$_sel" in
   0|"") echo "已取消" ;;
-  all)
-    printf "这会删除全部 %s 个节点，并卸掉内核、命令和配置。删了就不能用了。\n" "$_n_count"
-    printf "请输入 all 确认: "
-    read -r _ans2 || { echo "已取消"; exit 0; }
-    _ans2=$(_clean_choice "$_ans2")
-    _ans2=$(printf '%s' "$_ans2" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
-    # 只认 all。y、1234 或其它任何内容都取消，避免手滑把整台机器卸掉。
-    case "$_ans2" in
-      all) _uninstall_all ;;
-      *) echo "已取消" ;;
-    esac
-    ;;
+  *[!0-9]*) echo "输入不对，已取消。要删除全部，请输入 1234" ;;
   *)
-    case "$_sel" in ''|*[!0-9]*) echo "输入不对，已取消。要删除全部，请输入 all" ;;
-      *)
-        # 08 和 8 是同一个节点。只去掉数字前面的 0，all 已经在上面处理过了。
-        _sel=$(printf '%s' "$_sel" | sed 's/^0*//')
-        if [ -z "$_sel" ]; then
-          echo "已取消"
-        else
-          _found=0
-          for _cand in $_n_ids; do
-            if [ "$_cand" = "$_sel" ]; then
-              _found=1
-              _del_node "$_sel"
-              break
-            fi
-          done
-          [ "$_found" = "1" ] || echo "没有这个节点编号，已取消。要删除全部，请输入 all"
+    # 08 和 8 是同一个节点。先去掉数字前面的 0。
+    # 1234 是删除全部的选项，不能拿去对某一个节点。
+    _sel=$(printf '%s' "$_sel" | sed 's/^0*//')
+    if [ -z "$_sel" ] || [ "$_sel" = "0" ]; then
+      echo "已取消"
+    elif [ "$_sel" = "1234" ]; then
+      printf "这会删除全部 %s 个节点，并卸掉内核、命令和配置。删了就不能用了。\n" "$_n_count"
+      printf "确定删除全部节点并卸载干净吗？[y/N]: "
+      read -r _ans2 || { echo "已取消"; exit 0; }
+      _ans2=$(_clean_choice "$_ans2")
+      case "$_ans2" in
+        y|Y|yes|YES) _uninstall_all ;;
+        *) echo "已取消" ;;
+      esac
+    else
+      _found=0
+      for _cand in $_n_ids; do
+        if [ "$_cand" = "$_sel" ]; then
+          _found=1
+          _del_node "$_sel"
+          break
         fi
-        ;;
-    esac
+      done
+      [ "$_found" = "1" ] || echo "没有这个节点编号，已取消。要删除全部，请输入 1234"
+    fi
     ;;
 esac
 XZEOF
@@ -2762,6 +2757,8 @@ for _nd in /etc/xray-node/nodes/*/; do
   case "$_nn" in ''|*[!0-9]*) continue ;; esac
   [ "$_nn" -ge "$NODE_ID" ] && NODE_ID=$((_nn + 1))
 done
+# 1234 在节点管理里表示删除全部，不能拿来当新节点编号。
+[ "$NODE_ID" = "1234" ] && NODE_ID=1235
 NODE_DIR=/etc/xray-node/nodes/$NODE_ID
 # 注意：目录在这里先不建，留到更新模式之后——更新模式不需要新目录，
 # 提前建会在每次更新时留下一个空编号目录，节点编号越跳越大

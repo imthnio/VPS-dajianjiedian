@@ -138,6 +138,28 @@ class ShadowsocksKeyTest(unittest.TestCase):
             self.assertEqual(len(base64.b64decode(result.stdout)), 16, result.stdout)
 
 
+class NodeIdReservationTest(unittest.TestCase):
+    def next_id(self, existing):
+        source = INSTALLER.read_text()
+        start = source.index("NODE_ID=1\n")
+        block = source[start:source.index("NODE_DIR=", start)]
+        with tempfile.TemporaryDirectory() as temp:
+            nodes = Path(temp) / "nodes"
+            nodes.mkdir()
+            for node_id in existing:
+                (nodes / node_id).mkdir()
+            script = block.replace("/etc/xray-node/nodes", str(nodes))
+            script += '\nprintf "%s" "$NODE_ID"\n'
+            result = run_sh(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_1234_is_reserved_for_the_delete_everything_choice(self):
+        self.assertEqual(self.next_id(["1233"]), "1235")
+        self.assertEqual(self.next_id(["1", "2"]), "3")
+        self.assertEqual(self.next_id(["1234"]), "1235")
+
+
 class UninstallNoteTest(unittest.TestCase):
     def test_uninstall_mentions_ipv6_that_stays_off(self):
         body = between("_uninstall_all() {", "\necho \"==================== 节点管理")
