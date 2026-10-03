@@ -792,30 +792,44 @@ _ipv6_rebind_nodes() {
           exit
         }
       ' "${_d}config.yaml")
-      _port=""
+      # :443 和 [::]:443 要改成只听 IPv4。端口跳跃是 :443,20000，逗号后面的端口要留下。
+      # 留着双栈地址的话，关掉 IPv6 时这个套接字会一起失效，IPv4 也连不上。
+      _body=""
       case "$_listen" in
-        \[::\]:*) _port=${_listen#\[::\]:} ;;
-        :*) _port=${_listen#:} ;;
+        \[::\]:*) _body=${_listen#\[::\]:} ;;
+        :*) _body=${_listen#:} ;;
+      esac
+      _port=${_body%%,*}
+      _hop=""
+      case "$_body" in
+        *,*) _hop=${_body#*,} ;;
       esac
       case "$_port" in
         ''|*[!0-9]*) ;;
         *)
-          _cfg="${_d}config.yaml"
-          cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
-          if _hy_set_listen "$_cfg" "0.0.0.0:${_port}"; then
-            _svc_restart "$_id"
-            if wait_for_port "$_port" udp 15; then
-              rm -f "${_cfg}.bak-ipv6off"
-              info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
-            else
-              mv -f "${_cfg}.bak-ipv6off" "$_cfg"
-              _svc_restart "$_id"
-              warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
-            fi
-          else
-            mv -f "${_cfg}.bak-ipv6off" "$_cfg"
-            warn "节点 ${_id} 的监听地址没改成"
-          fi
+          case "$_hop" in
+            *[!0-9,]*) ;;
+            *)
+              _cfg="${_d}config.yaml"
+              _newlisten="0.0.0.0:${_port}"
+              [ -n "$_hop" ] && _newlisten="${_newlisten},${_hop}"
+              cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
+              if _hy_set_listen "$_cfg" "$_newlisten"; then
+                _svc_restart "$_id"
+                if wait_for_port "$_port" udp 15; then
+                  rm -f "${_cfg}.bak-ipv6off"
+                  info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
+                else
+                  mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+                  _svc_restart "$_id"
+                  warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
+                fi
+              else
+                mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+                warn "节点 ${_id} 的监听地址没改成"
+              fi
+              ;;
+          esac
           ;;
       esac
     fi
