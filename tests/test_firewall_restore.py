@@ -453,7 +453,7 @@ class PartialNodeTest(unittest.TestCase):
 
 
 class DeleteNodeSelectionTest(unittest.TestCase):
-    def test_menu_deletes_the_real_node_id(self):
+    def menu_script(self, nodes):
         source = INSTALLER.read_text()
         start = source.index("cat > /usr/local/bin/shanjiedian <<'XZEOF'\n")
         start += len("cat > /usr/local/bin/shanjiedian <<'XZEOF'\n")
@@ -465,6 +465,14 @@ class DeleteNodeSelectionTest(unittest.TestCase):
             '  return 0\n',
             1,
         )
+        script = script.replace(
+            '_uninstall_all() {\n',
+            '_uninstall_all() {\n  printf "UNINSTALL\\n" >> "$DELETE_LOG"\n  return 0\n',
+            1,
+        )
+        return script.replace("NODES_DIR=/etc/xray-node/nodes", f"NODES_DIR={nodes}", 1)
+
+    def run_menu(self, answers):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             nodes = root / "nodes"
@@ -472,38 +480,49 @@ class DeleteNodeSelectionTest(unittest.TestCase):
                 directory = nodes / node_id
                 directory.mkdir(parents=True)
                 (directory / "node.txt").write_text("协议: vless\n端口: 12345\n")
-            script = script.replace(
-                "NODES_DIR=/etc/xray-node/nodes",
-                f"NODES_DIR={nodes}",
-                1,
-            )
             log = root / "deleted"
             env = os.environ.copy()
             env["DELETE_LOG"] = str(log)
             result = subprocess.run(
-                ["sh", "-c", script],
-                input="2\n",
+                ["sh", "-c", self.menu_script(nodes)],
+                input=answers,
                 env=env,
                 text=True,
                 capture_output=True,
                 check=True,
             )
-            self.assertIn("节点 2", result.stdout)
-            self.assertIn("节点 5", result.stdout)
-            self.assertEqual(log.read_text().splitlines(), ["2"])
-            self.assertTrue((nodes / "5" / "node.txt").exists())
+            logged = log.read_text() if log.exists() else ""
+            node5_left = (nodes / "5" / "node.txt").exists()
+            return result, logged, node5_left
 
-            log.write_text("")
-            missed = subprocess.run(
-                ["sh", "-c", script],
-                input="1\n",
-                env=env,
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertIn("没有这个节点编号", missed.stdout)
-            self.assertEqual(log.read_text(), "")
+    def test_menu_deletes_the_real_node_id(self):
+        result, logged, node5_left = self.run_menu("2\n")
+        self.assertIn("节点 2", result.stdout)
+        self.assertIn("节点 5", result.stdout)
+        self.assertEqual(logged.splitlines(), ["2"])
+        self.assertTrue(node5_left)
+
+        missed, missed_log, _ = self.run_menu("1\n")
+        self.assertIn("没有这个节点编号", missed.stdout)
+        self.assertEqual(missed_log, "")
+
+    def test_delete_all_requires_the_word_all(self):
+        refused, refused_log, _ = self.run_menu("all\n1234\n")
+        self.assertIn("请输入 all 确认", refused.stdout)
+        self.assertIn("已取消", refused.stdout)
+        self.assertNotIn("UNINSTALL", refused_log)
+
+        old_yes, old_log, _ = self.run_menu("all\ny\n")
+        self.assertIn("已取消", old_yes.stdout)
+        self.assertNotIn("UNINSTALL", old_log)
+
+        confirmed, confirmed_log, _ = self.run_menu(" all \n ALL \n")
+        self.assertEqual(confirmed_log.splitlines(), ["UNINSTALL"])
+
+    def test_leading_zero_still_selects_the_real_node(self):
+        result, logged, _ = self.run_menu("02\n")
+        self.assertEqual(logged.splitlines(), ["2"])
+        self.assertIn("节点 5", result.stdout)
 
 
 class ServerAddressTest(unittest.TestCase):
