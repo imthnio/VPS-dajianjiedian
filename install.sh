@@ -3839,7 +3839,8 @@ case "$PROTO" in
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
-  "outbounds": [ { "protocol": "freedom" } ]
+  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
 }
 EOF
     ;;
@@ -3870,7 +3871,8 @@ EOF
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
-  "outbounds": [ { "protocol": "freedom" } ]
+  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
 }
 EOF
     ;;
@@ -3893,7 +3895,8 @@ EOF
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
     }
   ],
-  "outbounds": [ { "protocol": "freedom" } ]
+  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
 }
 EOF
     ;;
@@ -3913,7 +3916,8 @@ EOF
       }
     }
   ],
-  "outbounds": [ { "protocol": "freedom" } ]
+  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
 }
 EOF
     ;;
@@ -4014,6 +4018,19 @@ info "配置文件已写入"
 else
 # ---------- sing-box 配置（AnyTLS / TUIC） ----------
 SB_CONF="$NODE_DIR/config.json"
+# 拦截 QUIC（UDP 443）：sing-box 1.11 起才有 "action": "reject" 这种写法，更老的版本写了会起不来，只好不加。
+SB_ROUTE=""
+_sb_v=$(_ver_num "$("$SB_BIN" version 2>/dev/null | head -1)")
+_sb_maj=${_sb_v%%.*}; _sb_rest=${_sb_v#*.}; _sb_min=${_sb_rest%%.*}
+case "$_sb_maj.$_sb_min" in
+  *[!0-9.]*|.*|*.) _sb_maj=0; _sb_min=0 ;;
+esac
+if [ "$_sb_maj" -gt 1 ] || { [ "$_sb_maj" -eq 1 ] && [ "$_sb_min" -ge 11 ]; }; then
+  SB_ROUTE=',
+  "route": { "rules": [ { "network": "udp", "port": 443, "action": "reject" } ] }'
+else
+  warn "机器上原有的 sing-box 版本太老（${_sb_v:-未知}），不支持服务器端拦截 QUIC。节点照常能用，建议在客户端里打开「阻止 QUIC」。"
+fi
 if [ "$IPVER" = "6" ]; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   anytls)
@@ -4038,7 +4055,7 @@ case "$PROTO" in
       }
     }
   ],
-  "outbounds": [ { "type": "direct" } ]
+  "outbounds": [ { "type": "direct" } ]${SB_ROUTE}
 }
 EOF
     ;;
@@ -4062,7 +4079,7 @@ EOF
       }
     }
   ],
-  "outbounds": [ { "type": "direct" } ]
+  "outbounds": [ { "type": "direct" } ]${SB_ROUTE}
 }
 EOF
     ;;
