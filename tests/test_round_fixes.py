@@ -274,13 +274,18 @@ class Ipv6OnlyTest(unittest.TestCase):
     def hint(self, v4_route):
         script = (
             "ip() { case \"$*\" in \"-4 route show default\") printf '%s' '" + v4_route + "';; esac; }\n"
-            + between("_gh_hint() {", "\n_latest_tag() {")
+            + between("_no_ipv4_route() {", "\n# 临时换 DNS")
+            + "\n"
+            + between("_gh_hint() {", "\n# 下载的安装包")
             + "\nprintf '[%s]' \"$(_gh_hint)\"\n"
         )
         return run_sh(script).stdout
 
     def test_hint_only_without_ipv4_route(self):
-        self.assertIn("GitHub 不支持 IPv6", self.hint(""))
+        hint = self.hint("")
+        self.assertIn("GitHub 只有 IPv4", hint)
+        self.assertIn("IPv6 镜像和公共 NAT64", hint)
+        self.assertIn("WARP", hint)
         self.assertEqual(self.hint("default via 203.0.113.1 dev eth0"), "[]")
 
     def test_download_errors_carry_hint(self):
@@ -294,7 +299,7 @@ class Ipv6OnlyTest(unittest.TestCase):
         self.assertIn('_ipdef=2', block)
 
     def test_unzip_only_needed_for_download(self):
-        body = between("dl_xray() {", "\n}\n")
+        body = between("_dl_xray_inner() {", "\n}\n")
         self.assertLess(body.index('Xray 已存在，直接用现有的'), body.index("_ensure_unzip"))
 
 
