@@ -1085,6 +1085,7 @@ class InstalledMenuTest(unittest.TestCase):
             "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
             + ask
             + "\n_hy_fix_existing_ipv6() { echo UPDATED; }\n"
+            + "_hy_migrate_hop_all() { :; }\n"
             + "_choose_node_kind() { echo ADD; }\n"
             + "_ipv6_switch_menu() { echo IPV6; }\n"
             + "write_helper_cmds() { echo MANAGE; }\n"
