@@ -1524,7 +1524,7 @@ _del_node() {
     read -r _ans
     case "$_ans" in y|Y|yes|YES) ;; *) echo "已取消"; return 0 ;; esac
   fi
-  echo "正在删除节点 $_d_id…"
+  echo "正在删除节点 ${_d_id}…"
   _stop_remove_svc "$_d_id"
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   _del_fw_rules "$NODES_DIR/$_d_id/fw_info"
@@ -1608,6 +1608,11 @@ _uninstall_all() {
   fi
 }
 
+# 去掉空格、制表符和回车符。复制或 Windows 终端经常带上这些，否则 all 对不上。
+_clean_choice() {
+  printf '%s' "$1" | tr -d '[:space:]'
+}
+
 echo "==================== 节点管理 ===================="
 _n_count=0
 _n_ids=""
@@ -1625,29 +1630,45 @@ if [ "$_n_count" = "0" ]; then
   echo "没有已安装的节点。"
   exit 0
 fi
-printf "  0) 取消\n"
-printf "  all) 删除全部节点并卸载干净\n"
-printf "请输入要删除的节点编号（上面显示的数字）: "
-read -r _sel
+printf "  0) 取消，什么都不删\n"
+printf "  输入上面的节点编号：只删除那一个\n"
+printf "  输入 all：删除全部节点并卸载干净\n"
+printf "请选择: "
+read -r _sel || { echo "已取消"; exit 0; }
+_sel=$(_clean_choice "$_sel")
+_sel=$(printf '%s' "$_sel" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
 case "$_sel" in
   0|"") echo "已取消" ;;
-  all|ALL)
-    printf "确定删除全部 %s 个节点并卸载干净吗？[y/N]: " "$_n_count"
-    read -r _ans2
-    case "$_ans2" in y|Y|yes|YES) _uninstall_all ;; *) echo "已取消" ;; esac
+  all)
+    printf "这会删除全部 %s 个节点，并卸掉内核、命令和配置。删了就不能用了。\n" "$_n_count"
+    printf "请输入 all 确认: "
+    read -r _ans2 || { echo "已取消"; exit 0; }
+    _ans2=$(_clean_choice "$_ans2")
+    _ans2=$(printf '%s' "$_ans2" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    # 只认 all。y、1234 或其它任何内容都取消，避免手滑把整台机器卸掉。
+    case "$_ans2" in
+      all) _uninstall_all ;;
+      *) echo "已取消" ;;
+    esac
     ;;
   *)
-    case "$_sel" in ''|*[!0-9]*) echo "输入不对，已取消" ;;
+    case "$_sel" in ''|*[!0-9]*) echo "输入不对，已取消。要删除全部，请输入 all" ;;
       *)
-        _found=0
-        for _cand in $_n_ids; do
-          if [ "$_cand" = "$_sel" ]; then
-            _found=1
-            _del_node "$_sel"
-            break
-          fi
-        done
-        [ "$_found" = "1" ] || echo "没有这个节点编号，已取消"
+        # 08 和 8 是同一个节点。只去掉数字前面的 0，all 已经在上面处理过了。
+        _sel=$(printf '%s' "$_sel" | sed 's/^0*//')
+        if [ -z "$_sel" ]; then
+          echo "已取消"
+        else
+          _found=0
+          for _cand in $_n_ids; do
+            if [ "$_cand" = "$_sel" ]; then
+              _found=1
+              _del_node "$_sel"
+              break
+            fi
+          done
+          [ "$_found" = "1" ] || echo "没有这个节点编号，已取消。要删除全部，请输入 all"
+        fi
         ;;
     esac
     ;;
@@ -2600,7 +2621,7 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     _m_cfg=/usr/local/etc/sing-box/config.json
   fi
   if [ ! -f "$_m_cfg" ]; then
-    die "找不到老节点的配置文件（$_m_cfg），旧节点资料已保留；请先检查旧安装再重试"
+    die "找不到老节点的配置文件（${_m_cfg}），旧节点资料已保留；请先检查旧安装再重试"
   else
     _m_port=$(sed -n 's/^端口: //p' /etc/xray-node/node.txt | head -1)
     _m_proto=tcp
@@ -3096,7 +3117,7 @@ if ! SERVER_IP=$(get_ip "$IPVER"); then
     elif _valid_ip "$IPVER" "$SERVER_IP"; then
       break
     else
-      warn "「$SERVER_IP」不像个 IPv$IPVER 地址，检查一下再输"
+      warn "「${SERVER_IP}」不像个 IPv$IPVER 地址，检查一下再输"
     fi
     SERVER_IP=""
   done
@@ -3175,7 +3196,7 @@ _port_try=$((_port_try + 1))
 if [ "$_port_try" -ge 3 ]; then
   die "端口 $PORT/$_port_busy 已被其他程序占用，请重跑脚本换一个端口"
 fi
-warn "端口 $PORT/$_port_busy 已被其他程序占用，请换一个。直接回车就用 $_DEF_PORT（这个是空闲的）。"
+warn "端口 $PORT/$_port_busy 已被其他程序占用，请换一个。直接回车就用 ${_DEF_PORT}（这个是空闲的）。"
 done
 info "端口：$PORT"
 printf "如果是 NAT VPS，且服务商分配的公网端口与上面的端口不同，请填公网端口；普通 VPS 直接回车。\n"
@@ -3188,7 +3209,7 @@ LINK_PORT=$(printf '%s' "$LINK_PORT" | sed 's/^0*//')
   && [ "$LINK_PORT" -ge 1 ] && [ "$LINK_PORT" -le 65535 ] \
   || die "公网映射端口必须是 1-65535 的数字"
 if [ "$LINK_PORT" != "$PORT" ]; then
-  info "节点链接会使用公网端口 $LINK_PORT；请确认服务商已把它映射到本机 $PORT"
+  info "节点链接会使用公网端口 ${LINK_PORT}；请确认服务商已把它映射到本机 $PORT"
 fi
 
 # ---------- 6. REALITY 伪装域名 ----------
@@ -3325,7 +3346,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     break
   done
   if [ "$_rp_ok" -eq 1 ]; then
-    info "伪装域名验证通过：$REALITY_DOMAIN（TLS 1.3 握手正常）"
+    info "伪装域名验证通过：${REALITY_DOMAIN}（TLS 1.3 握手正常）"
   else
     warn "伪装域名 $REALITY_DOMAIN 验证没通过，继续安装（节点照常用，伪装效果可能打折）。"
   fi
@@ -3693,7 +3714,7 @@ else
   if [ -f "/var/log/xray-node-${NODE_ID}.log" ]; then
     tail -n 20 "/var/log/xray-node-${NODE_ID}.log" 2>/dev/null
   fi
-  die "服务没能监听端口 $PORT：节点装坏了。请把上面的日志截图发我。也可以运行 systemctl status '${SVC_UNIT:-xray-node@${NODE_ID}}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
+  die "服务没能监听端口 ${PORT}：节点装坏了。请把上面的日志截图发我。也可以运行 systemctl status '${SVC_UNIT:-xray-node@${NODE_ID}}'（或 rc-service 'xray-node-${NODE_ID}' status）看原因，修好再重跑脚本"
 fi
 
 # ---------- 12. 放行端口 ----------

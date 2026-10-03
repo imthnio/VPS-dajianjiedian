@@ -213,6 +213,7 @@ class PortRetryTest(unittest.TestCase):
     def test_busy_port_is_asked_again(self):
         result = self.run_block("8443\n\n")
         self.assertIn("WARN 端口 8443/TCP 已被其他程序占用", result.stdout)
+        self.assertIn("30000（这个是空闲的）", result.stdout)
         self.assertIn("PORT=30000", result.stdout)
 
     def test_gives_up_after_three_busy_answers(self):
