@@ -472,14 +472,14 @@ class DeleteNodeSelectionTest(unittest.TestCase):
         )
         return script.replace("NODES_DIR=/etc/xray-node/nodes", f"NODES_DIR={nodes}", 1)
 
-    def run_menu(self, answers):
+    def run_menu(self, answers, node_ids=("2", "5")):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             nodes = root / "nodes"
-            for node_id in ("2", "5"):
+            for node_id in node_ids:
                 directory = nodes / node_id
                 directory.mkdir(parents=True)
-                (directory / "node.txt").write_text("协议: vless\n端口: 12345\n")
+                (directory / "node.txt").write_text("协议: vless\n端口: 443\n")
             log = root / "deleted"
             env = os.environ.copy()
             env["DELETE_LOG"] = str(log)
@@ -492,43 +492,53 @@ class DeleteNodeSelectionTest(unittest.TestCase):
                 check=True,
             )
             logged = log.read_text() if log.exists() else ""
-            node5_left = (nodes / "5" / "node.txt").exists()
-            return result, logged, node5_left
+            return result, logged
 
     def test_menu_deletes_the_real_node_id(self):
-        result, logged, node5_left = self.run_menu("2\n")
-        self.assertIn("节点 2", result.stdout)
-        self.assertIn("节点 5", result.stdout)
+        result, logged = self.run_menu("2\n")
+        self.assertIn("2) 删除节点 2", result.stdout)
+        self.assertIn("5) 删除节点 5", result.stdout)
+        self.assertLess(result.stdout.index("2) 删除节点 2"), result.stdout.index("5) 删除节点 5"))
         self.assertEqual(logged.splitlines(), ["2"])
-        self.assertTrue(node5_left)
 
-        missed, missed_log, _ = self.run_menu("1\n")
-        self.assertIn("没有这个节点编号", missed.stdout)
+        missed, missed_log = self.run_menu("1\n")
+        self.assertIn("没有这个编号", missed.stdout)
         self.assertEqual(missed_log, "")
 
-    def test_delete_everything_uses_1234_not_all(self):
-        shown, shown_log, _ = self.run_menu("\n")
-        self.assertIn("输入 1234：删除全部节点并卸载干净", shown.stdout)
+    def test_next_number_deletes_every_node(self):
+        shown, shown_log = self.run_menu("\n", ("1", "2", "3"))
+        self.assertIn("1) 删除节点 1", shown.stdout)
+        self.assertIn("2) 删除节点 2", shown.stdout)
+        self.assertIn("3) 删除节点 3", shown.stdout)
+        self.assertIn("4) 删除全部节点并卸载干净", shown.stdout)
         self.assertNotIn("all", shown.stdout.lower())
         self.assertEqual(shown_log, "")
 
-        word, word_log, _ = self.run_menu("all\n")
-        self.assertIn("请输入 1234", word.stdout)
-        self.assertNotIn("UNINSTALL", word_log)
+        confirmed, confirmed_log = self.run_menu("4\ny\n", ("1", "2", "3"))
+        self.assertEqual(confirmed_log.splitlines(), ["UNINSTALL"])
 
-        refused, refused_log, _ = self.run_menu("1234\n\n")
-        self.assertIn("确定删除全部节点并卸载干净吗", refused.stdout)
+        refused, refused_log = self.run_menu("4\n\n", ("1", "2", "3"))
         self.assertIn("已取消", refused.stdout)
         self.assertNotIn("UNINSTALL", refused_log)
 
-        confirmed, confirmed_log, _ = self.run_menu(" 1234 \ny\n")
-        self.assertEqual(confirmed_log.splitlines(), ["UNINSTALL"])
-        self.assertNotIn("all", confirmed.stdout.lower())
+        word, word_log = self.run_menu("all\n", ("1", "2", "3"))
+        self.assertIn("输入不对", word.stdout)
+        self.assertNotIn("UNINSTALL", word_log)
+
+        # 节点编号有空档时，不能把下一个菜单序号当成那个节点。
+        # 节点是 2 和 5，删除全部是 6。输入 4 什么都不删，输入 2 只删节点 2。
+        gap, gap_log = self.run_menu("4\ny\n")
+        self.assertNotIn("UNINSTALL", gap_log)
+        self.assertEqual(gap_log, "")
+        self.assertIn("6) 删除全部节点并卸载干净", gap.stdout)
+
+        only_two, only_log = self.run_menu("6\ny\n")
+        self.assertEqual(only_log.splitlines(), ["UNINSTALL"])
 
     def test_leading_zero_still_selects_the_real_node(self):
-        result, logged, _ = self.run_menu("02\n")
+        result, logged = self.run_menu("02\n")
         self.assertEqual(logged.splitlines(), ["2"])
-        self.assertIn("节点 5", result.stdout)
+        self.assertIn("5) 删除节点 5", result.stdout)
 
 
 class ServerAddressTest(unittest.TestCase):
