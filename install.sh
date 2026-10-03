@@ -1225,6 +1225,317 @@ HOPEOF
   chmod 700 "$_hb_dir/xray-node-hop" || return 1
 }
 
+# ---------- 回程路由小程序 xray-node-route ----------
+# 有的机器上装了“策略路由”（比如 L2TP、WireGuard 等 VPN 一键脚本），会把本机发出去、
+# 又没打标记的流量默认送进 VPN 网卡。TCP 节点不受影响：连接建好以后，回包的源地址是固定的。
+# UDP 节点（Hysteria2、TUIC，还有 Shadowsocks 的 UDP）就不一样了：每个回包都要系统现查一次路由，
+# 结果回包从 VPN 网卡、用 VPN 的地址发了出去，客户端根本认不出来，节点就连不上。
+# 这个小程序发现这种情况时，给节点加一条只管自己的规则：
+#   本机从节点端口发出的 UDP 包，走公网网卡所在的路由表（通常是 main）。
+# 端口跳跃的包进来时已经被改成发往主端口，所以这一条规则把跳跃端口的回包也一起管上了。
+# 规则在节点启动时加、停掉时拆，巡检每分钟看一次（VPN 晚于节点启动时也能补上）。
+# 需要 Linux 4.17 以上的内核（按端口分流是从这一版开始有的）。
+install_route_bin() { # 写出 /usr/local/bin/xray-node-route。重复运行只覆盖脚本。
+  _rb_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  mkdir -p "$_rb_dir" 2>/dev/null || return 1
+  # 先写到临时文件再换上去：正在跑的旧脚本不会读到写了一半的内容
+  cat > "$_rb_dir/xray-node-route.tmp" <<'ROUTEEOF' || return 1
+#!/bin/sh
+# UDP 节点的回程路由。用法：
+#   xray-node-route up <编号>     需要就加上回程规则，不需要就拆掉（节点启动前、巡检时自动调用）
+#   xray-node-route down <编号>   拆掉（节点停止后、删节点时自动调用）
+#   xray-node-route check <编号>  系统里的规则和现在需要的一样就返回 0（巡检用）
+#   xray-node-route show <编号>   用大白话说一下这个节点加了哪些规则
+#   xray-node-route need          有 UDP 节点、机器上又有策略路由时返回 0（决定要不要挂巡检）
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+STATE_DIR=${XRAY_ROUTE_STATE:-/run/xray-node-route}
+# 用这两个公网地址问系统“包会从哪张网卡出去”。只是查路由表，不会真的发包。
+PROBE4=${XRAY_ROUTE_PROBE4:-1.1.1.1}
+PROBE6=${XRAY_ROUTE_PROBE6:-2606:4700:4700::1111}
+# 规则优先级从 8890 往下找空位，而且一定排在机器上别的策略路由规则前面（数字越小越先看）
+PREF_TOP=${XRAY_ROUTE_PREF:-8890}
+act=$1
+id=$2
+case "$act" in
+  need) ;;
+  *) case "$id" in ''|*[!0-9]*) echo "节点编号不对：$id" >&2; exit 2 ;; esac ;;
+esac
+ERRF="${TMPDIR:-/tmp}/xray-node-route.$$.err"
+trap 'rm -f "$ERRF"' EXIT
+
+_kw() { # _kw <关键字> <一行 ip 输出>：打印关键字后面的那个词，比如 dev 后面的网卡名
+  printf '%s\n' "$2" | awk -v k="$1" '{ for (i = 1; i < NF; i++) if ($i == k) { print $(i + 1); exit } }'
+}
+
+_is_udp_node() { # 只有 UDP 节点才需要：Hysteria2、TUIC、Shadowsocks
+  _d="$NODES_DIR/$id"
+  core=$(tr -d ' \r\n' < "$_d/core" 2>/dev/null)
+  case "$core" in
+    hysteria) [ -f "$_d/config.yaml" ] ;;
+    sing-box) grep -q '"type": *"tuic"' "$_d/config.json" 2>/dev/null ;;
+    xray) grep -q '"protocol": *"shadowsocks"' "$_d/config.json" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+_listen() { # 打印配置里的监听地址（去掉引号）
+  if [ "$core" = "hysteria" ]; then
+    sed -n 's/^listen:[[:space:]]*//p' "$NODES_DIR/$id/config.yaml" 2>/dev/null | head -1 | tr -d "\"' \r"
+  else
+    sed -n 's/.*"listen":[[:space:]]*"\([^"]*\)".*/\1/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1
+  fi
+}
+
+_load() { # 读出 UDP 主端口 port 和要管的地址族 fams
+  port=$(awk '$2 == "udp" && $1 ~ /^[0-9]+$/ { print $1; exit }' "$NODES_DIR/$id/fw_info" 2>/dev/null)
+  _ll=$(_listen)
+  if [ -z "$port" ]; then
+    if [ "$core" = "hysteria" ]; then
+      _lp=${_ll%%,*}; port=${_lp##*:}
+    else
+      port=$(sed -n 's/.*"\(listen_\)\{0,1\}port":[[:space:]]*\([0-9][0-9]*\).*/\2/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1)
+    fi
+  fi
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  # 只听 IPv4 的节点只管 IPv4；听 IPv6 或全部地址的两种都管
+  case "$_ll" in
+    0.0.0.0*|[0-9]*.*) fams=4 ;;
+    *) fams="4 6" ;;
+  esac
+  return 0
+}
+
+_node_addrs() { # _node_addrs <4|6>：node.txt 里写给客户端的地址
+  sed -n 's/^[^:：]*地址[^:：]*:[[:space:]]*//p' "$NODES_DIR/$id/node.txt" 2>/dev/null | tr -d '[] \r' |
+    while read -r _a; do
+      case "$1:$_a" in
+        4:*.*.*.*) case "$_a" in *[!0-9.]*) ;; *) printf '%s\n' "$_a" ;; esac ;;
+        6:*:*) case "$_a" in *[!0-9a-fA-F:]*) ;; *) printf '%s\n' "$_a" ;; esac ;;
+      esac
+    done
+}
+
+_dev_of_addr() { # _dev_of_addr <4|6> <地址>：这个地址在哪张网卡上（不在本机就什么都不打印）
+  ip -o "-$1" addr show 2>/dev/null | awk -v a="$2" '{ split($4, p, "/"); if (tolower(p[1]) == tolower(a)) { print $2; exit } }'
+}
+
+_dev_has() { # _dev_has <4|6> <网卡> <地址>：网卡上有这个地址就返回 0
+  ip -o "-$1" addr show dev "$2" 2>/dev/null | awk -v a="$3" '{ split($4, p, "/"); if (tolower(p[1]) == tolower(a)) f = 1 } END { exit !f }'
+}
+
+_main_dev() { # main 路由表里默认路由的网卡
+  _kw dev "$(ip "-$1" route show table main default 2>/dev/null | head -1)"
+}
+
+_table_for() { # _table_for <4|6> <网卡>：哪张路由表的默认路由走这张网卡（优先 main）
+  if [ "$(_main_dev "$1")" = "$2" ]; then echo main; return 0; fi
+  ip "-$1" route show table all default 2>/dev/null | awk -v d="$2" '
+    { dv = ""; t = ""
+      for (i = 1; i < NF; i++) { if ($i == "dev") dv = $(i + 1); if ($i == "table") t = $(i + 1) }
+      if (dv == d && t != "" && t != "local") { print t; exit } }'
+}
+
+# _want <4|6>：要不要加规则。要加返回 0，并给出 want_dev（该走的网卡）和 want_table（查哪张表）。
+# 不用加返回 1；看出来回包走错了、却找不到能走公网网卡的路由表，返回 2。
+_want() {
+  want_dev=""; want_table=""; nat_dev=""; nat_src=""
+  if [ "$1" = "6" ]; then _probe=$PROBE6; else _probe=$PROBE4; fi
+  # 公网网卡：写给客户端的地址在哪张网卡上；地址不在本机（云服务器的 NAT）就看 main 表的默认路由
+  for _a in $(_node_addrs "$1"); do
+    want_dev=$(_dev_of_addr "$1" "$_a")
+    [ -n "$want_dev" ] && break
+  done
+  [ -n "$want_dev" ] || want_dev=$(_main_dev "$1")
+  [ -n "$want_dev" ] || return 1
+  # 不带端口问一次：这是没有我们这条规则时，回包本来会走的路
+  _nat=$(ip "-$1" route get "$_probe" 2>/dev/null | head -1)
+  [ -n "$_nat" ] || return 1
+  nat_dev=$(_kw dev "$_nat")
+  nat_src=$(_kw src "$_nat")
+  if [ "$nat_dev" = "$want_dev" ]; then
+    [ -z "$nat_src" ] && return 1
+    _dev_has "$1" "$want_dev" "$nat_src" && return 1
+  fi
+  want_table=$(_table_for "$1" "$want_dev")
+  [ -n "$want_table" ] || return 2
+  return 0
+}
+
+_ours() { # _ours <4|6>：打印我们给这个端口加的规则，每行“优先级 路由表”
+  ip "-$1" rule show 2>/dev/null | awk -v p="$port" '
+    $0 ~ ("iif lo ipproto (udp|17) sport " p " lookup ") {
+      pr = $1; sub(":", "", pr); t = ""
+      for (i = 1; i < NF; i++) if ($i == "lookup") t = $(i + 1)
+      print pr, t }'
+}
+
+_del_ours() { # 只删“iif lo ipproto udp sport 本端口”这种我们自己的规则，你手动加的不碰
+  _do_n=0
+  for _pr in $(_ours "$1" | awk '{ print $1 }'); do
+    ip "-$1" rule del pref "$_pr" iif lo ipproto udp sport "$port" >/dev/null 2>&1 || true
+    _do_n=$((_do_n + 1))
+    [ "$_do_n" -ge 20 ] && break
+  done
+}
+
+_pick_pref() { # 找一个空着的优先级：不超过 8890，并且比机器上别的策略路由规则都小
+  ip "-$1" rule show 2>/dev/null | awk -v top="$PREF_TOP" '
+    { pr = $1; sub(":", "", pr); pr += 0; used[pr] = 1
+      if (pr == 0 || pr >= 32766) next
+      if ($0 ~ /iif lo ipproto (udp|17) sport [0-9]+ lookup /) next
+      if (min == "" || pr < min) min = pr }
+    END { c = top; if (min != "" && min - 1 < c) c = min - 1
+          while (c > 0 && (c in used)) c--
+          print c }'
+}
+
+_state_get() { # _state_get <4|6>：状态文件里这个地址族的那一行
+  awk -v f="$1" '$1 == f { print; exit }' "$STATE_DIR/$id" 2>/dev/null
+}
+
+_state_put() { # _state_put <4|6> <其余字段…>
+  _sf=$1; shift
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  { awk -v f="$_sf" '$1 != f' "$STATE_DIR/$id" 2>/dev/null; printf '%s %s\n' "$_sf" "$*"; } > "$STATE_DIR/$id.tmp" &&
+    mv -f "$STATE_DIR/$id.tmp" "$STATE_DIR/$id"
+}
+
+# _sync <4|6> <check|up>：check 只比较，up 把系统改成需要的样子
+_sync() {
+  _f=$1
+  _cur=$(_ours "$_f")
+  _cnt=$(printf '%s' "$_cur" | grep -c .)
+  _want "$_f"; _w=$?
+  if [ "$_w" = "0" ]; then
+    if [ "$_cnt" = "1" ] && [ "${_cur#* }" = "$want_table" ]; then
+      [ "$2" = "up" ] && _state_put "$_f" ok "${_cur%% *}" "$want_table" "$want_dev" "$port" "$nat_dev"
+      return 0
+    fi
+    # 内核太老加不上：记下来，巡检不再每分钟重试
+    if [ "$_cnt" = "0" ] && [ "$(_state_get "$_f" | awk '{ print $2 }')" = "old" ]; then return 0; fi
+    [ "$2" = "check" ] && return 1
+    _del_ours "$_f"
+    _pref=$(_pick_pref "$_f")
+    case "$_pref" in ''|*[!0-9]*|0) _state_put "$_f" fail - - "$want_dev" "$port" "$nat_dev"; return 1 ;; esac
+    if ! ip "-$_f" rule add pref "$_pref" iif lo ipproto udp sport "$port" lookup "$want_table" 2>"$ERRF"; then
+      # Linux 4.17 以前的内核（或很老的 ip 命令）不认 ipproto / sport
+      _state_put "$_f" old - - "$want_dev" "$port" "$nat_dev"
+      return 3
+    fi
+    # 加完再问一次系统，确认从这个端口发的 UDP 真的改走公网网卡了；没改过来就拆掉，不留没用的规则
+    if [ "$_f" = "6" ]; then _probe=$PROBE6; else _probe=$PROBE4; fi
+    _got=$(_kw dev "$(ip "-$_f" route get "$_probe" ipproto udp sport "$port" 2>/dev/null | head -1)")
+    if [ "$_got" != "$want_dev" ]; then
+      _del_ours "$_f"
+      _state_put "$_f" fail - "$want_table" "$want_dev" "$port" "$nat_dev"
+      return 1
+    fi
+    _state_put "$_f" ok "$_pref" "$want_table" "$want_dev" "$port" "$nat_dev"
+    return 0
+  fi
+  if [ "$_w" = "2" ]; then
+    [ "$2" = "up" ] && _state_put "$_f" notable - - "$want_dev" "$port" "$nat_dev"
+  fi
+  # 不需要规则：有就拆掉
+  if [ "$_cnt" != "0" ]; then
+    [ "$2" = "check" ] && return 1
+    _del_ours "$_f"
+  fi
+  [ "$2" = "up" ] && [ "$_w" = "1" ] && _state_put "$_f" none
+  return 0
+}
+
+_lock() { # 节点启动和巡检可能同时来，排队一个一个改
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  exec 9>"$STATE_DIR/.lock" || return 0
+  _lk=0
+  while ! flock -n 9 2>/dev/null; do
+    _lk=$((_lk + 1))
+    [ "$_lk" -ge 20 ] && break
+    sleep 1
+  done
+}
+
+_down() { # 端口优先用状态文件里记的（节点目录可能已经删了）
+  port=$(awk 'NF >= 6 && $6 ~ /^[0-9]+$/ { print $6; exit }' "$STATE_DIR/$id" 2>/dev/null)
+  if [ -z "$port" ]; then
+    _is_udp_node || true
+    _load || port=""
+  fi
+  if [ -n "$port" ]; then
+    _del_ours 4
+    _del_ours 6
+  fi
+  rm -f "$STATE_DIR/$id"
+}
+
+_has_policy() { # 机器上除了系统默认的三条规则，还有别的策略路由规则吗
+  for _hf in 4 6; do
+    ip "-$_hf" rule show 2>/dev/null | awk '{ pr = $1; sub(":", "", pr); if (pr != "0" && pr != "32766" && pr != "32767") f = 1 } END { exit !f }' && return 0
+  done
+  return 1
+}
+
+command -v ip >/dev/null 2>&1 || { [ "$act" = "need" ] && exit 1; exit 0; }
+case "$act" in
+  up)
+    _lock
+    if ! _is_udp_node || ! _load; then _down; exit 0; fi
+    _rc=0
+    for _f in 4 6; do
+      case " $fams " in
+        *" $_f "*) _sync "$_f" up || _rc=$? ;;
+        *) _del_ours "$_f"; _state_put "$_f" none ;;
+      esac
+    done
+    exit "$_rc"
+    ;;
+  down)
+    _lock
+    _down
+    exit 0
+    ;;
+  check)
+    if ! _is_udp_node || ! _load; then
+      [ -f "$STATE_DIR/$id" ] && exit 1
+      exit 0
+    fi
+    for _f in $fams; do _sync "$_f" check || exit 1; done
+    exit 0
+    ;;
+  show)
+    [ -f "$STATE_DIR/$id" ] || exit 0
+    while read -r _f _st _pr _tb _dv _pt _nd; do
+      if [ "$_f" = "6" ]; then _fn=IPv6; else _fn=IPv4; fi
+      case "$_st" in
+        ok) echo "${_fn}：回包本来会从 ${_nd} 发出去，已加规则让 UDP ${_pt} 的回包走 ${_dv}（规则优先级 ${_pr}，查路由表 ${_tb}）" ;;
+        old) echo "${_fn}：回包会从 ${_nd} 发出去（应该走 ${_dv}），但内核太老（4.17 以前），加不了按端口分的规则" ;;
+        notable) echo "${_fn}：回包会从 ${_nd} 发出去（应该走 ${_dv}），但找不到走 ${_dv} 的路由表，没法自动修" ;;
+        fail) echo "${_fn}：回包会从 ${_nd} 发出去（应该走 ${_dv}），加了规则也没改过来，已经拆掉" ;;
+      esac
+    done < "$STATE_DIR/$id"
+    exit 0
+    ;;
+  need)
+    _has_policy || exit 1
+    for _nd in "$NODES_DIR"/*/; do
+      id=$(basename "$_nd")
+      case "$id" in ''|*[!0-9]*) continue ;; esac
+      _is_udp_node && exit 0
+    done
+    exit 1
+    ;;
+esac
+echo "用法：xray-node-route up|down|check|show <节点编号>，或 xray-node-route need" >&2
+exit 2
+ROUTEEOF
+  chmod 700 "$_rb_dir/xray-node-route.tmp" || return 1
+  mv -f "$_rb_dir/xray-node-route.tmp" "$_rb_dir/xray-node-route" || return 1
+}
+
 # ---------- 巡检小程序 xray-node-watch ----------
 # 每分钟跑一次，平时几乎什么都不做，只做两件事：
 #   1. 端口跳跃规则自愈：防火墙服务（nftables、firewalld、ufw、iptables、netfilter-persistent）
@@ -1258,6 +1569,7 @@ PIDF=${XRAY_WATCH_PID:-/run/xray-node-watch.pid}
 LOG=${XRAY_WATCH_LOG:-/var/log/xray-node-watch.log}
 SELF="$BIN_DIR/xray-node-watch"
 HOP="$BIN_DIR/xray-node-hop"
+ROUTE="$BIN_DIR/xray-node-route"
 # 各系统里防火墙服务的名字。机器上有哪个，就把巡检挂在哪个后面。
 FW_UNITS="nftables.service firewalld.service ufw.service netfilter-persistent.service iptables.service ip6tables.service"
 FW_UNIT_DIRS=${XRAY_FW_UNIT_DIRS:-"$SD_DIR /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system"}
@@ -1278,7 +1590,11 @@ _has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d "$SD_RUN" ]; }
 # 节点服务正在跑吗？没在跑的节点不补规则、不开端口。
 _active() {
   if _has_systemd; then
-    systemctl is-active --quiet "hysteria-node@$1"
+    case "$(tr -d ' \r\n' < "$NODES_DIR/$1/core" 2>/dev/null)" in
+      sing-box) systemctl is-active --quiet "singbox-node@$1" ;;
+      xray) systemctl is-active --quiet "xray-node@$1" ;;
+      *) systemctl is-active --quiet "hysteria-node@$1" ;;
+    esac
     return
   fi
   if command -v rc-service >/dev/null 2>&1; then
@@ -1288,6 +1604,7 @@ _active() {
   for _ap in /proc/[0-9]*/cmdline; do
     case "$_ap" in "/proc/$$/"*) continue ;; esac
     tr '\000' ' ' < "$_ap" 2>/dev/null | grep -qF "$NODES_DIR/$1/config.yaml" && return 0
+    tr '\000' ' ' < "$_ap" 2>/dev/null | grep -qF "$NODES_DIR/$1/config.json" && return 0
   done
   return 1
 }
@@ -1318,6 +1635,30 @@ _heal_hop() {
     else
       : > "$_hfail"
       _log "节点 $_hid 的端口跳跃规则补不回来：$(printf '%s' "$_herr" | tr '\n' ' ' | cut -c1-300)"
+    fi
+  done
+}
+
+# ---- 回程路由自愈 ----
+# VPN 常常比节点晚启动，或者半路重连换了网卡：每分钟看一次 UDP 节点的回包该不该加规则、规则还在不在。
+_heal_route() {
+  [ -x "$ROUTE" ] || return 0
+  for _rd in "$NODES_DIR"/*/; do
+    [ -f "${_rd}node.txt" ] || continue
+    _rid=$(basename "$_rd")
+    case "$_rid" in ''|*[!0-9]*) continue ;; esac
+    _active "$_rid" || continue
+    "$ROUTE" check "$_rid" >/dev/null 2>&1 && continue
+    _rfail="$STATE_DIR/route-$_rid.fail"
+    if [ -f "$_rfail" ] && [ -n "$(find "$_rfail" -mmin -5 2>/dev/null)" ]; then
+      continue
+    fi
+    if "$ROUTE" up "$_rid" >/dev/null 2>&1; then
+      rm -f "$_rfail"
+      _log "节点 $_rid 的回程路由已按现在的网络改好：$("$ROUTE" show "$_rid" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+    else
+      : > "$_rfail"
+      _log "节点 $_rid 的回程路由没改好：$("$ROUTE" show "$_rid" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
     fi
   done
 }
@@ -1447,6 +1788,7 @@ _tick() {
   # 先开关证书端口，再补跳跃规则：firewalld 重载时可能把跳跃规则一起清掉，放在后面补更稳
   _acme_tick "$1"
   _heal_hop
+  _heal_route
 }
 
 # ---- 挂上 / 卸掉巡检 ----
@@ -1455,6 +1797,8 @@ _needed() {
     [ -f "${_nd}hop" ] && return 0
     [ -f "${_nd}fw_acme" ] && return 0
   done
+  # 有 UDP 节点、机器上又有策略路由：要每分钟看一下回程路由
+  [ -x "$ROUTE" ] && "$ROUTE" need >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -2190,6 +2534,9 @@ _delete_node() {
   # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
   _x_hop="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop"
   [ -x "$_x_hop" ] && "$_x_hop" down "$_d_id" >/dev/null 2>&1
+  # 拆掉回程路由规则（没加过时什么都不做）
+  _x_rt="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-route"
+  [ -x "$_x_rt" ] && "$_x_rt" down "$_d_id" >/dev/null 2>&1
   # 证书用的端口如果还开着，也关上
   _x_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
   [ -x "$_x_watch" ] && "$_x_watch" acme-drop "$_d_id" >/dev/null 2>&1
@@ -2568,6 +2915,8 @@ _stop_remove_svc() {
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.yaml" >/dev/null 2>&1
   # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
   [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_x_id" >/dev/null 2>&1
+  # 拆掉回程路由规则（没加过时什么都不做）
+  [ -x /usr/local/bin/xray-node-route ] && /usr/local/bin/xray-node-route down "$_x_id" >/dev/null 2>&1
   sleep 1
 }
 
@@ -2669,7 +3018,8 @@ _uninstall_all() {
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
   rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
-  rm -rf /run/xray-node-hop /run/xray-node-watch
+  rm -f /usr/local/bin/xray-node-route /usr/local/bin/xray-node-route.tmp
+  rm -rf /run/xray-node-hop /run/xray-node-watch /run/xray-node-route
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
   # IPv6 开关是整台服务器的设置，不跟着节点删。关过的话提醒一下怎么打开。
   if [ -f /etc/sysctl.d/99-xray-node-ipv6.conf ]; then
@@ -2866,6 +3216,7 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
   _si_svc="xray-node-${_si_id}"
   install_expire_bins || true
   install_hop_bin || true
+  install_route_bin || true
   # Hysteria2 用普通用户 xray-node 运行（只给“绑 1024 以下端口”这一项权限），
   # 万一程序有漏洞，别人也拿不到 root。端口跳跃的转发规则要 root 才能写，
   # 所以用 systemd 的 “+” 前缀单独以 root 身份跑 xray-node-hop。
@@ -2907,6 +3258,9 @@ NoNewPrivileges=true"
       _si_hop_pre="ExecStartPre=-${_si_plus}/usr/local/bin/xray-node-hop up %i"
       _si_hop_post="ExecStopPost=-${_si_plus}/usr/local/bin/xray-node-hop down %i"
     fi
+    # 回程路由：UDP 节点在有策略路由的机器上，回包要走公网网卡（不是 UDP 节点时这一步什么都不做）
+    _si_rt_pre="ExecStartPre=-${_si_plus}/usr/local/bin/xray-node-route up %i"
+    _si_rt_post="ExecStopPost=-${_si_plus}/usr/local/bin/xray-node-route down %i"
     cat > "$_si_tpl" <<EOF
 [Unit]
 Description=${_si_tpl_desc}
@@ -2917,8 +3271,10 @@ User=${_si_user}
 ${_si_unit_env}
 ${_si_harden}
 ${_si_hop_pre}
+${_si_rt_pre}
 ExecStart=${_si_tpl_exec}
 ${_si_hop_post}
+${_si_rt_post}
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -2964,9 +3320,12 @@ start_pre() {
     checkpath -f -m 0644 -o root:root "\$output_log"
     # 端口跳跃：启动前打开转发（没开跳跃的节点什么都不做）
     ${_si_rc_hop_up}
+    # 回程路由：有策略路由的机器上，UDP 回包走公网网卡（不需要时什么都不做）
+    /usr/local/bin/xray-node-route up ${_si_id} >/dev/null 2>&1 || true
 }
 stop_post() {
     ${_si_rc_hop_down}
+    /usr/local/bin/xray-node-route down ${_si_id} >/dev/null 2>&1 || true
 }
 RCEOF
     chmod +x /etc/init.d/${_si_svc}
@@ -2986,6 +3345,7 @@ RCEOF
       _hy_export_env
       /usr/local/bin/xray-node-hop up "$_si_id" >/dev/null 2>&1 || true
     fi
+    /usr/local/bin/xray-node-route up "$_si_id" >/dev/null 2>&1 || true
     pkill -f "$_si_cfg" >/dev/null 2>&1
     # _si_args 故意不加引号，拆成多个参数
     # shellcheck disable=SC2086
@@ -3647,6 +4007,53 @@ _quic_unblock_all() {
       rm -f "$_qu_new"
     fi
     _cq_fix_nodetxt "${_qu_d%/}" || true
+  done
+}
+
+# 回程路由的提示：有规则加上（或者该加却加不上）时，用大白话说明一下。
+_route_note() { # _route_note <节点id> <UDP 端口>
+  _rn_show=$("${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-route" show "$1" 2>/dev/null)
+  [ -n "$_rn_show" ] || return 0
+  warn "节点 $1：这台机器有策略路由（常见于装了 L2TP、WireGuard 等 VPN），没打标记的流量默认走 VPN 网卡。UDP 节点的回包要是也走那边，客户端收不到，节点就连不上。"
+  printf '%s\n' "$_rn_show" | sed 's/^/  /'
+  case "$_rn_show" in
+    *内核太老*)
+      warn "解决办法：把内核升级到 4.17 以上；或者把节点配置里的监听地址从全部地址（0.0.0.0 或 ::）改成公网网卡上的那个地址，再重启节点。" ;;
+    *没法自动修*|*已经拆掉*)
+      warn "这种情况脚本修不了：请在 VPN 的设置里，让这台服务器自己从 UDP ${2:-节点端口} 发出的包走公网网卡。" ;;
+    *)
+      info "这条规则只管本机从 UDP ${2:-节点端口} 发出的包（端口跳跃的回包也算），别的程序不受影响。节点启动时自动加、停掉时自动拆，每分钟检查一次。" ;;
+  esac
+}
+
+# 更新模式：给老节点装上回程路由。服务模板里还没有这一步的，重启一次换上新模板；
+# 然后马上按现在的网络核对一次（不用等重启）。
+_route_refresh_all() {
+  install_route_bin || return 0
+  _rr_bin=${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-route
+  for _rr_d in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/; do
+    if [ ! -f "${_rr_d}core" ] || [ ! -f "${_rr_d}node.txt" ]; then continue; fi
+    _rr_id=$(basename "$_rr_d")
+    case "$_rr_id" in ''|*[!0-9]*) continue ;; esac
+    if [ -d /run/systemd/system ]; then
+      case "$(tr -d ' \r\n' < "${_rr_d}core" 2>/dev/null)" in
+        sing-box) _rr_unit=/etc/systemd/system/singbox-node@.service ;;
+        hysteria) _rr_unit=/etc/systemd/system/hysteria-node@.service ;;
+        *) _rr_unit=/etc/systemd/system/xray-node@.service ;;
+      esac
+    else
+      _rr_unit=/etc/init.d/xray-node-${_rr_id}
+    fi
+    if [ -f "$_rr_unit" ] && ! grep -q 'xray-node-route' "$_rr_unit" 2>/dev/null; then
+      _svc_restart "$_rr_id"
+      _rr_port=""; _rr_proto="tcp"
+      if _rr_pp=$(_node_port "$_rr_id"); then _rr_port=${_rr_pp%% *}; _rr_proto=${_rr_pp#* }; fi
+      if [ -n "$_rr_port" ] && ! wait_for_port "$_rr_port" "$_rr_proto" 15; then
+        warn "节点 $_rr_id 重启后端口 $_rr_port 没监听，请运行 jiedian 看一下，或者重启服务器再试"
+      fi
+    fi
+    "$_rr_bin" up "$_rr_id" >/dev/null 2>&1
+    _route_note "$_rr_id" "$(awk '$2 == "udp" { print $1; exit }' "${_rr_d}fw_info" 2>/dev/null)"
   done
 }
 
@@ -4404,6 +4811,7 @@ _drop_partial_node() {
   pkill -f "${_dp_dir%/}/config.json" >/dev/null 2>&1
   pkill -f "${_dp_dir%/}/config.yaml" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_dp_id" >/dev/null 2>&1
+  [ -x /usr/local/bin/xray-node-route ] && /usr/local/bin/xray-node-route down "$_dp_id" >/dev/null 2>&1
   # 装到一半为这个节点放行的防火墙端口（证书用的 fw_acme、节点自己的 fw_info）也撤掉
   _dp_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
   _dp_d="${_dp_dir%/}"
@@ -4898,6 +5306,8 @@ if [ "$UPDATE_MODE" = "1" ]; then
       info "$_ucore 升级完成"
       ) || _u_any_fail=1
     done
+    # UDP 节点的回程路由（有策略路由的机器上，回包要走公网网卡）
+    _route_refresh_all
     # 刷新 jiedian / shanjiedian（脚本可能修过它们）
     write_helper_cmds
     info "jiedian / shanjiedian 命令已同步为最新版"
@@ -6022,6 +6432,13 @@ trap - EXIT
 write_helper_cmds
 info "已安装 jiedian 命令：以后输入 jiedian 就能看所有节点"
 info "已安装 shanjiedian 命令：输入 shanjiedian 可管理节点（查看/删除）"
+
+# ---------- 14a. UDP 节点的回程路由 ----------
+# 服务启动时已经核对过一次；现在 node.txt 写好了（里面有写给客户端的地址），按它再核对一次。
+if [ -x /usr/local/bin/xray-node-route ]; then
+  /usr/local/bin/xray-node-route up "$NODE_ID" >/dev/null 2>&1
+  _route_note "$NODE_ID" "$PORT"
+fi
 
 # ---------- 14b. BBR 加速：检测，没开就自动开 ----------
 # BBR 是 Linux 内核自带的一种 TCP 加速算法，网络差时速度更稳，打开不影响别的程序。
