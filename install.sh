@@ -47,8 +47,9 @@
 #       OpenVZ、LXC 小鸡常常没有 nat 转发的权限，脚本会先试，做不了就说明原因并关掉跳跃。
 # 混淆（salamander）：Hysteria2 给每个包再加一层“乱码”，让它看起来不像 QUIC。
 #       开了以后客户端也必须填同一个混淆密码。
-# 拦截 QUIC：QUIC 是走 UDP 443 端口的新版网页协议。代理走 QUIC 常常更慢、更容易断，
-#       服务器端直接拒绝 UDP 443，浏览器和 App 会自动改走普通的 TCP，更稳。
+# 拦截 QUIC（阻止 QUIC / block-quic）：QUIC 是走 UDP 443 端口的新版网页协议。代理走 QUIC 常常更慢、
+#       更容易断。这是客户端 App 里的开关（服务器上不拦）：打开后浏览器和 App 自动改走普通的 TCP。
+#       脚本给 Loon / Surge 生成的节点行已经写好这个开关，粘贴导入后自动打开。
 # 镜像 / NAT64：只有 IPv6 的机器连不上只有 IPv4 的 github.com。镜像是“替你转一手”的网站；
 #       NAT64 是一种公共 DNS，让 IPv6 机器也能借道访问 IPv4 网站。脚本下载时临时用一下，用完还原。
 # 校验值（SHA256）：文件的“指纹”。下载完和官方公布的指纹对一下，一样才说明文件没被改过。
@@ -3290,12 +3291,6 @@ ignoreClientBandwidth: true
 # 测速接口关掉，别人不能拿它来识别这是 Hysteria2。
 speedTest: false
 
-# 拦截 QUIC：经过节点的 UDP 443（QUIC/HTTP3）直接拒绝，App 会自动改走 TCP，更快更稳。
-# 只管“经过节点出去”的流量，不影响 Hysteria2 自己收发的 UDP。
-acl:
-  inline:
-    - reject(all, udp/443)
-
 $_hy_masq
 $_hy_quic
 EOF
@@ -3384,6 +3379,274 @@ _hy_migrate_hop_all() {
     rm -f "${_mh_d}hop"
     _svc_restart "$_mh_id"
     warn "节点 $_mh_id 换成新的端口跳跃写法后没起来，已恢复原来的配置"
+  done
+}
+
+# ---------- 阻止 QUIC：在客户端里打开，不在服务器上拦 ----------
+# QUIC 是走 UDP 443 的新版网页协议（HTTP/3）。经过代理时常常更慢、更容易断，
+# 所以很多 App 有一个「阻止 QUIC」开关（Loon 写 block-quic=true，Surge 写 block-quic=on）：
+# 打开后浏览器和 App 发现 QUIC 走不通，会自动改走普通的 TCP。
+# 这个开关是客户端自己的设置。分享链接（vless:// 这种）里没有通用的写法，
+# 所以脚本另外给 Loon、Surge 各生成一行“节点配置”，里面已经写好这个开关，粘贴导入后自动打开。
+# 下面这些函数用 CQ_ 开头的变量拼出这些行：
+#   CQ_PROTO 协议（vless/trojan/vmess/ss/anytls/hy2/tuic）  CQ_NAME 节点名
+#   CQ_HOST 服务器地址（IPv6 不带方括号）  CQ_PORT 端口  CQ_UUID  CQ_PASS 密码
+#   CQ_SNI 伪装域名  CQ_PBK / CQ_SID REALITY 公钥和 short-id  CQ_PATH WebSocket 路径
+
+_cq_ok() { # 值不能空，也不能带逗号、引号、空白：这些字符会把一整行配置切坏
+  for _cq_v in "$@"; do
+    case "$_cq_v" in
+      ''|*[,\"\ \	]*) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+_cq_loon_line() { # 打印 Loon 节点行（官方格式：节点名 = 协议,地址,端口,…）。Loon 不支持的协议什么都不打印
+  _cq_ok "$CQ_HOST" "$CQ_PORT" || return 0
+  case "$CQ_NAME" in ''|*[,=]*) return 0 ;; esac
+  case "$CQ_PROTO" in
+    vless)
+      _cq_ok "$CQ_UUID" "$CQ_PBK" "$CQ_SID" "$CQ_SNI" || return 0
+      printf '%s = VLESS,%s,%s,"%s",transport=tcp,flow=xtls-rprx-vision,public-key="%s",short-id=%s,over-tls=true,sni=%s,udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PBK" "$CQ_SID" "$CQ_SNI"
+      ;;
+    trojan)
+      _cq_ok "$CQ_PASS" "$CQ_PBK" "$CQ_SID" "$CQ_SNI" || return 0
+      printf '%s = Trojan,%s,%s,"%s",transport=tcp,public-key="%s",short-id=%s,sni=%s,udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$CQ_PBK" "$CQ_SID" "$CQ_SNI"
+      ;;
+    vmess)
+      _cq_ok "$CQ_UUID" "$CQ_PATH" || return 0
+      printf '%s = VMess,%s,%s,auto,"%s",transport=ws,alterId=0,path=%s,over-tls=false,udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PATH"
+      ;;
+    ss)
+      _cq_ok "$CQ_PASS" || return 0
+      printf '%s = Shadowsocks,%s,%s,2022-blake3-aes-128-gcm,"%s",udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS"
+      ;;
+    anytls)
+      _cq_ok "$CQ_PASS" "$CQ_PBK" "$CQ_SID" "$CQ_SNI" || return 0
+      printf '%s = AnyTLS,%s,%s,"%s",sni=%s,public-key="%s",short-id=%s,udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$CQ_SNI" "$CQ_PBK" "$CQ_SID"
+      ;;
+  esac
+  return 0
+}
+
+_cq_surge_line() { # 打印 Surge 节点行。Surge 不支持 VLESS 和 REALITY，这几种什么都不打印
+  _cq_ok "$CQ_HOST" "$CQ_PORT" || return 0
+  case "$CQ_NAME" in ''|*[,=]*) return 0 ;; esac
+  case "$CQ_PROTO" in
+    vmess)
+      _cq_ok "$CQ_UUID" "$CQ_PATH" || return 0
+      printf '%s = vmess, %s, %s, username=%s, ws=true, ws-path=%s, vmess-aead=true, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PATH"
+      ;;
+    ss)
+      _cq_ok "$CQ_PASS" || return 0
+      printf '%s = ss, %s, %s, encrypt-method=2022-blake3-aes-128-gcm, password=%s, udp-relay=true, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS"
+      ;;
+    tuic)
+      _cq_ok "$CQ_UUID" "$CQ_PASS" || return 0
+      printf '%s = tuic-v5, %s, %s, uuid=%s, password=%s, alpn=h3, sni=www.samsung.com, skip-cert-verify=true, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PASS"
+      ;;
+  esac
+  return 0
+}
+
+_cq_section() { # 打印 node.txt 里“拦截 QUIC”这一段
+  printf "拦截 QUIC（阻止 QUIC / block-quic）：这是客户端 App 里的开关，服务器上不拦。\n"
+  printf "  QUIC 是走 UDP 443 的新版网页协议，经过代理时常常更慢、更容易断。打开后 App 会自动改走 TCP，更稳。\n"
+  if [ "$CQ_PROTO" = "hy2" ]; then
+    printf "  上面给 Loon / Surge 粘贴的那几行已经写好这个开关，导入后自动打开。\n"
+  else
+    _cq_l=$(_cq_loon_line)
+    _cq_s=$(_cq_surge_line)
+    if [ -n "$_cq_l" ]; then
+      printf "Loon 可粘贴这一行（已写好 block-quic=true，导入后自动打开阻止 QUIC）:\n%s\n" "$_cq_l"
+    fi
+    if [ -n "$_cq_s" ]; then
+      printf "Surge 可粘贴这一行（已写好 block-quic=on）:\n%s\n" "$_cq_s"
+    fi
+  fi
+  printf "  用上面的分享链接导入时，链接里带不了这个开关，请自己打开:\n"
+  printf "  Loon / Surge：在这个节点的设置里打开「阻止 QUIC」（Block QUIC）\n"
+  printf "  小火箭 Shadowrocket：配置文件的 [General] 里写 block-quic = all-proxy\n"
+  printf "  Clash / mihomo / Stash：rules 最前面加一行 - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT\n"
+  printf '  sing-box：route 的 rules 最前面加 { "network": "udp", "port": 443, "action": "reject" }\n'
+}
+
+_cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.txt 读出 CQ_ 变量
+  _cq_nt="$1/node.txt"
+  [ -f "$_cq_nt" ] || return 1
+  _cq_link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic)://' "$_cq_nt" 2>/dev/null | tr -d '\r')
+  case "$_cq_link" in
+    vless://*) CQ_PROTO=vless ;;
+    trojan://*) CQ_PROTO=trojan ;;
+    vmess://*) CQ_PROTO=vmess ;;
+    ss://*) CQ_PROTO=ss ;;
+    anytls://*) CQ_PROTO=anytls ;;
+    hysteria2://*) CQ_PROTO=hy2 ;;
+    tuic://*) CQ_PROTO=tuic ;;
+    *) return 1 ;;
+  esac
+  CQ_NAME=$(_cq_kv "节点名")
+  [ -n "$CQ_NAME" ] || CQ_NAME=$(head -1 "$1/name" 2>/dev/null | tr -d '\r')
+  [ -n "$CQ_NAME" ] || CQ_NAME="节点$(basename "$1")"
+  CQ_HOST=$(_cq_kv "地址")
+  CQ_PORT=$(_cq_kv "端口")
+  CQ_UUID=$(_cq_kv "UUID")
+  CQ_PASS=$(_cq_kv "密码")
+  CQ_SNI=$(_cq_kv "伪装域名")
+  CQ_PATH=$(_cq_kv "WS 路径")
+  CQ_PBK=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
+  CQ_SID=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]sid=\([^&#]*\).*/\1/p')
+  return 0
+}
+
+_cq_kv() { # 读 node.txt 里“名字: 值”那一行的值
+  sed -n "s/^$1: //p" "$_cq_nt" 2>/dev/null | head -1 | tr -d '\r'
+}
+
+# 老节点的 node.txt 里写着“已在服务器上打开”，换成新说明，并补上 Loon / Surge 行。
+_cq_fix_nodetxt() { # _cq_fix_nodetxt <节点目录>
+  _cf_nt="$1/node.txt"
+  grep -q '^拦截 QUIC: \|^想在客户端也拦：' "$_cf_nt" 2>/dev/null || return 0
+  (
+    CQ_PROTO=""; CQ_NAME=""; CQ_HOST=""; CQ_PORT=""; CQ_UUID=""; CQ_PASS=""
+    CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""
+    _cq_from_nodetxt "$1" || CQ_PROTO=""
+    _cq_section
+  ) > "$_cf_nt.quic" 2>/dev/null || { rm -f "$_cf_nt.quic"; return 1; }
+  awk -v sec="$_cf_nt.quic" '
+    /^拦截 QUIC: / {
+      if (!done) { while ((getline l < sec) > 0) print l; done = 1 }
+      next
+    }
+    /^想在客户端也拦：/ {
+      if (!done) { while ((getline l < sec) > 0) print l; done = 1 }
+      next
+    }
+    { print }
+  ' "$_cf_nt" > "$_cf_nt.tmp" && mv -f "$_cf_nt.tmp" "$_cf_nt"
+  rm -f "$_cf_nt.quic" "$_cf_nt.tmp"
+  chmod 600 "$_cf_nt" 2>/dev/null
+  return 0
+}
+
+# 去掉旧版写进服务器配置的“拦 UDP 443”。只认本脚本当初写的那几行原样，
+# 你自己改过的配置不动。改好打印到标准输出；没有要改的返回 1。
+_cq_strip_xray() { # _cq_strip_xray <config.json>
+  awk '
+    BEGIN {
+      r = "  \"routing\": { \"rules\": [ { \"type\": \"field\", \"network\": \"udp\", \"port\": \"443\", \"outboundTag\": \"block\" } ] },"
+      o = "  \"outbounds\": [ { \"protocol\": \"freedom\", \"tag\": \"direct\" }, { \"protocol\": \"blackhole\", \"tag\": \"block\" } ]"
+    }
+    { sub(/\r$/, "") }
+    $0 == r { hr = 1; next }
+    $0 == o { print "  \"outbounds\": [ { \"protocol\": \"freedom\" } ]"; ho = 1; next }
+    { print }
+    END { exit (hr && ho) ? 0 : 1 }
+  ' "$1"
+}
+
+_cq_strip_singbox() { # _cq_strip_singbox <config.json>
+  awk '
+    BEGIN {
+      o = "  \"outbounds\": [ { \"type\": \"direct\" } ],"
+      r = "  \"route\": { \"rules\": [ { \"network\": \"udp\", \"port\": 443, \"action\": \"reject\" } ] }"
+    }
+    { sub(/\r$/, ""); line[NR] = $0 }
+    END {
+      for (i = 1; i < NR; i++) if (line[i] == o && line[i + 1] == r) { hit = i; break }
+      if (!hit) exit 1
+      for (i = 1; i <= NR; i++) {
+        if (i == hit) { print "  \"outbounds\": [ { \"type\": \"direct\" } ]"; continue }
+        if (i == hit + 1) continue
+        print line[i]
+      }
+    }
+  ' "$1"
+}
+
+_cq_strip_hysteria() { # _cq_strip_hysteria <config.yaml>：只删 acl 里只有这一条 reject(all, udp/443) 的情况
+  awk '
+    { sub(/\r$/, ""); line[NR] = $0 }
+    END {
+      for (i = 1; i + 2 <= NR; i++) {
+        if (line[i] == "acl:" && line[i + 1] == "  inline:" && line[i + 2] == "    - reject(all, udp/443)" && line[i + 3] !~ /^[[:space:]]/) { hit = i; break }
+      }
+      if (!hit) exit 1
+      from = hit; to = hit + 2
+      # 连同上面两行说明一起删；下面紧跟的空行也删掉
+      if (from > 2 && line[from - 1] ~ /^# 只管“经过节点出去”的流量/ && line[from - 2] ~ /^# 拦截 QUIC：/) from -= 2
+      if (to < NR && line[to + 1] == "") to++
+      for (i = 1; i <= NR; i++) if (i < from || i > to) print line[i]
+    }
+  ' "$1"
+}
+
+# 更新模式：把所有老节点服务器上的“拦 QUIC”去掉。改完先校验配置，再重启；
+# 端口没起来就换回原来的配置再启动，保证节点不会被弄断。
+_quic_unblock_all() {
+  for _qu_d in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/; do
+    if [ ! -f "${_qu_d}core" ] || [ ! -f "${_qu_d}node.txt" ]; then continue; fi
+    _qu_id=$(basename "$_qu_d")
+    case "$_qu_id" in ''|*[!0-9]*) continue ;; esac
+    _qu_core=$(tr -d ' \r\n' < "${_qu_d}core" 2>/dev/null)
+    case "$_qu_core" in
+      xray) _qu_cfg="${_qu_d}config.json" ;;
+      sing-box) _qu_cfg="${_qu_d}config.json" ;;
+      hysteria) _qu_cfg="${_qu_d}config.yaml" ;;
+      *) continue ;;
+    esac
+    # 临时文件要保留 .json / .yaml 结尾：Xray 是看文件结尾来认配置格式的
+    _qu_new="${_qu_cfg%.*}.noquic.${_qu_cfg##*.}"
+    _qu_hit=1
+    case "$_qu_core" in
+      xray) _cq_strip_xray "$_qu_cfg" > "$_qu_new" 2>/dev/null || _qu_hit=0 ;;
+      sing-box) _cq_strip_singbox "$_qu_cfg" > "$_qu_new" 2>/dev/null || _qu_hit=0 ;;
+      hysteria) _cq_strip_hysteria "$_qu_cfg" > "$_qu_new" 2>/dev/null || _qu_hit=0 ;;
+    esac
+    if [ "$_qu_hit" = "1" ] && [ -s "$_qu_new" ]; then
+      # 先用内核自带的检查命令看新配置对不对，不对就不换
+      _qu_bad=""
+      if [ "$_qu_core" = "xray" ] && [ -x "$XRAY_BIN" ]; then
+        "$XRAY_BIN" -test -config "$_qu_new" >/dev/null 2>&1 || _qu_bad=1
+      elif [ "$_qu_core" = "sing-box" ] && [ -x "$SB_BIN" ]; then
+        "$SB_BIN" check -c "$_qu_new" >/dev/null 2>&1 || _qu_bad=1
+      fi
+      if [ -n "$_qu_bad" ]; then
+        rm -f "$_qu_new"
+        warn "节点 $_qu_id 去掉服务器端拦 QUIC 后配置校验没通过，保持原样"
+        continue
+      elif cp -a "$_qu_cfg" "${_qu_cfg}.bak-quic"; then
+        cat "$_qu_new" > "$_qu_cfg" && rm -f "$_qu_new"
+        _svc_restart "$_qu_id"
+        _qu_port=""; _qu_proto="tcp"
+        if _qu_pp=$(_node_port "$_qu_id"); then _qu_port=${_qu_pp%% *}; _qu_proto=${_qu_pp#* }; fi
+        if [ -n "$_qu_port" ] && wait_for_port "$_qu_port" "$_qu_proto" 15; then
+          rm -f "${_qu_cfg}.bak-quic"
+          info "节点 $_qu_id：已去掉服务器端拦 QUIC（以后在客户端里打开「阻止 QUIC」）"
+        else
+          mv -f "${_qu_cfg}.bak-quic" "$_qu_cfg"
+          _svc_restart "$_qu_id"
+          warn "节点 $_qu_id 改完后端口没起来，已换回原来的配置"
+          continue
+        fi
+      else
+        rm -f "$_qu_new"
+        warn "节点 $_qu_id 的配置备份失败（磁盘满了？），这次先不改"
+        continue
+      fi
+    else
+      rm -f "$_qu_new"
+    fi
+    _cq_fix_nodetxt "${_qu_d%/}" || true
   done
 }
 
@@ -4302,14 +4565,14 @@ fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   while true; do
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法；Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
+  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
   printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
-    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; break ;;
+    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; _quic_unblock_all; break ;;
     2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
@@ -5045,8 +5308,7 @@ case "$PROTO" in
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
-  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
-  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
     ;;
@@ -5077,8 +5339,7 @@ EOF
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
-  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
-  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
     ;;
@@ -5101,8 +5362,7 @@ EOF
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
     }
   ],
-  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
-  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
     ;;
@@ -5122,8 +5382,7 @@ EOF
       }
     }
   ],
-  "routing": { "rules": [ { "type": "field", "network": "udp", "port": "443", "outboundTag": "block" } ] },
-  "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
     ;;
@@ -5201,19 +5460,6 @@ info "配置文件已写入"
 else
 # ---------- sing-box 配置（AnyTLS / TUIC） ----------
 SB_CONF="$NODE_DIR/config.json"
-# 拦截 QUIC（UDP 443）：sing-box 1.11 起才有 "action": "reject" 这种写法，更老的版本写了会起不来，只好不加。
-SB_ROUTE=""
-_sb_v=$(_ver_num "$("$SB_BIN" version 2>/dev/null | head -1)")
-_sb_maj=${_sb_v%%.*}; _sb_rest=${_sb_v#*.}; _sb_min=${_sb_rest%%.*}
-case "$_sb_maj.$_sb_min" in
-  *[!0-9.]*|.*|*.) _sb_maj=0; _sb_min=0 ;;
-esac
-if [ "$_sb_maj" -gt 1 ] || { [ "$_sb_maj" -eq 1 ] && [ "$_sb_min" -ge 11 ]; }; then
-  SB_ROUTE=',
-  "route": { "rules": [ { "network": "udp", "port": 443, "action": "reject" } ] }'
-else
-  warn "机器上原有的 sing-box 版本太老（${_sb_v:-未知}），不支持服务器端拦截 QUIC。节点照常能用，建议在客户端里打开「阻止 QUIC」。"
-fi
 if [ "$IPVER" = "6" ]; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   anytls)
@@ -5238,7 +5484,7 @@ case "$PROTO" in
       }
     }
   ],
-  "outbounds": [ { "type": "direct" } ]${SB_ROUTE}
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     ;;
@@ -5262,7 +5508,7 @@ EOF
       }
     }
   ],
-  "outbounds": [ { "type": "direct" } ]${SB_ROUTE}
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     ;;
@@ -5709,7 +5955,7 @@ fi
       if [ -n "$HY_MPORT" ]; then
         _hy_loon_tail=",server-ports=\"${HY_MPORT}\",hop-interval=30"
       fi
-      printf "Loon 可粘贴这一行:\n"
+      printf "Loon 可粘贴这一行（已写好 block-quic=true，导入后自动打开阻止 QUIC）:\n"
       printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail"
       if [ -n "$LINK_EXTRA" ]; then
@@ -5721,6 +5967,18 @@ fi
         printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
           "${NODE_NAME}-v6" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2"
       fi
+      # Surge：自签证书用证书指纹锁定（server-cert-fingerprint-sha256），跳跃端口用分号隔开。
+      _hy_surge_cert="server-cert-fingerprint-sha256=${HY2_PIN}"
+      [ -n "$HY2_DOMAIN" ] && _hy_surge_cert="skip-cert-verify=false"
+      _hy_surge_obfs=""
+      [ "$HY2_USE_OBFS" = "1" ] && _hy_surge_obfs=", salamander-password=${HY2_OBFS}"
+      _hy_surge_hop=""
+      if [ -n "$HY_MPORT" ]; then
+        _hy_surge_hop=", port-hopping=\"$(printf '%s' "$HY_MPORT" | tr ',' ';')\", port-hopping-interval=30"
+      fi
+      printf "Surge 可粘贴这一行（已写好 block-quic=on）:\n"
+      printf "%s = hysteria2, %s, %s, password=%s, sni=%s, %s%s%s, block-quic=on\n" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_surge_cert" "$_hy_surge_obfs" "$_hy_surge_hop"
       # mihomo（Clash Meta、Clash Verge、FlClash 用的内核）原生支持端口跳跃：ports + hop-interval。
       printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
       printf "  - name: %s\n    type: hysteria2\n    server: %s\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
@@ -5737,12 +5995,17 @@ fi
       ;;
     tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
   esac
-  if { [ "$PROTO" = "anytls" ] || [ "$PROTO" = "tuic" ]; } && [ -z "$SB_ROUTE" ]; then
-    printf "拦截 QUIC: 机器上的 sing-box 太老，服务器上没打开，请在客户端里打开。\n"
-  else
-    printf "拦截 QUIC: 已在服务器上打开。经过节点的 UDP 443（QUIC/HTTP3）会被拒绝，App 自动改走 TCP，更快更稳，客户端不用另外设置。\n"
-  fi
-  printf "想在客户端也拦：Loon 打开 block-quic；Clash / mihomo 在 rules 最前面加一行 - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT\n"
+  # 拦截 QUIC 是客户端的开关：给 Loon / Surge 各拼一行已经打开它的节点配置，再说明别的 App 怎么开
+  CQ_PROTO="$PROTO"; CQ_NAME="$NODE_NAME"; CQ_HOST="$SERVER_IP"; CQ_PORT="$LINK_PORT"
+  CQ_UUID="${UUID:-}"; CQ_SNI="${REALITY_DOMAIN:-}"; CQ_PBK="${REALITY_PUB:-}"; CQ_SID="${REALITY_SID:-}"
+  CQ_PATH="${WS_PATH:-}"; CQ_PASS=""
+  case "$PROTO" in
+    trojan) CQ_PASS="$TROJAN_PASS" ;;
+    ss)     CQ_PASS="$SS_PASS" ;;
+    anytls) CQ_PASS="$ANYTLS_PASS" ;;
+    tuic)   CQ_PASS="$TUIC_PASS" ;;
+  esac
+  _cq_section
   printf -- "----------------------------------------------\n"
   if [ "$NODE_KIND" = "timed" ]; then
     printf "种类: 定时节点\n"

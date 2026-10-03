@@ -678,7 +678,8 @@ class HysteriaHopTest(unittest.TestCase):
         self.assertNotIn("block-quic=false", source)
         # 不再让 Hysteria2 自己写转发规则（它会把端口排序后去听最小的那个）
         self.assertNotIn("HYSTERIA_FIREWALL_BACKEND", source)
-        self.assertIn("reject(all, udp/443)", source)
+        # 拦截 QUIC 改成客户端开关，服务器配置里不再拒绝 UDP 443
+        self.assertNotIn("    - reject(all, udp/443)\n\n$_hy_masq", source)
         self.assertIn("ignoreClientBandwidth: true", source)
         self.assertIn("ExecStartPre=-${_si_plus}/usr/local/bin/xray-node-hop up %i", source)
 
