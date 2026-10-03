@@ -52,7 +52,7 @@ info() { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[注意]${NC} %s\n" "$1"; }
 err()  { printf "${RED}[出错]${NC} %s\n" "$1"; }
 step() { printf "\n${CYAN}${BOLD}%s${NC}\n" "$1"; }
-die()  { err "$1"; exit 1; }
+die()  { _dns64_off 2>/dev/null; err "$1"; exit 1; }
 
 # ask：问你一个问题并把回答存进变量。直接回车就用方括号里的默认值。
 ask() { # ask "提示文字" "默认值" 变量名
@@ -353,6 +353,182 @@ _http_save() { # _http_save URL 输出文件 [请求头]
     return $?
   fi
   return 127
+}
+
+# ---------- 下载工具：GitHub 连不上时换镜像、换 NAT64 ----------
+# 纯 IPv6 小鸡连不上 github.com（GitHub 没有 IPv6 地址）。按下面的顺序一条条试：
+#   1. 直接连 GitHub（API 和 github.com 两条路）
+#   2. 有 IPv6 地址的 GitHub 下载镜像（在原地址前面加一段镜像网址）
+#   3. 临时把 DNS 换成公共 NAT64/DNS64，让 IPv6 机器也能连上 IPv4 的 GitHub，下载完马上换回去
+# 镜像是别人搭的中转站，所以下载完一定对一遍官方公布的 SHA256 校验值，对不上就不装。
+GH_MIRRORS="https://v6.gh-proxy.org/ https://gh.llkk.cc/ https://ghproxy.net/"
+# 公共 NAT64/DNS64：nat64.net（Kasper Dupont）和 Trex。只在下载时临时用。
+DNS64_SERVERS="2a00:1098:2b::1 2a01:4f8:c2c:123f::1 2a00:1098:2c::1 2001:67c:2b0::4"
+_DNS64_ON=0
+_GH_VIA=""
+
+_no_ipv4_route() {
+  command -v ip >/dev/null 2>&1 || return 1
+  [ -z "$(ip -4 route show default 2>/dev/null)" ]
+}
+
+# 临时换 DNS。/etc/resolv.conf 可能是指向 systemd-resolved 的链接，整个挪开再写新的，换回时原样挪回。
+_dns64_on() {
+  [ "$_DNS64_ON" = "1" ] && return 0
+  _no_ipv4_route || return 1
+  [ -e /etc/resolv.conf.xray-node-bak ] && return 1
+  if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+    mv -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null || return 1
+  else
+    : > /etc/resolv.conf.xray-node-bak.none 2>/dev/null || return 1
+  fi
+  {
+    for _ds in $DNS64_SERVERS; do printf 'nameserver %s\n' "$_ds"; done
+  } > /etc/resolv.conf 2>/dev/null || { _DNS64_ON=1; _dns64_off; return 1; }
+  _DNS64_ON=1
+  trap '_dns64_off; exit 130' INT TERM HUP
+  warn "直连和镜像都不通，临时换成公共 NAT64/DNS64 再试（下载完马上换回原来的 DNS）"
+  return 0
+}
+
+_dns64_off() {
+  [ "$_DNS64_ON" = "1" ] || return 0
+  if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ]; then
+    rm -f /etc/resolv.conf
+    mv -f /etc/resolv.conf.xray-node-bak /etc/resolv.conf 2>/dev/null
+  elif [ -e /etc/resolv.conf.xray-node-bak.none ]; then
+    rm -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak.none
+  fi
+  _DNS64_ON=0
+  trap - INT TERM HUP
+}
+
+# 上次脚本被强行关掉、DNS 没来得及换回时，这次开头先换回去。
+_dns64_recover() {
+  if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ]; then
+    _DNS64_ON=1
+    _dns64_off
+  fi
+}
+
+_sha256_of() { # _sha256_of <文件> -> 64 位小写十六进制
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print tolower($1)}'
+  elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx sha256sum; then
+    busybox sha256sum "$1" 2>/dev/null | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" 2>/dev/null | awk '{print tolower($NF)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print tolower($1)}'
+  fi
+}
+
+# _gh_get <github 地址> <输出文件> [先不用的镜像]：直连 -> 镜像。成功时 _GH_VIA 记下走的哪条路。
+_gh_get() {
+  _gg_url="$1"; _gg_out="$2"; _gg_skip="${3:-}"
+  rm -f "$_gg_out"
+  if _http_save "$_gg_url" "$_gg_out" && [ -s "$_gg_out" ]; then _GH_VIA=direct; return 0; fi
+  rm -f "$_gg_out"
+  for _gg_m in $GH_MIRRORS; do
+    [ "$_gg_m" = "$_gg_skip" ] && continue
+    info "换镜像下载：${_gg_m}"
+    if _http_save "${_gg_m}${_gg_url}" "$_gg_out" && [ -s "$_gg_out" ]; then _GH_VIA="$_gg_m"; return 0; fi
+    rm -f "$_gg_out"
+  done
+  if [ -n "$_gg_skip" ]; then
+    if _http_save "${_gg_skip}${_gg_url}" "$_gg_out" && [ -s "$_gg_out" ]; then _GH_VIA="$_gg_skip"; return 0; fi
+    rm -f "$_gg_out"
+  fi
+  return 1
+}
+
+# _gh_prepare：纯 IPv6 机器先试 GitHub 和镜像通不通，全都不通才临时换 NAT64。
+# 必须在主流程里调用（不能放在 $(...) 里）：换 DNS 是改文件，换回也要在同一个进程里做。
+_gh_prepare() {
+  [ "$_DNS64_ON" = "1" ] && return 0
+  _no_ipv4_route || return 0
+  _gp_probe="https://github.com/apernet/hysteria/releases/latest/download/hashes.txt"
+  _http_body "$_gp_probe" >/dev/null 2>&1 && return 0
+  for _gp_m in $GH_MIRRORS; do
+    _http_body "${_gp_m}${_gp_probe}" >/dev/null 2>&1 && return 0
+  done
+  _dns64_on || return 0
+  if [ "$_DNS64_ON" = "1" ]; then
+    _http_body "$_gp_probe" >/dev/null 2>&1 || warn "换了 NAT64 也连不上 GitHub，还是会继续试"
+  fi
+  return 0
+}
+
+# _gh_text <github 地址>：小文件（校验值、API）直接打印出来。
+_gh_text() {
+  _gt_tmp="${DL_TMP:-/tmp}/xray-node-gh.$$"
+  if _gh_get "$1" "$_gt_tmp" "${2:-}" >/dev/null 2>&1; then
+    cat "$_gt_tmp"
+    rm -f "$_gt_tmp"
+    return 0
+  fi
+  rm -f "$_gt_tmp"
+  return 1
+}
+
+# _gh_expect_sum <owner/repo> <tag> <文件名>：从官方发布页取这个文件的 SHA256。
+# 下载走了镜像时，校验值优先从别的路取，不全信同一个中转站。
+_gh_expect_sum() {
+  _ges_repo="$1"; _ges_tag="$2"; _ges_asset="$3"; _ges_avoid="${_GH_VIA:-}"
+  case "$_ges_avoid" in direct) _ges_avoid="" ;; esac
+  _ges=""
+  case "$_ges_repo" in
+    apernet/hysteria)
+      _ges=$(_gh_text "https://github.com/${_ges_repo}/releases/download/${_ges_tag}/hashes.txt" "$_ges_avoid" \
+        | awk -v a="build/${_ges_asset}" '$2 == a || $2 == "./" a || $2 == a ".exe" { print tolower($1); exit }')
+      ;;
+    XTLS/Xray-core)
+      _ges=$(_gh_text "https://github.com/${_ges_repo}/releases/download/${_ges_tag}/${_ges_asset}.dgst" "$_ges_avoid" \
+        | sed -n 's/^SHA2-256=[[:space:]]*//p' | head -1 | tr -d ' \r\n' | tr 'A-F' 'a-f')
+      ;;
+  esac
+  if [ -z "$_ges" ]; then
+    # GitHub 从 2025 年起在 API 里给每个发布文件附上 sha256（digest 字段）。sing-box 只有这一种来源。
+    _ges=$(_gh_text "https://api.github.com/repos/${_ges_repo}/releases/tags/${_ges_tag}" "$_ges_avoid" \
+      | tr ',{}' '\n\n\n' | awk -v a="\"${_ges_asset}\"" '
+          index($0, "\"name\"") && index($0, a) { hit = 1; next }
+          hit && index($0, "\"digest\"") { sub(/.*sha256:/, ""); gsub(/[" \r]/, ""); print tolower($0); exit }
+        ')
+  fi
+  case "$_ges" in
+    *[!0-9a-f]*|"") return 1 ;;
+  esac
+  [ "${#_ges}" -eq 64 ] || return 1
+  printf '%s' "$_ges"
+}
+
+# _verify_dl <文件> <owner/repo> <tag> <文件名>：校验值对不上就删文件并返回 1。
+# 取不到官方校验值时只提醒（后面还会试运行 version，跑不起来一样不装）。
+_verify_dl() {
+  _vd_want=$(_gh_expect_sum "$2" "$3" "$4") || _vd_want=""
+  if [ -z "$_vd_want" ]; then
+    warn "没取到官方 SHA256 校验值，改为只检查程序能不能运行（${4}）"
+    return 0
+  fi
+  _vd_have=$(_sha256_of "$1")
+  if [ -z "$_vd_have" ]; then
+    warn "这台机器没有 sha256sum，跳过校验（${4}）"
+    return 0
+  fi
+  if [ "$_vd_have" != "$_vd_want" ]; then
+    rm -f "$1"
+    err "下载的 ${4} 和官方校验值对不上（可能是镜像被篡改或下载出错），已删除，不安装。"
+    return 1
+  fi
+  info "SHA256 校验通过：${4}"
+  return 0
+}
+
+# 全部路都不通时的说明。
+_gh_hint() {
+  if _no_ipv4_route; then
+    printf '%s' "。这台机器没有 IPv4，而 GitHub 只有 IPv4 地址。脚本已经试过 IPv6 镜像和公共 NAT64，都没成功。请先给机器加一个 IPv4 出口（WARP）：运行 wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh ，在菜单里选给 IPv6 only 机器「添加 IPv4 网络接口」的那一项。装好以后重跑这个脚本"
+  fi
 }
 
 # 下载的安装包先放到硬盘上的临时目录，装完就删。
@@ -2176,8 +2352,8 @@ _ver_num() { # _ver_num <字符串> -> 提取其中的第一个版本号，如 "
 
 # _latest_tag_web <owner/repo>：不走 API，看 github.com/<repo>/releases/latest 跳转到哪个 tag。
 # api.github.com 对每个 IP 每小时只给 60 次，同一出口的机器多了就会被限流。
-_latest_tag_web() {
-  _ltw_page="https://github.com/$1/releases/latest"
+_latest_tag_web() { # _latest_tag_web <owner/repo> [镜像前缀]
+  _ltw_page="${2:-}https://github.com/$1/releases/latest"
   _ltw_url=""
   if command -v curl >/dev/null 2>&1; then
     _ltw_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 20 --connect-timeout 15 "$_ltw_page" 2>/dev/null)
@@ -2190,21 +2366,27 @@ _latest_tag_web() {
   esac
 }
 
-# 没有 IPv4 出口时补一句原因：GitHub 不支持 IPv6，纯 IPv6 机器直接连不上。
-_gh_hint() {
-  command -v ip >/dev/null 2>&1 || return 0
-  if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
-    printf '%s' "（这台机器没有 IPv4，而 GitHub 不支持 IPv6，下载不了。先装 WARP 或设置 NAT64/DNS64，再重跑脚本）"
+# _latest_tag_raw <owner/repo>：打印最新 release 的原始 tag（比如 v26.3.27、app/v2.12.3）。
+# 顺序：GitHub API -> github.com 跳转 -> IPv6 镜像的 API 和跳转（NAT64 由 _gh_prepare 提前打开）。
+_latest_tag_raw() {
+  _ltr_api="https://api.github.com/repos/$1/releases/latest"
+  _ltr_pick() { grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//'; }
+  _ltr=$(_http_body "$_ltr_api" 2>/dev/null | _ltr_pick)
+  # API 被限流或连不上时，改看 github.com 的跳转地址
+  [ -n "$_ltr" ] || _ltr=$(_latest_tag_web "$1") || _ltr=""
+  if [ -z "$_ltr" ]; then
+    for _ltr_m in $GH_MIRRORS; do
+      _ltr=$(_http_body "${_ltr_m}${_ltr_api}" 2>/dev/null | _ltr_pick)
+      [ -n "$_ltr" ] || _ltr=$(_latest_tag_web "$1" "$_ltr_m") || _ltr=""
+      [ -n "$_ltr" ] && break
+    done
   fi
+  [ -n "$_ltr" ] || return 1
+  printf '%s' "$_ltr" | tr -d '\r'
 }
 
 _latest_tag() { # _latest_tag <owner/repo> -> 打印最新 release 版本号（去 v 前缀），失败返回非零
-  _lt_tag=$(_http_body "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s/^v//')
-  # API 被限流或连不上时，改看 github.com 的跳转地址
-  if [ -z "$_lt_tag" ]; then
-    _lt_tag=$(_latest_tag_web "$1" | sed 's/^v//') || _lt_tag=""
-  fi
+  _lt_tag=$(_latest_tag_raw "$1" | sed 's|.*%2[Ff]||; s|.*/||; s/^v//')
   # 必须是版本号的样子：tag 格式万一变了（比如 "nightly"），
   # 不能把整行垃圾当版本号吐出去，否则版本比较永远对不上、每次更新都重复下载
   case "$_lt_tag" in ''|*[!0-9a-zA-Z.-]*) return 1 ;; esac
@@ -2413,12 +2595,8 @@ prepare_low_memory() {
 # ---------- 下载三个内核：Hysteria2 / Xray / sing-box ----------
 # 都是先下载到临时文件名、确认能运行，再替换正式文件，避免装到一半把旧的弄坏。
 _latest_hysteria_ver() { # 打印 hysteria 最新版本号（不带 v），失败返回非零
-  _hv=$(_http_body "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//; s/".*//; s|.*/||; s/^v//')
-  # API 被限流时改看 github.com 的跳转地址（tag 形如 app/v2.12.3，斜杠可能被编码成 %2F）
-  if [ -z "$_hv" ]; then
-    _hv=$(_latest_tag_web "apernet/hysteria" | sed 's|.*%2[Ff]||; s|.*/||; s/^v//') || _hv=""
-  fi
+  # tag 形如 app/v2.12.3，从跳转地址拿到时斜杠可能被编码成 %2F
+  _hv=$(_latest_tag_raw "apernet/hysteria" | sed 's|.*%2[Ff]||; s|.*/||; s/^v//') || _hv=""
   case "$_hv" in ''|*[!0-9A-Za-z.-]*) return 1 ;; esac
   printf '%s' "$_hv"
 }
@@ -2436,7 +2614,7 @@ _hy_asset() {
   esac
 }
 
-dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内存装得下；sing-box 1.14 解压后约 80MB，装不上。
+_dl_hysteria_inner() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内存装得下；sing-box 1.14 解压后约 80MB，装不上。
   step "[下载] 获取 Hysteria2 内核…"
   _hy_asset=$(_hy_asset) || die "这个 CPU 架构没有对应的 Hysteria2 程序：$(uname -m)"
   _hy_latest=$(_latest_hysteria_ver) || _hy_latest=""
@@ -2455,21 +2633,33 @@ dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内�
   fi
   rm -f "${HY_BIN}.new"
   _dl_ok=0
+  _GH_VIA=direct
   info "尝试下载：${_hy_asset}"
+  if [ -n "$_hy_latest" ]; then
+    _url="https://github.com/apernet/hysteria/releases/download/app/v${_hy_latest}/${_hy_asset}"
+  else
+    _url="https://github.com/apernet/hysteria/releases/latest/download/${_hy_asset}"
+  fi
   if gh_api_dl "apernet/hysteria" "$_hy_asset" "${HY_BIN}.new"; then
     _dl_ok=1
   else
-    warn "API 路线失败，换 github.com 直链试试…"
+    warn "API 路线失败，换 github.com 直链和镜像试试…"
     rm -f "${HY_BIN}.new"
-    _url="https://github.com/apernet/hysteria/releases/latest/download/${_hy_asset}"
     info "尝试下载：$_url"
-    if _http_save "$_url" "${HY_BIN}.new"; then
+    if _gh_get "$_url" "${HY_BIN}.new"; then
       _dl_ok=1
     fi
   fi
   if [ "$_dl_ok" != "1" ]; then
     rm -f "${HY_BIN}.new"
     die "Hysteria2 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
+  fi
+  # 官方 hashes.txt 里有每个文件的 SHA256。对不上就不装。
+  if [ -n "$_hy_latest" ]; then
+    _verify_dl "${HY_BIN}.new" "apernet/hysteria" "app/v${_hy_latest}" "$_hy_asset" \
+      || die "Hysteria2 安装包校验没通过，已停止。请稍后重跑脚本"
+  else
+    warn "不知道最新版本号，取不到官方校验值，改为只检查程序能不能运行"
   fi
   # 小于 1MB 的多半是错误页，不是内核
   _hy_sz=$(wc -c < "${HY_BIN}.new" 2>/dev/null | tr -d ' ')
@@ -2486,10 +2676,16 @@ dl_hysteria() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内�
     die "下载的 Hysteria2 内核跑不起来（退出码 ${_hy_rc}）。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_hy_run" | tr '\n' ' ' | cut -c1-300)"
   fi
   mv -f "${HY_BIN}.new" "$HY_BIN"
+  _dns64_off
   mark_our_bin "hysteria"
   _hy_have=$(_hysteria_local_ver "$HY_BIN")
   info "Hysteria2 安装成功：v${_hy_have:-未知}"
 }
+
+# 三个下载函数的外壳：先看看 GitHub 通不通（纯 IPv6 时可能临时换 NAT64），下完一定把 DNS 换回去。
+dl_hysteria() { _gh_prepare; _dl_hysteria_inner; _dl_rc=$?; _dns64_off; return "$_dl_rc"; }
+dl_xray() { _gh_prepare; _dl_xray_inner; _dl_rc=$?; _dns64_off; return "$_dl_rc"; }
+dl_singbox() { _gh_prepare; _dl_singbox_inner; _dl_rc=$?; _dns64_off; return "$_dl_rc"; }
 
 _ensure_unzip() {
   command -v unzip >/dev/null 2>&1 && return 0
@@ -2510,7 +2706,7 @@ _ensure_unzip() {
   command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
 }
 
-dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
+_dl_xray_inner() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强制下载最新版
   step "[下载] 获取 Xray 内核…"
   case "$MACH" in
     amd64) XARCH="64" ;;
@@ -2543,30 +2739,32 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
       rm -f "$DL_DIR/xray.zip"
       _xasset="Xray-linux-${XARCH}.zip"
       _dl_ok=0
+      _GH_VIA=direct
+      _xver=$(_latest_tag "XTLS/Xray-core") || _xver=""
       # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
       info "尝试下载：GitHub API"
       if gh_api_dl "XTLS/Xray-core" "$_xasset" "$DL_DIR/xray.zip"; then
         _dl_ok=1
       else
-        warn "API 路线失败，换 github.com 直链试试…"
+        warn "API 路线失败，换 github.com 直链和镜像试试…"
         rm -f "$DL_DIR/xray.zip"
-        # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底）
-        _xver=$(_latest_tag "XTLS/Xray-core") || _xver=""
-        for _url in \
-          ${_xver:+https://github.com/XTLS/Xray-core/releases/download/v${_xver}/Xray-linux-${XARCH}.zip} \
-          "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip" \
-        ; do
-          [ -z "$_url" ] && continue
-          info "尝试下载：$_url"
-          if _http_save "$_url" "$DL_DIR/xray.zip"; then
-            _dl_ok=1
-            break
-          fi
-          warn "这个地址下载失败，换下一个地址试试…"
-          rm -f "$DL_DIR/xray.zip"
-        done
+        # 路线 B：github.com 直链（版本直链优先，/latest/download 兜底），不通再走镜像和 NAT64
+        if [ -n "$_xver" ]; then
+          _url="https://github.com/XTLS/Xray-core/releases/download/v${_xver}/${_xasset}"
+        else
+          _url="https://github.com/XTLS/Xray-core/releases/latest/download/${_xasset}"
+        fi
+        info "尝试下载：$_url"
+        if _gh_get "$_url" "$DL_DIR/xray.zip"; then
+          _dl_ok=1
+        fi
       fi
       [ "$_dl_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
+      # 官方每个包都有 .dgst 校验文件，SHA256 对不上就不装
+      if [ -n "$_xver" ]; then
+        _verify_dl "$DL_DIR/xray.zip" "XTLS/Xray-core" "v${_xver}" "$_xasset" \
+          || die "Xray 安装包校验没通过，已停止。请稍后重跑脚本"
+      fi
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
@@ -2580,13 +2778,14 @@ dl_xray() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在也强�
       die "下载的 Xray 内核跑不起来，安装包可能有问题"
     fi
     mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
+    _dns64_off
     mark_our_bin "xray"
     rm -rf "$DL_DIR"
     info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
   fi
 }
 
-dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在也强制下载最新版
+_dl_singbox_inner() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在也强制下载最新版
   step "[下载] 获取 sing-box 内核…"
   if [ "$LOW_MEM" = "1" ]; then
     warn "sing-box 解压后大约 80MB，这台机器大约 ${MEM_MB:-很少}MB 内存，有可能装不上。装不上的话，协议请选 6（Hysteria2）。"
@@ -2626,6 +2825,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
       else
         _sb_cands="sing-box-${_ver}-linux-${MACH}.tar.gz sing-box-${_ver}-linux-${MACH}-glibc.tar.gz"
       fi
+      _GH_VIA=direct
       for _cand in $_sb_cands; do
         info "尝试下载：${_cand}"
         # 路线 A：GitHub API（api.github.com 稳，302 跳到 release-assets 下得快）
@@ -2633,11 +2833,11 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
           _dl_ok=1
           break
         fi
-        warn "API 路线失败，换 github.com 直链试试…"
+        warn "API 路线失败，换 github.com 直链和镜像试试…"
         rm -f "$DL_DIR/sb.tar.gz"
-        # 路线 B：github.com 版本直链兜底
+        # 路线 B：github.com 版本直链，不通再走镜像和 NAT64
         _url="https://github.com/SagerNet/sing-box/releases/download/v${_ver}/${_cand}"
-        if _http_save "$_url" "$DL_DIR/sb.tar.gz"; then
+        if _gh_get "$_url" "$DL_DIR/sb.tar.gz"; then
           _dl_ok=1
           break
         fi
@@ -2645,6 +2845,9 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
         rm -f "$DL_DIR/sb.tar.gz"
       done
       [ "$_dl_ok" -eq 1 ] || die "sing-box 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试$(_gh_hint)"
+      # sing-box 没有单独的校验文件，用 GitHub API 给的 sha256（digest）对一遍
+      _verify_dl "$DL_DIR/sb.tar.gz" "SagerNet/sing-box" "v${_ver}" "$_cand" \
+        || die "sing-box 安装包校验没通过，已停止。请稍后重跑脚本"
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
@@ -2664,6 +2867,7 @@ dl_singbox() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使已存在
       die "下载的 sing-box 内核跑不起来。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_sb_run" | tr '\n' ' ' | cut -c1-300)"
     fi
     mv -f "${SB_BIN}.new" "$SB_BIN"
+    _dns64_off
     mark_our_bin "sing-box"
     rm -rf "$DL_DIR"
     info "sing-box 安装成功：$($SB_BIN version 2>/dev/null | head -1)"
@@ -2683,6 +2887,8 @@ if [ ! -t 0 ] && [ -r /dev/tty ] && (: < /dev/tty) 2>/dev/null; then
   exec < /dev/tty
 fi
 umask 077
+# 上次脚本中途被关掉、临时 DNS 没换回时，先换回来。
+_dns64_recover
 # 旧版本可能把节点链接和密码写成全机可读；升级时也一并收紧。
 for _sec_dir in /etc/xray-node /etc/xray-node/nodes /etc/xray-node/nodes/*/; do
   [ -d "$_sec_dir" ] && chmod 700 "$_sec_dir"
@@ -3141,11 +3347,13 @@ if [ "$UPDATE_MODE" = "1" ]; then
           _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
         fi
       fi
+      _gh_prepare
       if [ "$_ucore" = "hysteria" ]; then
         _u_latest=$(_latest_hysteria_ver) || _u_latest=""
       else
         _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
       fi
+      _dns64_off
       if [ -z "$_u_latest" ]; then
         warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
         exit 0
