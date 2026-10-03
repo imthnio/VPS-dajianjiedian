@@ -506,18 +506,24 @@ class DeleteNodeSelectionTest(unittest.TestCase):
         self.assertIn("没有这个节点编号", missed.stdout)
         self.assertEqual(missed_log, "")
 
-    def test_delete_all_requires_the_word_all(self):
-        refused, refused_log, _ = self.run_menu("all\n1234\n")
-        self.assertIn("请输入 all 确认", refused.stdout)
+    def test_delete_everything_uses_1234_not_all(self):
+        shown, shown_log, _ = self.run_menu("\n")
+        self.assertIn("输入 1234：删除全部节点并卸载干净", shown.stdout)
+        self.assertNotIn("all", shown.stdout.lower())
+        self.assertEqual(shown_log, "")
+
+        word, word_log, _ = self.run_menu("all\n")
+        self.assertIn("请输入 1234", word.stdout)
+        self.assertNotIn("UNINSTALL", word_log)
+
+        refused, refused_log, _ = self.run_menu("1234\n\n")
+        self.assertIn("确定删除全部节点并卸载干净吗", refused.stdout)
         self.assertIn("已取消", refused.stdout)
         self.assertNotIn("UNINSTALL", refused_log)
 
-        old_yes, old_log, _ = self.run_menu("all\ny\n")
-        self.assertIn("已取消", old_yes.stdout)
-        self.assertNotIn("UNINSTALL", old_log)
-
-        confirmed, confirmed_log, _ = self.run_menu(" all \n ALL \n")
+        confirmed, confirmed_log, _ = self.run_menu(" 1234 \ny\n")
         self.assertEqual(confirmed_log.splitlines(), ["UNINSTALL"])
+        self.assertNotIn("all", confirmed.stdout.lower())
 
     def test_leading_zero_still_selects_the_real_node(self):
         result, logged, _ = self.run_menu("02\n")
