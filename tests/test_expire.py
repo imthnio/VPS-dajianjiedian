@@ -292,6 +292,71 @@ class IPv6SwitchTest(unittest.TestCase):
             self.assertNotIn("2001:db8::1", kept)
             self.assertNotIn("IPv6 链接", kept)
 
+    def test_ipv6_apply_that_does_not_stick_leaves_nodes_untouched(self):
+        # 文件权限是可写，但写进去的 1 读不回来。这时不能先改节点。
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, nodes = self.env_for(root)
+            hy = nodes / "3"
+            hy.mkdir()
+            (hy / "config.yaml").write_text('listen: ":444"\n')
+            (hy / "node.txt").write_text("hysteria2://pass@[2001:db8::1]:444/?insecure=1#xray-node\n")
+            log = Path(root) / "restart.log"
+            env["RESTART_LOG"] = str(log)
+            extra = (
+                "_ipv6_apply() { return 1; }\n"
+                "_hy_set_listen() { printf 'listen: \"%s\"\\n' \"$2\" > \"$1\"; }\n"
+                "_svc_restart() { printf '%s\\n' \"$1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 0; }\n"
+                "_ipv6_turn_off\n"
+            )
+            result = subprocess.run(
+                ["sh", "-c", self.script(extra)],
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertEqual((hy / "config.yaml").read_text(), 'listen: ":444"\n')
+            self.assertFalse(log.exists())
+            self.assertIn("[2001:db8::1]", (hy / "node.txt").read_text())
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+            self.assertFalse(Path(env["XRAY_IPV6_CONF"]).exists())
+            self.assertIn("不允许修改 IPv6", result.stdout)
+            self.assertNotIn("节点 3 已改为只听 IPv4", result.stdout)
+
+    def test_unknown_ipv6_switch_choice_asks_again(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, proc, _nodes = self.env_for(root)
+            result = subprocess.run(
+                ["sh", "-c", self.script("_ipv6_switch_menu\nprintf 'BACK\\n'\n")],
+                input="9\n3\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertIn("WARN 没有这个选项，请重新选择", result.stdout)
+            self.assertIn("BACK", result.stdout)
+            self.assertNotIn("IPv6 已关闭", result.stdout)
+            self.assertNotIn("IPv6 已打开", result.stdout)
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+
+            entered = subprocess.run(
+                ["sh", "-c", self.script("_ipv6_switch_menu\nprintf 'BACK\\n'\n")],
+                input="\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertIn("BACK", entered.stdout)
+            self.assertNotIn("WARN", entered.stdout)
+            self.assertEqual((proc / "all" / "disable_ipv6").read_text().strip(), "0")
+
 class InstallPromptTest(unittest.TestCase):
     def readme_command(self):
         readme = (INSTALLER.parent / "README.md").read_text()
@@ -348,6 +413,41 @@ class InstallPromptTest(unittest.TestCase):
             check=True,
         )
         self.assertIn("SET 随机", result.stdout)
+
+    def test_surrounding_spaces_are_removed_but_address_zeros_stay(self):
+        blank = subprocess.run(
+            ["/bin/sh", "-c", self.ask_script()],
+            input="   \n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertIn("SET 随机", blank.stdout)
+        spaced = subprocess.run(
+            ["/bin/sh", "-c", self.ask_script()],
+            input="  8443 \n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertIn("SET 8443", spaced.stdout)
+        address = (
+            "err() { printf 'ERR %s\\n' \"$1\"; }\n"
+            "die() { err \"$1\"; exit 1; }\n"
+            + between("ask() {", "\nrand_hex() {")
+            + "\nask 'IP' '' SERVER_IP\nprintf 'SET %s\\n' \"$SERVER_IP\"\n"
+        )
+        kept = subprocess.run(
+            ["/bin/sh", "-c", address],
+            input="  0.0.0.0 \n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertIn("SET 0.0.0.0", kept.stdout)
 
     def test_installer_reopens_the_terminal_before_the_first_question(self):
         source = source_text()
@@ -926,6 +1026,98 @@ class ArmWatchTest(unittest.TestCase):
             pid = (root / "loop.pid").read_text().strip()
             self.assertRegex(pid, r"^[0-9]+$")
             subprocess.run(["kill", pid], check=False)
+
+
+class InstalledMenuTest(unittest.TestCase):
+    def script(self):
+        menu = between('if [ "$_NODE_COUNT" -gt 0 ]; then', "# 旧版小内存模式")
+        ask = between("ask() {", "\nrand_hex() {")
+        return (
+            "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
+            + ask
+            + "\n_hy_fix_existing_ipv6() { echo UPDATED; }\n"
+            + "_choose_node_kind() { echo ADD; }\n"
+            + "_ipv6_switch_menu() { echo IPV6; }\n"
+            + "write_helper_cmds() { echo MANAGE; }\n"
+            + "_NODE_COUNT=1\n"
+            + menu
+            + "printf 'MODE %s\\n' \"$UPDATE_MODE\"\n"
+        )
+
+    def run_menu(self, answers):
+        return subprocess.run(
+            ["sh", "-c", self.script()],
+            input=answers,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+    def test_unknown_choice_does_not_update(self):
+        result = self.run_menu("9\n4\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARN 没有这个选项，请重新选择", result.stdout)
+        self.assertIn("已取消", result.stdout)
+        self.assertNotIn("UPDATED", result.stdout)
+        self.assertNotIn("ADD", result.stdout)
+        self.assertNotIn("MODE", result.stdout)
+
+    def test_enter_and_one_still_update(self):
+        for answers in ("\n", "1\n", "  1 \n", "   \n"):
+            result = self.run_menu(answers)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("UPDATED", result.stdout)
+            self.assertIn("MODE 1", result.stdout)
+            self.assertNotIn("WARN", result.stdout)
+
+
+class ChoiceRetryTest(unittest.TestCase):
+    def preamble(self):
+        return (
+            "warn() { printf 'WARN %s\\n' \"$1\"; }\n"
+            + between("ask() {", "\nrand_hex() {")
+            + "\n"
+        )
+
+    def run_choice(self, block, answers, trailer):
+        result = subprocess.run(
+            ["sh", "-c", self.preamble() + block + trailer],
+            input=answers,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return result.stdout
+
+    def test_protocol_unknown_is_asked_again(self):
+        block = between('while true; do\n  ask "请选择" "1" _proto', '\ncase "$PROTO" in')
+        trailer = "\nprintf 'PROTO %s\\n' \"$PROTO\"\n"
+        bad = self.run_choice(block, "8\n6\n", trailer)
+        self.assertIn("WARN 没有这个选项，请重新选择", bad)
+        self.assertIn("PROTO hy2", bad)
+        chosen = self.run_choice(block, "\n", trailer)
+        self.assertIn("PROTO vless", chosen)
+        self.assertNotIn("WARN", chosen)
+        self.assertIn("PROTO hy2", self.run_choice(block, "  6 \n", trailer))
+
+    def test_ip_version_unknown_is_asked_again(self):
+        block = between('while true; do\n  ask "请选择" "$_ipdef" _ipver', '\nprintf "正在检测公网 IP')
+        trailer = "\nprintf 'IPVER %s\\n' \"$IPVER\"\n"
+        bad = self.run_choice("_ipdef=1\n" + block, "9\n2\n", trailer)
+        self.assertIn("WARN 没有这个选项，请重新选择", bad)
+        self.assertIn("IPVER 6", bad)
+        self.assertIn("IPVER 4", self.run_choice("_ipdef=1\n" + block, "\n", trailer))
+        self.assertIn("IPVER 6", self.run_choice("_ipdef=2\n" + block, "\n", trailer))
+
+    def test_domain_unknown_is_asked_again(self):
+        block = between('  while true; do\n    ask "请选择" "1" _dm', '\n  info "伪装域名：')
+        trailer = "\nprintf 'DOMAIN %s\\n' \"$REALITY_DOMAIN\"\n"
+        bad = self.run_choice(block, "12\n3\n", trailer)
+        self.assertIn("WARN 没有这个选项，请重新选择", bad)
+        self.assertIn("DOMAIN www.apple.com", bad)
+        self.assertIn("DOMAIN www.samsung.com", self.run_choice(block, "\n", trailer))
+        self.assertIn("DOMAIN www.samsung.com", self.run_choice(block, "1\n", trailer))
 
 
 class SyntaxTest(unittest.TestCase):
