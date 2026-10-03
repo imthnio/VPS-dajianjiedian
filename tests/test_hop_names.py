@@ -188,13 +188,12 @@ class NodeNameTest(unittest.TestCase):
 
 
 class QuicBlockTest(unittest.TestCase):
-    def test_every_core_blocks_udp_443(self):
+    def test_quic_is_blocked_in_the_client_not_on_the_server(self):
         source = INSTALLER.read_text()
-        self.assertEqual(source.count('"network": "udp", "port": "443", "outboundTag": "block"'), 4)
-        self.assertIn('"action": "reject"', source)
-        self.assertIn("reject(all, udp/443)", source)
+        self.assertNotIn('"outboundTag": "block" } ] },\n', source)
+        self.assertIn("block-quic=true", source)
+        self.assertIn("block-quic=on", source)
         self.assertIn("AND,((NETWORK,UDP),(DST-PORT,443)),REJECT", source)
-
 
 if __name__ == "__main__":
     unittest.main()
