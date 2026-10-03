@@ -657,6 +657,12 @@ class HysteriaHopTest(unittest.TestCase):
         self.assertIn("sniGuard: dns-san", source)
         self.assertNotIn('type: "404"', source)
         self.assertIn("请设置你的端口跳跃%s:", source)
+        self.assertIn("salamander-password=${HY2_OBFS}", source)
+        self.assertNotIn('salamander-password=\\"${HY2_OBFS}\\"', source)
+        self.assertIn("block-quic=true", source)
+        self.assertNotIn("block-quic=false", source)
+        self.assertIn("HYSTERIA_FIREWALL_BACKEND=${HY2_FW_BACKEND}", source)
+        self.assertIn("改用 iptables 再试一次。", source)
 
     def run_collect(self, answers, port="443", link_port="443"):
         function = self.source_between("_hy_hop_taken() {", "\n_hy_listen_for() {")
