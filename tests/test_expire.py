@@ -292,6 +292,55 @@ class IPv6SwitchTest(unittest.TestCase):
             self.assertNotIn("2001:db8::1", kept)
             self.assertNotIn("IPv6 链接", kept)
 
+    def test_disabling_ipv6_keeps_hysteria_hop_ports(self):
+        with tempfile.TemporaryDirectory() as root:
+            env, _proc, nodes = self.env_for(root)
+            dual = nodes / "3"
+            dual.mkdir()
+            (dual / "config.yaml").write_text('listen: ":443,20000,20001"\n')
+            v6 = nodes / "5"
+            v6.mkdir()
+            (v6 / "config.yaml").write_text('listen: "[::]:555,20010"\n')
+            already = nodes / "6"
+            already.mkdir()
+            (already / "config.yaml").write_text('listen: "0.0.0.0:8443,20020"\n')
+            junk = nodes / "7"
+            junk.mkdir()
+            (junk / "config.yaml").write_text('listen: ":443,20abc"\n')
+            log = Path(root) / "restart.log"
+            env["RESTART_LOG"] = str(log)
+            extra = (
+                "_hy_set_listen() { printf 'listen: \"%s\"\\n' \"$2\" > \"$1\"; }\n"
+                "_svc_restart() { printf '%s\\n' \"$1\" >> \"$RESTART_LOG\"; }\n"
+                "wait_for_port() { return 0; }\n"
+                "_ipv6_turn_off\n"
+            )
+            result = subprocess.run(
+                ["sh", "-c", self.script(extra)],
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
+                env=env,
+            )
+            self.assertEqual(result.stderr, "", result.stderr)
+            self.assertEqual(
+                (dual / "config.yaml").read_text(),
+                'listen: "0.0.0.0:443,20000,20001"\n',
+            )
+            self.assertEqual(
+                (v6 / "config.yaml").read_text(),
+                'listen: "0.0.0.0:555,20010"\n',
+            )
+            self.assertEqual(
+                (already / "config.yaml").read_text(),
+                'listen: "0.0.0.0:8443,20020"\n',
+            )
+            self.assertEqual((junk / "config.yaml").read_text(), 'listen: ":443,20abc"\n')
+            self.assertEqual(log.read_text().splitlines(), ["3", "5"])
+            self.assertIn("节点 3 已改为只听 IPv4", result.stdout)
+
     def test_ipv6_apply_that_does_not_stick_leaves_nodes_untouched(self):
         # 文件权限是可写，但写进去的 1 读不回来。这时不能先改节点。
         with tempfile.TemporaryDirectory() as root:
