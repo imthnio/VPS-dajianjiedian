@@ -55,6 +55,9 @@
 # 校验值（SHA256）：文件的“指纹”。下载完和官方公布的指纹对一下，一样才说明文件没被改过。
 # 巡检：每分钟自动查一次的小程序 xray-node-watch。防火墙服务重启会把端口跳跃的转发规则清掉，
 #   它发现少了就自动补回去；用自己的域名申请证书时，它只在申请/续期期间打开 TCP 80（或 443），平时关着。
+# WireGuard 落地（wg-luodi）：另一个脚本 VPS-WireGuard-luodi。装了它以后，你指定的端口上的节点
+#   上网时用 WireGuard 落地机的 IP，其它端口照旧用服务器自己的 IP。本脚本只在节点启动前叫它一声
+#   （wg-luodi hook），没装就什么都不做。
 # 所有节点都放在 /etc/xray-node/nodes/<编号>/ 目录里，一个节点一个目录，互不影响。
 # ============================================================
 
@@ -3320,6 +3323,8 @@ start_pre() {
     checkpath -f -m 0644 -o root:root "\$output_log"
     # 端口跳跃：启动前打开转发（没开跳跃的节点什么都不做）
     ${_si_rc_hop_up}
+    # WireGuard 落地：装了 wg-luodi 时，让它看看这个节点的端口要不要走 WireGuard（没装就跳过）
+    [ -x /usr/local/bin/wg-luodi ] && /usr/local/bin/wg-luodi hook ${_si_id} >/dev/null 2>&1 || true
     # 回程路由：有策略路由的机器上，UDP 回包走公网网卡（不需要时什么都不做）
     /usr/local/bin/xray-node-route up ${_si_id} >/dev/null 2>&1 || true
 }
@@ -3345,6 +3350,8 @@ RCEOF
       _hy_export_env
       /usr/local/bin/xray-node-hop up "$_si_id" >/dev/null 2>&1 || true
     fi
+    # WireGuard 落地：装了 wg-luodi 时先让它改好配置（没装就跳过）
+    [ -x /usr/local/bin/wg-luodi ] && /usr/local/bin/wg-luodi hook "$_si_id" >/dev/null 2>&1 || true
     /usr/local/bin/xray-node-route up "$_si_id" >/dev/null 2>&1 || true
     pkill -f "$_si_cfg" >/dev/null 2>&1
     # _si_args 故意不加引号，拆成多个参数
@@ -5470,6 +5477,15 @@ LINK_PORT=$(printf '%s' "$LINK_PORT" | sed 's/^0*//')
 if [ "$LINK_PORT" != "$PORT" ]; then
   info "节点链接会使用公网端口 ${LINK_PORT}；请确认服务商已把它映射到本机 $PORT"
 fi
+# WireGuard 落地：这个端口在 wg-luodi 的名单里，就提醒一句（真正的修改由 wg-luodi 在节点启动前完成）
+if [ -r /etc/wg-luodi/state ]; then
+  for _wgl_p in $(sed -n 's/^PORTS=//p' /etc/wg-luodi/state 2>/dev/null | head -n 1); do
+    if [ "$_wgl_p" = "$PORT" ] || [ "$_wgl_p" = "$LINK_PORT" ]; then
+      info "端口 $_wgl_p 在 WireGuard 落地名单里：这个节点上网会自动走 WireGuard 落地机的 IP"
+      break
+    fi
+  done
+fi
 # 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
 HY_HOP_PORTS=""
 HY2_USE_OBFS=1
@@ -5932,6 +5948,8 @@ fi
 # 注册成系统服务并立刻启动，以后服务器重启也会自动启动。
 # 先记下这个节点用的内核，_svc_install 要读它
 echo "$CORE" > "$NODE_DIR/core" 2>/dev/null
+# 公网映射端口也记一下（NAT 小鸡上和本机端口不同）。wg-luodi 靠它认出“你说的端口”是哪个节点。
+echo "$LINK_PORT" > "$NODE_DIR/link_port" 2>/dev/null
 step "[服务] 设置开机自启…"
 # 申请证书时 Let's Encrypt 要从外面连 TCP 80（或 443），所以启动前先放行。
 # 放行了哪些记在节点目录的 fw_acme 里：装到一半失败时撤销；申请成功后先关上，
