@@ -349,7 +349,87 @@ _http_body() { # _http_body [-4|-6] URL -> 正文
   return 127
 }
 
+# 小内存机器（64MB 容器）上，刚下载、刚解压的内容会先堆在内存里等着写盘。
+# 写盘一慢就把内存上限顶满，系统会随手杀进程，常常杀到你的 SSH / 网页终端，表现为装到一半突然掉线。
+# _pace_start 在后台每秒催一次写盘，_pace_stop 停掉它。主脚本退出后它自己也会停。
+_PACE_PID=""
+_pace_start() {
+  [ "$LOW_MEM" = "1" ] || return 0
+  [ -z "$_PACE_PID" ] || return 0
+  ( while kill -0 "$$" 2>/dev/null; do sync; sleep 1; done ) >/dev/null 2>&1 &
+  _PACE_PID=$!
+}
+_pace_stop() {
+  [ -n "$_PACE_PID" ] || return 0
+  kill "$_PACE_PID" 2>/dev/null
+  wait "$_PACE_PID" 2>/dev/null
+  _PACE_PID=""
+  sync
+}
+
+# _drip_to <文件>：把标准输入写进文件，每写 4MB 就等它真正落盘再写下一段。
+# 这样等着写盘的内容最多 4MB，64MB 的机器解压几十 MB 的内核也不会被杀。
+# 这台机器的 dd 不认这种写法时返回 1，调用的地方再换老办法。
+_drip_to() {
+  : > "$1" 2>/dev/null || return 1
+  while :; do
+    _dt=$(LC_ALL=C dd bs=1048576 count=4 iflag=fullblock conv=fsync 2>&1 >>"$1") || return 1
+    case "$_dt" in
+      "0+0 records in"*) return 0 ;;
+      *"records in"*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+# _unpack_drip <zip|tgz> <安装包> <包里的文件> <输出文件>：小内存机器专用，边解压边落盘，直接写到目标位置。
+# 成功返回 0；做不了（不是小内存、dd 不支持、大小对不上）返回 1 并删掉半截文件。
+_unpack_drip() {
+  [ "$LOW_MEM" = "1" ] || return 1
+  _ud_want=""
+  rm -f "$4"
+  case "$1" in
+    zip)
+      _ud_want=$(unzip -l "$2" "$3" 2>/dev/null | awk -v n="$3" '$NF == n { print $1; exit }')
+      unzip -p "$2" "$3" 2>/dev/null | _drip_to "$4"
+      ;;
+    tgz)
+      tar xzOf "$2" "$3" 2>/dev/null | _drip_to "$4"
+      ;;
+    *) return 1 ;;
+  esac
+  _ud_rc=$?
+  _ud_have=$(wc -c < "$4" 2>/dev/null | tr -d ' ')
+  case "$_ud_want" in ''|*[!0-9]*) _ud_want="" ;; esac
+  if [ "$_ud_rc" -eq 0 ] && [ -n "$_ud_have" ] && [ "$_ud_have" -ge 1000000 ] \
+     && { [ -z "$_ud_want" ] || [ "$_ud_have" = "$_ud_want" ]; }; then
+    return 0
+  fi
+  rm -f "$4"
+  return 1
+}
+
+# _cp_bin <源> <目标>：拷贝内核文件（几十 MB）。小内存机器上分段落盘，别的机器照常 cp。
+_cp_bin() {
+  if [ "$LOW_MEM" = "1" ] && _drip_to "$2" < "$1" && chmod 0755 "$2"; then
+    return 0
+  fi
+  _pace_start
+  cp -a "$1" "$2"
+  _cb_rc=$?
+  _pace_stop
+  return "$_cb_rc"
+}
+
 _http_save() { # _http_save URL 输出文件 [请求头]
+  _pace_start
+  _http_save_raw "$@"
+  _hs_rc=$?
+  _pace_stop
+  return "$_hs_rc"
+}
+
+_http_save_raw() {
   _hs_url="$1"; _hs_out="$2"; _hs_hdr="${3:-}"
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$_hs_hdr" ]; then
@@ -3215,6 +3295,11 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
     sing-box) _si_bin="$SB_BIN"; _si_args="run -c $_si_cfg"; _si_tpl=/etc/systemd/system/singbox-node@.service; _si_unit="singbox-node@${_si_id}" ;;
     *)        _si_bin="$XRAY_BIN"; _si_args="-config $_si_cfg"; _si_tpl=/etc/systemd/system/xray-node@.service; _si_unit="xray-node@${_si_id}" ;;
   esac
+  # 小内存机器上 Xray / sing-box 也让 Go 勤快点回收内存，少占一些，不容易被系统杀掉
+  if [ "$LOW_MEM" = "1" ] && [ "$_si_core" != "hysteria" ]; then
+    _si_unit_env="Environment=GOGC=30"
+    _si_openrc_env="export GOGC=30"
+  fi
   SVC_UNIT="$_si_unit"
   _si_svc="xray-node-${_si_id}"
   install_expire_bins || true
@@ -3349,6 +3434,8 @@ RCEOF
     if [ "$_si_core" = "hysteria" ]; then
       _hy_export_env
       /usr/local/bin/xray-node-hop up "$_si_id" >/dev/null 2>&1 || true
+    elif [ "$LOW_MEM" = "1" ]; then
+      export GOGC=30
     fi
     # WireGuard 落地：装了 wg-luodi 时先让它改好配置（没装就跳过）
     [ -x /usr/local/bin/wg-luodi ] && /usr/local/bin/wg-luodi hook "$_si_id" >/dev/null 2>&1 || true
@@ -4282,6 +4369,17 @@ _cgroup_mem_mb() {
   return 1
 }
 
+# 容器里 /proc/meminfo 的 SwapTotal 常常是宿主机的，容器自己能用多少虚拟内存要看 cgroup。
+# 打印 kB。没限制（max）或读不到时返回 1。
+_cgroup_swap_kb() {
+  _csf=/sys/fs/cgroup/memory.swap.max
+  [ -r "$_csf" ] || return 1
+  _csv=$(tr -d ' \r\n' < "$_csf" 2>/dev/null)
+  case "$_csv" in ''|max|*[!0-9]*) return 1 ;; esac
+  [ "${#_csv}" -le 12 ] || return 1
+  printf '%s' $((_csv / 1024))
+}
+
 _disk_free_mb() { # _disk_free_mb <路径> -> 该路径所在磁盘剩余 MB
   df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}'
 }
@@ -4378,6 +4476,10 @@ prepare_low_memory() {
   fi
   _swap_kb=$(_read_meminfo_kb "SwapTotal:")
   _swap_kb=${_swap_kb:-0}
+  # 容器被限制了虚拟内存（常见是 0）时，按限制算，别把宿主机的当成自己的
+  if _cg_swap_kb=$(_cgroup_swap_kb) && [ "$_cg_swap_kb" -lt "$_swap_kb" ]; then
+    _swap_kb="$_cg_swap_kb"
+  fi
   if [ "$_swap_kb" -ge 65536 ]; then
     SWAP_OK=1
     info "虚拟内存已经有了，直接用"
@@ -4619,14 +4721,27 @@ _dl_xray_inner() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
-    rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
-    unzip -o "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || die "解压失败"
-    [ -s "$DL_DIR/xray-dl/xray" ] || die "解压后没找到 xray 文件"
     # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
-    install -m 0755 "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" || die "安装 Xray 失败"
-    if ! "${XRAY_BIN}.new" version >/dev/null 2>&1; then
+    rm -f "${XRAY_BIN}.new"
+    if _unpack_drip zip "$DL_DIR/xray.zip" xray "${XRAY_BIN}.new"; then
+      # 小内存机器：边解压边落盘，直接写到目标位置，不再多拷一份 36MB
+      chmod 0755 "${XRAY_BIN}.new" || { rm -f "${XRAY_BIN}.new"; die "安装 Xray 失败"; }
+    else
+      rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
+      _pace_start
+      unzip -o -q "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || { _pace_stop; die "解压失败"; }
+      [ -s "$DL_DIR/xray-dl/xray" ] || { _pace_stop; die "解压后没找到 xray 文件"; }
+      install -m 0755 "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" || { _pace_stop; rm -f "${XRAY_BIN}.new"; die "安装 Xray 失败"; }
+      _pace_stop
+    fi
+    # 安装包用完就删：删掉以后它占的缓存马上还给系统，小内存机器试运行内核时才有地方
+    rm -rf "$DL_DIR"
+    drop_page_cache
+    _x_run=$("${XRAY_BIN}.new" version 2>&1)
+    _x_rc=$?
+    if [ "$_x_rc" -ne 0 ]; then
       rm -f "${XRAY_BIN}.new"
-      die "下载的 Xray 内核跑不起来，安装包可能有问题"
+      die "下载的 Xray 内核跑不起来（退出码 ${_x_rc}）。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_x_run" | tr '\n' ' ' | cut -c1-300)"
     fi
     mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
     _dns64_off
@@ -4702,19 +4817,28 @@ _dl_singbox_inner() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使�
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
     tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
-    rm -rf "$DL_DIR/sb-dl" && mkdir -p "$DL_DIR/sb-dl"
-    tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || die "解压失败"
     # 包内顶层目录名跟包名走（不同候选包名目录名不同），动态探测，不写死
     _sb_inner=$(tar tzf "$DL_DIR/sb.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)
-    [ -n "$_sb_inner" ] && [ -s "$DL_DIR/sb-dl/${_sb_inner}/sing-box" ] \
-      || die "解压后没找到 sing-box 文件"
+    [ -n "$_sb_inner" ] || die "解压后没找到 sing-box 文件"
     # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
-    install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" || die "安装 sing-box 失败"
+    rm -f "${SB_BIN}.new"
+    if _unpack_drip tgz "$DL_DIR/sb.tar.gz" "${_sb_inner}/sing-box" "${SB_BIN}.new"; then
+      # 小内存机器：边解压边落盘，直接写到目标位置
+      chmod 0755 "${SB_BIN}.new" || { rm -f "${SB_BIN}.new"; die "安装 sing-box 失败"; }
+    else
+      rm -rf "$DL_DIR/sb-dl" && mkdir -p "$DL_DIR/sb-dl"
+      _pace_start
+      tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || { _pace_stop; die "解压失败"; }
+      [ -s "$DL_DIR/sb-dl/${_sb_inner}/sing-box" ] || { _pace_stop; die "解压后没找到 sing-box 文件"; }
+      install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" || { _pace_stop; rm -f "${SB_BIN}.new"; die "安装 sing-box 失败"; }
+      _pace_stop
+    fi
+    # 安装包用完就删，占的缓存马上还给系统
+    rm -rf "$DL_DIR"
     drop_page_cache
     _sb_run=$("${SB_BIN}.new" version 2>&1)
     if [ $? -ne 0 ]; then
       rm -f "${SB_BIN}.new"
-      rm -rf "$DL_DIR"
       die "下载的 sing-box 内核跑不起来。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "$_sb_run" | tr '\n' ' ' | cut -c1-300)"
     fi
     mv -f "${SB_BIN}.new" "$SB_BIN"
@@ -5242,7 +5366,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
       if [ -x "$_u_bin" ]; then
         _u_backup=$(mktemp "${_u_bin}.bak.XXXXXX") ||
           die "$_ucore 无法创建备份文件，升级已取消"
-        cp -a "$_u_bin" "$_u_backup" ||
+        _cp_bin "$_u_bin" "$_u_backup" ||
           { rm -f "$_u_backup"; die "$_ucore 旧内核备份失败，升级已取消"; }
         info "旧内核备份：$_u_backup"
       fi
@@ -5278,7 +5402,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
           # 不能 cp 到正在运行的可执行文件：其他节点可能正运行新版，会触发 ETXTBSY。
           # 在同一目录先写临时文件，再原子替换路径，并保留备份直到全部恢复成功。
           rm -f "${_u_bin}.rollback"
-          cp -a "$_u_backup" "${_u_bin}.rollback" ||
+          _cp_bin "$_u_backup" "${_u_bin}.rollback" ||
             die "回滚文件写入失败，备份仍在 ${_u_backup}，请手动恢复"
           mv -f "${_u_bin}.rollback" "$_u_bin" ||
             die "回滚替换失败，备份仍在 ${_u_backup}，请手动恢复"
