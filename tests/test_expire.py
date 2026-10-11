@@ -28,7 +28,7 @@ class MenuSplitTest(unittest.TestCase):
         self.assertIn("3) 关闭 IPv6（这台服务器以后只通过 IPv4 访问网站和 App，效果和没有 IPv6 一样。重启后也保持关闭）", source)
         self.assertIn("4) 开启 IPv6（恢复使用。服务商没分配地址的话，打开后仍然没有 IPv6）", source)
         self.assertIn("5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）", source)
-        self.assertIn("7) 1 周（7 天）", source)
+        self.assertIn("9) 1 周（7 天）", source)
         self.assertIn("2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）", source)
         self.assertIn("3) 节点管理（查看所有节点、删除某个节点）", source)
         self.assertIn("4) 取消，什么都不做", source)
@@ -67,15 +67,17 @@ class MenuSplitTest(unittest.TestCase):
         self.assertIn("RESULT 0 ", run("\n"))
         self.assertIn("永久节点", run("1\n"))
         self.assertIn("WARN 没有这个选项，按永久节点安装", run("9\n"))
-        week = run("2\n7\n")
+        week = run("2\n9\n")
         self.assertIn("RESULT 604800 1 周", week)
         self.assertIn("定时节点", week)
-        self.assertIn("RESULT 3600 1 小时", run("2\n1\n"))
+        self.assertIn("RESULT 600 10 分钟", run("2\n1\n"))
+        self.assertIn("RESULT 1800 30 分钟", run("2\n2\n"))
+        self.assertIn("RESULT 3600 1 小时", run("2\n3\n"))
         self.assertIn("RESULT 86400 24 小时", run("2\n\n"))
-        self.assertIn("WARN 没有这个选项，按 24 小时算", run("2\n8\n"))
+        self.assertIn("WARN 没有这个选项，按 24 小时算", run("2\n10\n"))
 
         lone = subprocess.run(
-            ["sh", "-c", helpers + "\n_set_expire_choice 3 && printf '%s\\n' \"$EXPIRE_AFTER\"\n_set_expire_choice 0"],
+            ["sh", "-c", helpers + "\n_set_expire_choice 5 && printf '%s\\n' \"$EXPIRE_AFTER\"\n_set_expire_choice 0"],
             text=True,
             capture_output=True,
             timeout=10,

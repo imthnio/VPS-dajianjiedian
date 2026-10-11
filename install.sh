@@ -13,7 +13,7 @@
 #
 # 节点分两种，装的时候先选：
 #   永久节点：一直有效
-#   定时节点：1 小时、2 小时、6 小时、24 小时、48 小时、72 小时或 1 周
+#   定时节点：10 分钟、30 分钟、1 小时、2 小时、6 小时、24 小时、48 小时、72 小时或 1 周
 # 同一个菜单里可以关闭或开启 IPv6。关掉之后，这台服务器只通过 IPv4
 # 访问网站和 App，效果和没有 IPv6 一样，重启后也保持关闭。
 # 定时节点到点后大约一分钟内彻底失效：停服务、作废链接、删配置和防火墙规则。
@@ -399,7 +399,7 @@ _unpack_drip() {
     *) return 1 ;;
   esac
   _ud_rc=$?
-  _ud_have=$(wc -c < "$4" 2>/dev/null | tr -d ' ')
+  _ud_have=$(wc -c 2>/dev/null < "$4" | tr -d ' ')
   case "$_ud_want" in ''|*[!0-9]*) _ud_want="" ;; esac
   if [ "$_ud_rc" -eq 0 ] && [ -n "$_ud_have" ] && [ "$_ud_have" -ge 1000000 ] \
      && { [ -z "$_ud_want" ] || [ "$_ud_have" = "$_ud_want" ]; }; then
@@ -635,7 +635,7 @@ _gh_hint() {
 
 # 下载的安装包先放到硬盘上的临时目录，装完就删。
 # pick_dldir: 选一个磁盘上的下载目录（/tmp 可能是内存盘，大文件下载会爆内存）
-# 优先 /var/tmp，其次 $HOME，最后才 /tmp。打印目录路径，失败返回非零。
+# 优先 /var/tmp，其次 ${HOME}，最后才 /tmp。打印目录路径，失败返回非零。
 pick_dldir() {
   for _cand in /var/tmp "$HOME" /tmp; do
     if [ -d "$_cand" ] && [ -w "$_cand" ]; then
@@ -873,13 +873,15 @@ _nft_drop_chains() {
 
 _set_expire_choice() { # 定时节点菜单编号 -> EXPIRE_AFTER（秒）和 EXPIRE_LABEL
   case "$1" in
-    1) EXPIRE_AFTER=3600; EXPIRE_LABEL="1 小时" ;;
-    2) EXPIRE_AFTER=7200; EXPIRE_LABEL="2 小时" ;;
-    3) EXPIRE_AFTER=21600; EXPIRE_LABEL="6 小时" ;;
-    4) EXPIRE_AFTER=86400; EXPIRE_LABEL="24 小时" ;;
-    5) EXPIRE_AFTER=172800; EXPIRE_LABEL="48 小时" ;;
-    6) EXPIRE_AFTER=259200; EXPIRE_LABEL="72 小时" ;;
-    7) EXPIRE_AFTER=604800; EXPIRE_LABEL="1 周" ;;
+    1) EXPIRE_AFTER=600; EXPIRE_LABEL="10 分钟" ;;
+    2) EXPIRE_AFTER=1800; EXPIRE_LABEL="30 分钟" ;;
+    3) EXPIRE_AFTER=3600; EXPIRE_LABEL="1 小时" ;;
+    4) EXPIRE_AFTER=7200; EXPIRE_LABEL="2 小时" ;;
+    5) EXPIRE_AFTER=21600; EXPIRE_LABEL="6 小时" ;;
+    6) EXPIRE_AFTER=86400; EXPIRE_LABEL="24 小时" ;;
+    7) EXPIRE_AFTER=172800; EXPIRE_LABEL="48 小时" ;;
+    8) EXPIRE_AFTER=259200; EXPIRE_LABEL="72 小时" ;;
+    9) EXPIRE_AFTER=604800; EXPIRE_LABEL="1 周" ;;
     *) return 1 ;;
   esac
 }
@@ -888,20 +890,22 @@ _choose_expire_duration() {
   printf "\n定时节点多久后失效？从安装完成开始算，用的是这台服务器的时间。\n"
   printf "到点后大约一分钟内，这个节点会被彻底删掉：服务停掉，链接作废，配置和防火墙一起清掉。\n"
   printf "服务器中间重启过也一样。其它节点不受影响。\n"
-  printf "  1) 1 小时\n"
-  printf "  2) 2 小时\n"
-  printf "  3) 6 小时\n"
-  printf "  4) 24 小时\n"
-  printf "  5) 48 小时\n"
-  printf "  6) 72 小时\n"
-  printf "  7) 1 周（7 天）\n"
+  printf "  1) 10 分钟\n"
+  printf "  2) 30 分钟\n"
+  printf "  3) 1 小时\n"
+  printf "  4) 2 小时\n"
+  printf "  5) 6 小时\n"
+  printf "  6) 24 小时\n"
+  printf "  7) 48 小时\n"
+  printf "  8) 72 小时\n"
+  printf "  9) 1 周（7 天）\n"
   printf "不知道选多久就回车，默认 24 小时。\n"
-  ask "请选择" "4" _ed
+  ask "请选择" "6" _ed
   if _set_expire_choice "$_ed"; then
     info "种类：定时节点，${EXPIRE_LABEL}后彻底失效"
   else
     warn "没有这个选项，按 24 小时算"
-    _set_expire_choice 4
+    _set_expire_choice 6
     info "种类：定时节点，${EXPIRE_LABEL}后彻底失效"
   fi
 }
@@ -968,6 +972,8 @@ _node_name() { # _node_name <协议显示名> -> 不和已有节点重名的名�
   _nn_base="${NODE_REGION:-未知地区}$1"
   _nn="$_nn_base"
   _nn_i=1
+  # 名字本来就以数字结尾（Hysteria2）时加个短横，免得第二个节点叫成 Hysteria22
+  case "$_nn_base" in *[0-9]) _nn_sep="-" ;; *) _nn_sep="" ;; esac
   while :; do
     _nn_dup=0
     for _nn_f in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/name; do
@@ -976,7 +982,7 @@ _node_name() { # _node_name <协议显示名> -> 不和已有节点重名的名�
     done
     [ "$_nn_dup" = "0" ] && break
     _nn_i=$((_nn_i + 1))
-    _nn="${_nn_base}${_nn_i}"
+    _nn="${_nn_base}${_nn_sep}${_nn_i}"
   done
   printf '%s' "$_nn"
 }
@@ -1353,7 +1359,7 @@ _kw() { # _kw <关键字> <一行 ip 输出>：打印关键字后面的那个词
 
 _is_udp_node() { # 只有 UDP 节点才需要：Hysteria2、TUIC、Shadowsocks
   _d="$NODES_DIR/$id"
-  core=$(tr -d ' \r\n' < "$_d/core" 2>/dev/null)
+  core=$(tr -d ' \r\n' 2>/dev/null < "$_d/core")
   case "$core" in
     hysteria) [ -f "$_d/config.yaml" ] ;;
     sing-box) grep -q '"type": *"tuic"' "$_d/config.json" 2>/dev/null ;;
@@ -1662,7 +1668,7 @@ ACME_WINDOW=${XRAY_ACME_WINDOW:-2764800}
 _log() {
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
   # 日志超过 64KB 只留最后 200 行，不会越写越大
-  if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+  if [ -f "$LOG" ] && [ "$(wc -c 2>/dev/null < "$LOG" || echo 0)" -gt 65536 ]; then
     tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
   fi
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$1" >> "$LOG" 2>/dev/null
@@ -1673,7 +1679,7 @@ _has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d "$SD_RUN" ]; }
 # 节点服务正在跑吗？没在跑的节点不补规则、不开端口。
 _active() {
   if _has_systemd; then
-    case "$(tr -d ' \r\n' < "$NODES_DIR/$1/core" 2>/dev/null)" in
+    case "$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/core")" in
       sing-box) systemctl is-active --quiet "singbox-node@$1" ;;
       xray) systemctl is-active --quiet "xray-node@$1" ;;
       *) systemctl is-active --quiet "hysteria-node@$1" ;;
@@ -1686,8 +1692,8 @@ _active() {
   fi
   for _ap in /proc/[0-9]*/cmdline; do
     case "$_ap" in "/proc/$$/"*) continue ;; esac
-    tr '\000' ' ' < "$_ap" 2>/dev/null | grep -qF "$NODES_DIR/$1/config.yaml" && return 0
-    tr '\000' ' ' < "$_ap" 2>/dev/null | grep -qF "$NODES_DIR/$1/config.json" && return 0
+    tr '\000' ' ' 2>/dev/null < "$_ap" | grep -qF "$NODES_DIR/$1/config.yaml" && return 0
+    tr '\000' ' ' 2>/dev/null < "$_ap" | grep -qF "$NODES_DIR/$1/config.json" && return 0
   done
   return 1
 }
@@ -1981,7 +1987,7 @@ _disarm_openrc() {
 
 _kill_loop() {
   [ -f "$PIDF" ] || return 0
-  _kp=$(tr -d ' \r\n' < "$PIDF" 2>/dev/null)
+  _kp=$(tr -d ' \r\n' 2>/dev/null < "$PIDF")
   case "$_kp" in ''|*[!0-9]*) ;; *) kill "$_kp" >/dev/null 2>&1 || true ;; esac
   rm -f "$PIDF"
 }
@@ -2014,7 +2020,7 @@ EOF
   fi
   # 什么服务管理器都没有：后台循环。已经在跑就不再开第二个。
   if [ -f "$PIDF" ]; then
-    _op=$(tr -d ' \r\n' < "$PIDF" 2>/dev/null)
+    _op=$(tr -d ' \r\n' 2>/dev/null < "$PIDF")
     case "$_op" in ''|*[!0-9]*) ;; *) kill -0 "$_op" 2>/dev/null && return 0 ;; esac
   fi
   nohup "$SELF" loop >/dev/null 2>&1 &
@@ -2093,7 +2099,7 @@ _ipv6_is_off() {
   _iv_root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
   _iv_all="${_iv_root}/all/disable_ipv6"
   if [ -f "$_iv_all" ]; then
-    [ "$(tr -d ' \r\n' < "$_iv_all" 2>/dev/null)" = "1" ]
+    [ "$(tr -d ' \r\n' 2>/dev/null < "$_iv_all")" = "1" ]
     return $?
   fi
   [ -f "$(_ipv6_conf_path)" ]
@@ -2108,7 +2114,7 @@ _ipv6_apply() { # _ipv6_apply 0|1：立刻生效。以 all/disable_ipv6 的结�
     printf '%s\n' "$_iv" > "$_f" 2>/dev/null || true
   done
   _all="${_root}/all/disable_ipv6"
-  if [ ! -f "$_all" ] || [ "$(tr -d ' \r\n' < "$_all" 2>/dev/null)" != "$_iv" ]; then
+  if [ ! -f "$_all" ] || [ "$(tr -d ' \r\n' 2>/dev/null < "$_all")" != "$_iv" ]; then
     if command -v sysctl >/dev/null 2>&1; then
       sysctl -w "net.ipv6.conf.all.disable_ipv6=${_iv}" >/dev/null 2>&1 || true
       sysctl -w "net.ipv6.conf.default.disable_ipv6=${_iv}" >/dev/null 2>&1 || true
@@ -2116,7 +2122,7 @@ _ipv6_apply() { # _ipv6_apply 0|1：立刻生效。以 all/disable_ipv6 的结�
     fi
   fi
   [ -f "$_all" ] || return 1
-  [ "$(tr -d ' \r\n' < "$_all" 2>/dev/null)" = "$_iv" ]
+  [ "$(tr -d ' \r\n' 2>/dev/null < "$_all")" = "$_iv" ]
 }
 
 _ipv6_sysctl_block() { # off|on：改 sysctl.conf 里的标记段，开机时还会再关一次。
@@ -2372,7 +2378,7 @@ _ipv6_turn_off() {
   # 文件能写，不代表写进去的值会留下来。先试一次；读不回来就不要改节点。
   # 试写会立刻关掉 IPv6。忽略挂断，把原值写回后再改节点，避免连上的会话一断脚本就停。
   if [ -f "$_root/all/disable_ipv6" ]; then
-    _iv_old=$(tr -d ' \r\n' < "$_root/all/disable_ipv6" 2>/dev/null || true)
+    _iv_old=$(tr -d ' \r\n' 2>/dev/null < "$_root/all/disable_ipv6" || true)
     if [ "$_iv_old" != "1" ]; then
       trap '' HUP
       if ! _ipv6_apply 1; then
@@ -2522,7 +2528,7 @@ _log() {
 
 _due() {
   [ -f "$1" ] || return 1
-  _ts=$(tr -d ' \r\n' < "$1" 2>/dev/null) || return 1
+  _ts=$(tr -d ' \r\n' 2>/dev/null < "$1") || return 1
   case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
   _now=$(date +%s 2>/dev/null) || return 1
   [ "$_now" -ge "$_ts" ]
@@ -2570,7 +2576,7 @@ _del_fw() {
 
 _stop_outside() {
   _x_id=$1
-  _x_core=$(tr -d ' \r\n' < "$NODES_DIR/$_x_id/core" 2>/dev/null || true)
+  _x_core=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$_x_id/core" || true)
   if command -v systemctl >/dev/null 2>&1 && [ -d "${XRAY_SYSTEMD_RUN:-/run/systemd/system}" ]; then
     case "$_x_core" in
       sing-box) _x_unit="singbox-node@${_x_id}" ;;
@@ -2710,7 +2716,7 @@ _bin_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 1
 
 _is_due() {
   [ -f "$1" ] || return 1
-  _ts=$(tr -d ' \r\n' < "$1" 2>/dev/null) || return 1
+  _ts=$(tr -d ' \r\n' 2>/dev/null < "$1") || return 1
   case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
   _now=$(date +%s 2>/dev/null) || return 1
   [ "$_now" -ge "$_ts" ]
@@ -2860,7 +2866,7 @@ EOF
   fi
   _aw_pid=${XRAY_EXPIRE_PID:-/run/xray-node-expire.pid}
   if [ -f "$_aw_pid" ]; then
-    _aw_old=$(tr -d ' \r\n' < "$_aw_pid" 2>/dev/null || true)
+    _aw_old=$(tr -d ' \r\n' 2>/dev/null < "$_aw_pid" || true)
     case "$_aw_old" in
       ''|*[!0-9]*) ;;
       *)
@@ -2914,7 +2920,7 @@ _node_info() {
   _ni_proto=$(grep -m1 '^协议: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^协议: //')
   _ni_port=$(grep -m1 '^端口: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^端口: //')
   _ni_kind="永久节点"
-  _ni_exp=$(tr -d ' \r\n' < "$NODES_DIR/$1/expire" 2>/dev/null || true)
+  _ni_exp=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/expire" || true)
   case "$_ni_exp" in
     ''|*[!0-9]*) ;;
     *)
@@ -2966,7 +2972,10 @@ _del_fw_rules() {
         "$_fipbin" -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
       fi
     fi
-    echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
+    # 装的时候一条防火墙规则都没加（比如容器里改不了防火墙），就别说撤销了
+    if [ "$_fufw$_ffwl$_fipt" != "000" ]; then
+      echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
+    fi
   done < "$1"
   # iptables 删了规则也要存盘，不然重启后删掉的规则又回来了。两种地址分开存。
   [ "$_fipt_v4" = "1" ] && _fw_save 4
@@ -2976,7 +2985,7 @@ _del_fw_rules() {
 # _stop_remove_svc <节点id>：停掉并删除该节点的服务，不碰其它节点
 _stop_remove_svc() {
   _x_id="$1"
-  _x_core=$(tr -d ' \r\n' < "$NODES_DIR/$_x_id/core" 2>/dev/null)
+  _x_core=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$_x_id/core")
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     case "$_x_core" in
       sing-box) _x_unit="singbox-node@${_x_id}" ;;
@@ -3262,7 +3271,7 @@ _hy_perms() {
 # 没有 systemd 的机器（Alpine 等）用 OpenRC；两者都没有就用 nohup 放到后台跑（重启后要重跑脚本）。
 _svc_install() { # _svc_install <节点id>：按该节点的 core 装好开机自启服务并启动（systemd 模板实例 / OpenRC 独立脚本 / 兜底后台）
   _si_id="$1"
-  _si_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_si_id"/core 2>/dev/null)
+  _si_core=$(tr -d ' \r\n' 2>/dev/null < /etc/xray-node/nodes/"$_si_id"/core)
   _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.json
   _si_unit_env=""
   _si_openrc_env=""
@@ -3824,7 +3833,7 @@ _hy_migrate_hop_all() {
       _svc_restart "$_mh_id"
       if wait_for_port "$_mh_main" udp 15; then
         rm -f "${_mh_cfg}.bak-hop"
-        info "节点 $_mh_id 的端口跳跃改成了新写法：主端口 $_mh_main，跳跃端口 $_mh_hops"
+        info "节点 $_mh_id 的端口跳跃改成了新写法：主端口 ${_mh_main}，跳跃端口 $_mh_hops"
         continue
       fi
     fi
@@ -4051,7 +4060,7 @@ _quic_unblock_all() {
     if [ ! -f "${_qu_d}core" ] || [ ! -f "${_qu_d}node.txt" ]; then continue; fi
     _qu_id=$(basename "$_qu_d")
     case "$_qu_id" in ''|*[!0-9]*) continue ;; esac
-    _qu_core=$(tr -d ' \r\n' < "${_qu_d}core" 2>/dev/null)
+    _qu_core=$(tr -d ' \r\n' 2>/dev/null < "${_qu_d}core")
     case "$_qu_core" in
       xray) _qu_cfg="${_qu_d}config.json" ;;
       sing-box) _qu_cfg="${_qu_d}config.json" ;;
@@ -4085,7 +4094,7 @@ _quic_unblock_all() {
         if _qu_pp=$(_node_port "$_qu_id"); then _qu_port=${_qu_pp%% *}; _qu_proto=${_qu_pp#* }; fi
         if [ -n "$_qu_port" ] && wait_for_port "$_qu_port" "$_qu_proto" 15; then
           rm -f "${_qu_cfg}.bak-quic"
-          info "节点 $_qu_id：已去掉服务器端拦 QUIC（以后在客户端里打开「阻止 QUIC」）"
+          info "节点 ${_qu_id}：已去掉服务器端拦 QUIC（以后在客户端里打开「阻止 QUIC」）"
         else
           mv -f "${_qu_cfg}.bak-quic" "$_qu_cfg"
           _svc_restart "$_qu_id"
@@ -4130,7 +4139,7 @@ _route_refresh_all() {
     _rr_id=$(basename "$_rr_d")
     case "$_rr_id" in ''|*[!0-9]*) continue ;; esac
     if [ -d /run/systemd/system ]; then
-      case "$(tr -d ' \r\n' < "${_rr_d}core" 2>/dev/null)" in
+      case "$(tr -d ' \r\n' 2>/dev/null < "${_rr_d}core")" in
         sing-box) _rr_unit=/etc/systemd/system/singbox-node@.service ;;
         hysteria) _rr_unit=/etc/systemd/system/hysteria-node@.service ;;
         *) _rr_unit=/etc/systemd/system/xray-node@.service ;;
@@ -4278,7 +4287,7 @@ _hy_fix_existing_ipv6() {
 
 # ---------- 更新内核时用的小工具：读端口、比版本号 ----------
 _node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
-  read -r _np_port _np_proto _np_rest < /etc/xray-node/nodes/"$1"/fw_info 2>/dev/null
+  read -r _np_port _np_proto _np_rest 2>/dev/null < /etc/xray-node/nodes/"$1"/fw_info
   [ -n "$_np_port" ] || return 1
   [ -n "$_np_proto" ] || _np_proto="tcp"
   printf "%s %s" "$_np_port" "$_np_proto"
@@ -4359,7 +4368,7 @@ _cgroup_mem_mb() {
               /sys/fs/cgroup/memory/memory.limit_in_bytes \
               /sys/fs/cgroup/memory.limit_in_bytes; do
     [ -r "$_cgf" ] || continue
-    _cgv=$(tr -d ' \r\n' < "$_cgf" 2>/dev/null)
+    _cgv=$(tr -d ' \r\n' 2>/dev/null < "$_cgf")
     case "$_cgv" in ''|max|*[!0-9]*) continue ;; esac
     [ "${#_cgv}" -le 12 ] || continue
     [ "$_cgv" -ge 1048576 ] || continue
@@ -4374,7 +4383,7 @@ _cgroup_mem_mb() {
 _cgroup_swap_kb() {
   _csf=/sys/fs/cgroup/memory.swap.max
   [ -r "$_csf" ] || return 1
-  _csv=$(tr -d ' \r\n' < "$_csf" 2>/dev/null)
+  _csv=$(tr -d ' \r\n' 2>/dev/null < "$_csf")
   case "$_csv" in ''|max|*[!0-9]*) return 1 ;; esac
   [ "${#_csv}" -le 12 ] || return 1
   printf '%s' $((_csv / 1024))
@@ -4464,7 +4473,7 @@ prepare_low_memory() {
   [ "$LOW_MEM" = "1" ] || return 0
   info "这台机器大约 ${MEM_MB:-很少}MB 内存。先准备虚拟内存，否则 Hysteria2 起不来。"
   if [ -w /proc/sys/vm/overcommit_memory ]; then
-    _oc=$(tr -d ' \r\n' < /proc/sys/vm/overcommit_memory 2>/dev/null)
+    _oc=$(tr -d ' \r\n' 2>/dev/null < /proc/sys/vm/overcommit_memory)
     if [ "$_oc" != "1" ]; then
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
         || printf '1\n' > /proc/sys/vm/overcommit_memory 2>/dev/null; then
@@ -4615,7 +4624,7 @@ _dl_hysteria_inner() { # 下载官方 Hysteria2。它是静态的小程序，64M
     warn "不知道最新版本号，取不到官方校验值，改为只检查程序能不能运行"
   fi
   # 小于 1MB 的多半是错误页，不是内核
-  _hy_sz=$(wc -c < "${HY_BIN}.new" 2>/dev/null | tr -d ' ')
+  _hy_sz=$(wc -c 2>/dev/null < "${HY_BIN}.new" | tr -d ' ')
   if [ -z "$_hy_sz" ] || [ "$_hy_sz" -lt 1000000 ]; then
     rm -f "${HY_BIN}.new"
     die "下载到的 Hysteria2 文件不完整，请重跑脚本"
@@ -4878,7 +4887,7 @@ done
 # 上面把目录都收成只有 root 能进。用普通用户 xray-node 跑的 Hysteria2 还要能读自己的配置和证书。
 if grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
   for _sec_dir in /etc/xray-node/nodes/*/; do
-    [ "$(tr -d ' \r\n' < "${_sec_dir}core" 2>/dev/null)" = "hysteria" ] || continue
+    [ "$(tr -d ' \r\n' 2>/dev/null < "${_sec_dir}core")" = "hysteria" ] || continue
     _hy_perms "$(basename "$_sec_dir")" xray-node
   done
 fi
@@ -4919,7 +4928,7 @@ _drop_partial_node() {
   [ -n "$_dp_id" ] && [ -n "$_dp_dir" ] && [ -d "$_dp_dir" ] || return 0
   [ -f "$_dp_dir/node.txt" ] && return 0
   case "$_dp_id" in ''|*[!0-9]*) return 0 ;; esac
-  _dp_core=$(tr -d ' \r\n' < "$_dp_dir/core" 2>/dev/null)
+  _dp_core=$(tr -d ' \r\n' 2>/dev/null < "$_dp_dir/core")
   _dp_sd=${XRAY_SYSTEMD_RUN:-/run/systemd/system}
   if command -v systemctl >/dev/null 2>&1 && [ -d "$_dp_sd" ]; then
     case "$_dp_core" in
@@ -4983,7 +4992,7 @@ _reap_partial_nodes
 # 先停旧服务、再起新服务，中间只断几秒。
 if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
   step "[迁移] 检测到老版本单节点，正在转为多节点管理（旧节点保留）…"
-  _m_core=$(tr -d ' \r\n' < /etc/xray-node/core 2>/dev/null)
+  _m_core=$(tr -d ' \r\n' 2>/dev/null < /etc/xray-node/core)
   case "$_m_core" in xray|sing-box) ;; *) _m_core="xray" ;; esac
   if [ "$_m_core" = "xray" ]; then
     _m_cfg=/usr/local/etc/xray/config.json
@@ -5306,7 +5315,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
   _u_cores=""
   for _ud in /etc/xray-node/nodes/*/; do
     [ -f "${_ud}core" ] || continue
-    _uc=$(tr -d ' \r\n' < "${_ud}core" 2>/dev/null)
+    _uc=$(tr -d ' \r\n' 2>/dev/null < "${_ud}core")
     case "$_uc" in
       xray|sing-box|hysteria)
         case " $_u_cores " in *" $_uc "*) ;; *) _u_cores="$_u_cores $_uc" ;; esac
@@ -5381,7 +5390,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
       _u_failed=""
       for _ud2 in /etc/xray-node/nodes/*/; do
         [ -f "${_ud2}core" ] || continue
-        _uc2=$(tr -d ' \r\n' < "${_ud2}core" 2>/dev/null)
+        _uc2=$(tr -d ' \r\n' 2>/dev/null < "${_ud2}core")
         [ "$_uc2" = "$_ucore" ] || continue
         _u_id=$(basename "$_ud2")
         _svc_restart "$_u_id"
@@ -5409,7 +5418,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
           # 所有共享此内核的节点都要切回旧版本，不能只重启刚才失败的节点。
           for _rd in /etc/xray-node/nodes/*/; do
             [ -f "${_rd}core" ] || continue
-            [ "$(tr -d ' \r\n' < "${_rd}core" 2>/dev/null)" = "$_ucore" ] || continue
+            [ "$(tr -d ' \r\n' 2>/dev/null < "${_rd}core")" = "$_ucore" ] || continue
             _rid=$(basename "$_rd")
             _svc_restart "$_rid"
             sleep 1

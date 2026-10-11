@@ -183,6 +183,10 @@ class NodeNameTest(unittest.TestCase):
             env = dict(os.environ, XRAY_NODES_DIR=str(nodes), NODE_REGION="香港")
             self.assertEqual(self.sh("_node_name Vless-Reality", env), "香港Vless-Reality3")
             self.assertEqual(self.sh("_node_name Hysteria2", env), "香港Hysteria2")
+            (nodes / "3").mkdir()
+            (nodes / "3" / "name").write_text("香港Hysteria2")
+            # 以数字结尾的名字加短横，不能变成 Hysteria22
+            self.assertEqual(self.sh("_node_name Hysteria2", env), "香港Hysteria2-2")
             env.pop("NODE_REGION")
             self.assertEqual(self.sh("_node_name TUIC", env), "未知地区TUIC")
 
