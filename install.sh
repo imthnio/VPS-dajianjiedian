@@ -3754,6 +3754,21 @@ ignoreClientBandwidth: true
 # 测速接口关掉，别人不能拿它来识别这是 Hysteria2。
 speedTest: false
 
+# 不许经过节点去连本机和内网地址（本机上的面板、数据库，云厂商的 169.254.169.254 元数据接口等）。
+# 别的地址不写规则：走第一个出站（默认直连；装了 wg-luodi 时就是它加的 WireGuard 出站）。
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+
 $_hy_masq
 $_hy_quic
 EOF
@@ -5621,7 +5636,7 @@ if [ -r /etc/wg-luodi/state ]; then
 fi
 # 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
 HY_HOP_PORTS=""
-HY2_USE_OBFS=1  # 默认开启混淆，安全第一（GFW已能审查QUIC流量）
+HY2_USE_OBFS=1
 HY2_DOMAIN=""
 HY2_ACME_TYPE=""
 if [ "$PROTO" = "hy2" ]; then
@@ -5676,7 +5691,8 @@ step "[生成] 随机生成账号和密码…"
 UUID=$(gen_uuid)
 TROJAN_PASS=$(rand_hex 16)
 ANYTLS_PASS=$(rand_hex 16)
-HY2_PASS=$(rand_hex 16)
+# Hysteria2 的登录密码和混淆密码都用 32 字节（64 个十六进制字符）。
+HY2_PASS=$(rand_hex 32)
 HY2_OBFS=$(rand_hex 32)
 TUIC_PASS=$(rand_hex 16)
 if command -v openssl >/dev/null 2>&1; then
@@ -5975,7 +5991,7 @@ esac
 case "$HY2_OBFS" in
   *[!0-9a-f]*|"") die "随机密码生成失败，没有装上节点" ;;
 esac
-[ "${#HY2_PASS}" -eq 32 ] && [ "${#HY2_OBFS}" -eq 32 ] || die "随机密码生成失败，没有装上节点"
+[ "${#HY2_PASS}" -eq 64 ] && [ "${#HY2_OBFS}" -eq 64 ] || die "随机密码生成失败，没有装上节点"
 if [ -n "$_hy_both" ]; then
   if [ "$IPVER" = "6" ]; then
     HY_EXTRA_IP=$(get_ip 4) || HY_EXTRA_IP=""
@@ -6515,7 +6531,7 @@ fi
       [ -n "$HY2_DOMAIN" ] && _hy_loon_cert="skip-cert-verify=false"
       _hy_loon_obfs=""
       if [ "$HY2_USE_OBFS" = "1" ]; then
-        _hy_loon_obfs=",salamander-password='${HY2_OBFS}'"
+        _hy_loon_obfs=",salamander-password=${HY2_OBFS}"
       fi
       _hy_loon_tail=""
       if [ -n "$HY_MPORT" ]; then
@@ -6538,7 +6554,7 @@ fi
       [ -n "$HY2_DOMAIN" ] && _hy_surge_cert="skip-cert-verify=false"
       _hy_surge_obfs=""
       if [ "$HY2_USE_OBFS" = "1" ]; then
-        _hy_surge_obfs=",salamander-password=${HY2_OBFS}"
+        _hy_surge_obfs=", salamander-password=${HY2_OBFS}"
       fi
       _hy_surge_hop=""
       if [ -n "$HY_MPORT" ]; then
