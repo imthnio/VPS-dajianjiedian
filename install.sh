@@ -3695,6 +3695,39 @@ _hy_ask_domain() {
   info "证书：给 ${HY2_DOMAIN} 申请正规证书（启动时自动申请，申请不下来会自动改回自签证书）"
 }
 
+# REALITY 客户端指纹（链接里的 fp=）：客户端握手时装成哪个浏览器，服务器不看这个值。
+# 只给 chrome / firefox / safari：几乎所有支持 REALITY 的客户端都认。ios、randomized 有的客户端不认。
+_reality_rand_fp() { # 从三个里随机挑一个；随机数取不到时用 chrome，保证链接里不会是空的 fp=
+  _rf_n=$(od -An -tu1 -N1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  case "$_rf_n" in ''|*[!0-9]*) _rf_n=0 ;; esac
+  case $((_rf_n % 3)) in
+    1) printf 'firefox' ;;
+    2) printf 'safari' ;;
+    *) printf 'chrome' ;;
+  esac
+}
+
+_reality_ask_fp() {
+  printf "\n客户端连接时装成哪个浏览器（指纹）？\n"
+  printf "  1) 随机（从 chrome、firefox、safari 里挑一个，每个节点不一样）\n"
+  printf "  2) chrome（用安卓、Windows 的人最多）\n"
+  printf "  3) safari（主要用 iPhone、iPad、Mac 的选这个）\n"
+  printf "  4) firefox\n"
+  printf "看不懂就回车，默认随机。\n"
+  while true; do
+    ask "请选择" "1" _fp_choice
+    case "$_fp_choice" in
+      1) REALITY_FP=$(_reality_rand_fp) ;;
+      2) REALITY_FP=chrome ;;
+      3) REALITY_FP=safari ;;
+      4) REALITY_FP=firefox ;;
+      *) warn "没有这个选项，请重新选择"; continue ;;
+    esac
+    info "指纹：$REALITY_FP"
+    return 0
+  done
+}
+
 # 写 Hysteria2 的配置文件。证书申请失败时会用自签证书再写一次，所以单独做成函数。
 _hy_write_config() {
   if [ -n "$HY2_DOMAIN" ]; then
@@ -5681,6 +5714,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     esac
   done
   info "伪装域名：$REALITY_DOMAIN"
+  _reality_ask_fp
 else
   step "[4/4] 这一步跳过（只有 REALITY 协议才需要选伪装域名）"
 fi
@@ -5731,11 +5765,8 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     REALITY_PUB=$(printf "%s" "$_out" | grep -i "publickey" | awk '{print $NF}' | tr -d '\r\n')
   fi
   [ -z "$REALITY_PRIV" ] || [ -z "$REALITY_PUB" ] && die "REALITY 密钥生成失败"
-  REALITY_SID=$(rand_hex 8)  # 8 字节 short-id，增强抗指纹识别能力
-  # uTLS 指纹随机选择，避免所有节点特征统一
-  _fps="chrome|firefox|safari|ios|randomized"
-  REALITY_FP=$(printf "%s" "$_fps" | tr '|' '\n' | sort -R | head -1)
-  info "REALITY 密钥已生成（指纹: $REALITY_FP）"
+  REALITY_SID=$(rand_hex 8)
+  info "REALITY 密钥已生成"
 fi
 
 # ---------- 9c. REALITY 伪装域名可用性检查 ----------
@@ -6386,10 +6417,10 @@ NAME_ENC=$(_urlenc "$NODE_NAME")
 [ -n "$NAME_ENC" ] || NAME_ENC="xray-node"
 case "$PROTO" in
   vless)
-    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP:-chrome}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   trojan)
-    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP:-chrome}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   vmess)
     _json="{\"v\":\"2\",\"ps\":\"${NODE_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
@@ -6399,7 +6430,7 @@ case "$PROTO" in
     LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
     ;;
   anytls)
-    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP:-chrome}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   hy2)
     # 证书：有正规证书时只写 sni；自签证书时写 insecure=1 + pinSHA256（官方客户端要两个一起写，
