@@ -5686,7 +5686,7 @@ else
   # gawk 在 UTF-8 环境会把 >127 的字节写成两个字节，密钥长度不对，Xray 校验失败。
   SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | base64 | tr -d '\n')
 fi
-WS_PATH="/$(rand_hex 4)"
+WS_PATH="/$(rand_hex 16)"  # 16 字节随机路径，防止被轻易探测
 info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
 
 # ---------- 8. 下载内核 ----------
@@ -5715,8 +5715,11 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     REALITY_PUB=$(printf "%s" "$_out" | grep -i "publickey" | awk '{print $NF}' | tr -d '\r\n')
   fi
   [ -z "$REALITY_PRIV" ] || [ -z "$REALITY_PUB" ] && die "REALITY 密钥生成失败"
-  REALITY_SID=$(rand_hex 4)
-  info "REALITY 密钥已生成"
+  REALITY_SID=$(rand_hex 8)  # 8 字节 short-id，增强抗指纹识别能力
+  # uTLS 指纹随机选择，避免所有节点特征统一
+  _fps="chrome|firefox|safari|ios|randomized"
+  REALITY_FP=$(printf "%s" "$_fps" | tr '|' '\n' | sort -R | head -1)
+  info "REALITY 密钥已生成（指纹: $REALITY_FP）"
 fi
 
 # ---------- 9c. REALITY 伪装域名可用性检查 ----------
@@ -6367,10 +6370,10 @@ NAME_ENC=$(_urlenc "$NODE_NAME")
 [ -n "$NAME_ENC" ] || NAME_ENC="xray-node"
 case "$PROTO" in
   vless)
-    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="vless://${UUID}@${LINK_IP}:${LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   trojan)
-    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="trojan://${TROJAN_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   vmess)
     _json="{\"v\":\"2\",\"ps\":\"${NODE_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
@@ -6380,7 +6383,7 @@ case "$PROTO" in
     LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
     ;;
   anytls)
-    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
+    LINK="anytls://${ANYTLS_PASS}@${LINK_IP}:${LINK_PORT}?security=reality&sni=${REALITY_DOMAIN}&fp=${REALITY_FP}&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#${NAME_ENC}"
     ;;
   hy2)
     # 证书：有正规证书时只写 sni；自签证书时写 insecure=1 + pinSHA256（官方客户端要两个一起写，
