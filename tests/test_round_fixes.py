@@ -307,3 +307,40 @@ class MigrationHelperTest(unittest.TestCase):
     def test_helpers_refreshed_right_after_migration(self):
         block = between('info "迁移完成：老节点已转为节点 1', "# ---------- 2d.")
         self.assertIn("write_helper_cmds", block.split("else", 1)[0])
+
+
+class RealityFingerprintTest(unittest.TestCase):
+    def run_ask(self, answers, od_stub=""):
+        script = (
+            "warn() { echo \"WARN $1\"; }\ninfo() { :; }\ndie() { echo \"DIE $1\"; exit 1; }\n"
+            + od_stub
+            + between("ask() {", "\nrand_hex() {") + "\n"
+            + between("_reality_rand_fp() {", "\n# 写 Hysteria2 的配置文件")
+            + "\n_reality_ask_fp\necho \"FP=$REALITY_FP\"\n"
+        )
+        return subprocess.run(["sh", "-c", script], input=answers, text=True, capture_output=True, timeout=10)
+
+    def test_default_is_random_from_three(self):
+        seen = set()
+        for _ in range(30):
+            out = self.run_ask("\n").stdout
+            seen.add(out.strip().rsplit(": ", 1)[-1])
+        self.assertTrue(seen <= {"FP=chrome", "FP=firefox", "FP=safari"}, seen)
+        self.assertGreater(len(seen), 1)
+
+    def test_fixed_choices_and_retry(self):
+        self.assertIn("FP=chrome", self.run_ask("2\n").stdout)
+        self.assertIn("FP=safari", self.run_ask("3\n").stdout)
+        out = self.run_ask("9\n4\n").stdout
+        self.assertIn("WARN 没有这个选项", out)
+        self.assertIn("FP=firefox", out)
+
+    def test_random_falls_back_to_chrome_without_od(self):
+        out = self.run_ask("1\n", "od() { return 1; }\n").stdout
+        self.assertIn("FP=chrome", out)
+
+    def test_links_never_have_empty_fp(self):
+        source = INSTALLER.read_text()
+        self.assertNotIn("sort -R", source)
+        self.assertNotIn("&fp=${REALITY_FP}&", source)
+        self.assertEqual(source.count("&fp=${REALITY_FP:-chrome}&"), 3)
