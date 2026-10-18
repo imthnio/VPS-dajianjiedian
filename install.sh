@@ -5621,7 +5621,7 @@ if [ -r /etc/wg-luodi/state ]; then
 fi
 # 只有 Hysteria2 才问。其它协议没有端口跳跃。看不懂就回车，不开启。
 HY_HOP_PORTS=""
-HY2_USE_OBFS=1
+HY2_USE_OBFS=1  # 默认开启混淆，安全第一（GFW已能审查QUIC流量）
 HY2_DOMAIN=""
 HY2_ACME_TYPE=""
 if [ "$PROTO" = "hy2" ]; then
@@ -5677,7 +5677,7 @@ UUID=$(gen_uuid)
 TROJAN_PASS=$(rand_hex 16)
 ANYTLS_PASS=$(rand_hex 16)
 HY2_PASS=$(rand_hex 16)
-HY2_OBFS=$(rand_hex 16)
+HY2_OBFS=$(rand_hex 32)
 TUIC_PASS=$(rand_hex 16)
 if command -v openssl >/dev/null 2>&1; then
   SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
@@ -6511,7 +6511,9 @@ fi
       _hy_loon_cert="skip-cert-verify=false,tls-cert-sha256=${HY2_PIN}"
       [ -n "$HY2_DOMAIN" ] && _hy_loon_cert="skip-cert-verify=false"
       _hy_loon_obfs=""
-      [ "$HY2_USE_OBFS" = "1" ] && _hy_loon_obfs=",salamander-password=${HY2_OBFS}"
+      if [ "$HY2_USE_OBFS" = "1" ]; then
+        _hy_loon_obfs=",salamander-password='${HY2_OBFS}'"
+      fi
       _hy_loon_tail=""
       if [ -n "$HY_MPORT" ]; then
         _hy_loon_tail=",server-ports=\"${HY_MPORT}\",hop-interval=30"
@@ -6532,7 +6534,9 @@ fi
       _hy_surge_cert="server-cert-fingerprint-sha256=${HY2_PIN}"
       [ -n "$HY2_DOMAIN" ] && _hy_surge_cert="skip-cert-verify=false"
       _hy_surge_obfs=""
-      [ "$HY2_USE_OBFS" = "1" ] && _hy_surge_obfs=", salamander-password=${HY2_OBFS}"
+      if [ "$HY2_USE_OBFS" = "1" ]; then
+        _hy_surge_obfs=",salamander-password=${HY2_OBFS}"
+      fi
       _hy_surge_hop=""
       if [ -n "$HY_MPORT" ]; then
         _hy_surge_hop=", port-hopping=\"$(printf '%s' "$HY_MPORT" | tr ',' ';')\", port-hopping-interval=30"
