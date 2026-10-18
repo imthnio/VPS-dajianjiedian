@@ -107,8 +107,23 @@ class ServerSideRemovedTest(unittest.TestCase):
         code = "\n".join(l for l in source.splitlines() if not l.lstrip().startswith("#"))
         self.assertNotIn("已在服务器上打开", code)
         write_cfg = between("_hy_write_config() {", "\n_hy_listen_for() {")
-        self.assertNotIn("acl:", write_cfg)
-        self.assertNotIn("reject(", write_cfg)
+        self.assertNotIn("udp/443", write_cfg)
+        self.assertNotIn("reject(all", write_cfg)
+
+    def test_hy2_acl_blocks_private_but_keeps_default_outbound(self):
+        write_cfg = between("_hy_write_config() {", "\n_hy_listen_for() {")
+        for cidr in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                     "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10"):
+            self.assertIn(f"    - reject({cidr})\n", write_cfg)
+        # 不能写 direct(all)：wg-luodi 加的出站要靠“没匹配就走第一个出站”生效
+        self.assertNotIn("direct(", write_cfg)
+
+    def test_hy2_random_secret_lengths_match_checks(self):
+        source = INSTALLER.read_text()
+        self.assertIn("HY2_PASS=$(rand_hex 32)\n", source)
+        self.assertIn("HY2_OBFS=$(rand_hex 32)\n", source)
+        self.assertIn('[ "${#HY2_PASS}" -eq 64 ] && [ "${#HY2_OBFS}" -eq 64 ]', source)
+        self.assertIn('_hy_loon_obfs=",salamander-password=${HY2_OBFS}"', source)
 
     def test_update_mode_runs_the_migration(self):
         source = INSTALLER.read_text()
