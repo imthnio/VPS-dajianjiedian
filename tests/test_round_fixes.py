@@ -512,3 +512,70 @@ openssl req -x509 -new -key {home}/../fixed.key -out {home}/"$dom"_ecc/fullchain
         # 巡检：有 acme_sh 的节点就算没有 fw_acme 也要续期；删节点先 acme-forget
         self.assertIn('[ -f "${_ad}fw_acme" ] || [ -f "${_ad}acme_sh" ] || continue', source)
         self.assertEqual(source.count("acme-forget \"$_d_id\""), 2)
+
+
+class AlpineOpenRCTest(unittest.TestCase):
+    """在 64MB 的 Alpine（OpenRC、busybox）上实测发现的问题。"""
+
+    def test_openrc_services_are_supervised(self):
+        source = INSTALLER.read_text()
+        fn = between("_openrc_bg() {", "\n# 从系统随机数源")
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "supervise-daemon").write_text("#!/bin/sh\n")
+            os.chmod(os.path.join(d, "supervise-daemon"), 0o755)
+            with_sd = run_sh(f"PATH={d}:$PATH\n" + fn + "\n_openrc_bg")
+        self.assertIn('supervisor="supervise-daemon"', with_sd.stdout)
+        self.assertIn("respawn_max=0", with_sd.stdout)
+        without = run_sh("PATH=/nonexistent\n" + fn + "\n_openrc_bg")
+        self.assertEqual(without.stdout, 'command_background="yes"')
+        # 节点、到点删除、巡检三个 OpenRC 服务都要被看着
+        self.assertEqual(source.count("$(_openrc_bg)"), 2)
+        self.assertIn('_ao_bg=\'supervisor="supervise-daemon"', source)
+        # 函数要定义在脚本前面：write_helper_cmds / arm_expire_watch 在主流程前段就会调用
+        self.assertLess(source.index("_openrc_bg() {"), source.index("\nwrite_helper_cmds\n"))
+
+    def test_service_rewrite_stops_old_process_first(self):
+        source = INSTALLER.read_text()
+        block = between('  elif command -v rc-service >/dev/null 2>&1; then', 'RCEOF')
+        self.assertIn('rc-service "$_si_svc" stop', block)
+        self.assertIn('pkill -f "$_si_cfg"', between('rc-service "$_si_svc" zap', 'rc-service "$_si_svc" start'))
+
+    def test_update_mode_supervises_existing_openrc_nodes(self):
+        source = INSTALLER.read_text()
+        self.assertIn("grep -q '^supervisor=\"supervise-daemon\"' \"/etc/init.d/xray-node-$_u3\"", source)
+
+    def test_no_pgrep_x(self):
+        # busybox 的 pgrep -x 匹配不到进程名
+        code = [l for l in INSTALLER.read_text().splitlines() if not l.lstrip().startswith("#")]
+        self.assertFalse([l for l in code if "pgrep -x" in l])
+
+    def test_readonly_proc_write_is_silent(self):
+        self.assertIn("{ printf '1\\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null", INSTALLER.read_text())
+
+    def test_cert_pin_without_openssl(self):
+        with tempfile.TemporaryDirectory() as d:
+            key = os.path.join(d, "k.pem")
+            cert = os.path.join(d, "c.pem")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                            "-days", "1", "-subj", "/CN=www.samsung.com"], check=True, capture_output=True)
+            want = subprocess.run(f"openssl x509 -in {cert} -outform der | openssl dgst -sha256", shell=True,
+                                  capture_output=True, text=True).stdout.split()[-1].upper()
+            fns = between("_sha256_of() {", "\n# _gh_get ") + "\n" + between("_cert_pin() {", "\n_timeout_cmd() {")
+            # 把 openssl 藏起来，只留 base64 / sha256 工具
+            bindir = os.path.join(d, "bin")
+            os.makedirs(bindir)
+            for tool in ("awk", "base64", "rm", "tr", "sha256sum", "shasum", "perl", "cat"):
+                p = subprocess.run(["sh", "-c", f"command -v {tool}"], capture_output=True, text=True).stdout.strip()
+                if p:
+                    os.symlink(p, os.path.join(bindir, tool))
+            got = run_sh(f"PATH={bindir}\n" + fns + f"\n_cert_pin {cert}")
+            self.assertEqual(got.stdout, want)
+
+    def test_tuic_surge_line_pins_cert(self):
+        fn = between("_cq_ok() {", "\n_cq_surge_line() {") + "\n" + between("_cq_surge_line() {", "\n_cq_section() {")
+        env = ('CQ_PROTO=tuic CQ_NAME=n CQ_HOST=1.2.3.4 CQ_PORT=443 CQ_UUID=u CQ_PASS=p\n')
+        pinned = run_sh(fn + "\n" + env + "CQ_PIN=" + "AB" * 32 + "\n_cq_surge_line")
+        self.assertIn("server-cert-fingerprint-sha256=" + "AB" * 32, pinned.stdout)
+        self.assertNotIn("skip-cert-verify=true", pinned.stdout)
+        old = run_sh(fn + "\n" + env + "CQ_PIN=\n_cq_surge_line")
+        self.assertIn("skip-cert-verify=true", old.stdout)

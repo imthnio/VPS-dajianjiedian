@@ -97,6 +97,16 @@ ask() { # ask "提示文字" "默认值" 变量名
   eval "$_v='$_a_esc'"
 }
 
+# OpenRC 服务怎么在后台跑。有 supervise-daemon 就让它看着进程：崩溃或者内存不够被系统杀掉，
+# 5 秒后自动拉起来（相当于 systemd 的 Restart=on-failure）。老版 OpenRC 没有它，只能普通后台启动。
+_openrc_bg() {
+  if command -v supervise-daemon >/dev/null 2>&1; then
+    printf 'supervisor="supervise-daemon"\nrespawn_delay=5\nrespawn_max=0'
+  else
+    printf 'command_background="yes"'
+  fi
+}
+
 # 从系统随机数源 /dev/urandom 取随机字节，转成 0-9a-f 的字符串。
 # 密码、REALITY 的 shortId、WebSocket 路径都用它生成，别人猜不到。
 rand_hex() { # rand_hex 字节数 -> 十六进制串
@@ -2015,13 +2025,21 @@ _disarm_systemd() {
 }
 
 _arm_openrc() {
+  # 有 supervise-daemon 就让它看着：被系统杀掉后自动拉起来
+  if command -v supervise-daemon >/dev/null 2>&1; then
+    _ao_bg='supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0'
+  else
+    _ao_bg='command_background="yes"'
+  fi
   cat > "$INITD/xray-node-watch" <<EOF
 #!/sbin/openrc-run
 name="xray-node-watch"
 description="xray-node watch: restore port-hopping rules, open certificate port when renewing"
 command="$SELF"
 command_args="loop"
-command_background="yes"
+$_ao_bg
 pidfile="/run/xray-node-watch-openrc.pid"
 depend() { after net firewall; }
 EOF
@@ -2886,7 +2904,7 @@ EOF
 name="xray-node-expire"
 description="Delete proxy nodes when their time is up"
 command="${_aw_loop}"
-command_background="yes"
+$(_openrc_bg)
 pidfile="/run/xray-node-expire.pid"
 depend() { after localmount; }
 EOF
@@ -3443,6 +3461,9 @@ EOF
       warn "节点 $_si_id 服务好像没起来，运行 systemctl status $_si_unit 看看原因"
     fi
   elif command -v rc-service >/dev/null 2>&1; then
+    # 先用旧的服务脚本把节点停掉。旧脚本和新脚本的启动方式可能不一样（后台启动 / supervise-daemon），
+    # 换了脚本再停就停不掉，旧进程会一直占着端口，新进程起不来。
+    [ -f "/etc/init.d/${_si_svc}" ] && rc-service "$_si_svc" stop >/dev/null 2>&1
     _si_rc_hop_up=":"
     _si_rc_hop_down=":"
     if [ "$_si_core" = "hysteria" ]; then
@@ -3456,7 +3477,7 @@ name="${_si_svc}"
 description="${_si_svc} proxy service"
 command="${_si_bin}"
 command_args="${_si_args}"
-command_background="yes"
+$(_openrc_bg)
 pidfile="/run/${_si_svc}.pid"
 output_log="/var/log/${_si_svc}.log"
 error_log="/var/log/${_si_svc}.log"
@@ -3487,6 +3508,8 @@ RCEOF
     rc-update add "$_si_svc" default >/dev/null 2>&1
     # 先清掉可能残留的旧状态，再启动（比 restart 更稳）
     rc-service "$_si_svc" zap >/dev/null 2>&1
+    # 停不掉的残留进程（比如以前服务状态乱了）还占着这个节点的端口，也清掉
+    pkill -f "$_si_cfg" >/dev/null 2>&1 && sleep 1
     rc-service "$_si_svc" start >/dev/null 2>&1
     sleep 1
     if rc-service "$_si_svc" status >/dev/null 2>&1; then
@@ -3796,6 +3819,14 @@ _hy_acmesh_get() {
   chmod 700 "$ACMESH_HOME/acme.sh.new" && mv -f "$ACMESH_HOME/acme.sh.new" "$ACMESH_HOME/acme.sh"
 }
 
+_hy_acmesh_in_use() { # 别的节点在用这个域名的 acme.sh 证书吗
+  for _aiu_f in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/acme_sh; do
+    [ -f "$_aiu_f" ] || continue
+    [ "$(head -1 "$_aiu_f" | tr -d ' \r\n')" = "$1" ] && return 0
+  done
+  return 1
+}
+
 # 申请成功：证书和私钥复制到节点目录，返回 0。失败返回 1，节点目录里还是自签证书。
 _hy_acmesh_issue() {
   _hy_acmesh_get || { warn "acme.sh 没下载下来"; return 1; }
@@ -3821,7 +3852,9 @@ _hy_acmesh_issue() {
   _ai_rc=$?
   # 2 = 这个域名已经有没到期的证书（比如同一个域名再装一个节点），直接用
   if [ "$_ai_rc" != 0 ] && [ "$_ai_rc" != 2 ]; then
-    grep -iE "error|invalid|timeout|refused|fail" "$NODE_DIR/acme.log" 2>/dev/null | tail -n 3 | cut -c1-200 | sed 's/^/  /'
+    grep -iE "error|invalid|timeout|refused|fail" "$NODE_DIR/acme.log" 2>/dev/null | tail -n 3 | cut -c1-300 | sed 's/^/  /'
+    # 没有别的节点在用这个域名，就把这次留下的私钥和记录删掉
+    _hy_acmesh_in_use "$HY2_DOMAIN" || rm -rf "$ACMESH_HOME/${HY2_DOMAIN}_ecc"
     return 1
   fi
   _ai_src="$ACMESH_HOME/${HY2_DOMAIN}_ecc"
@@ -4071,8 +4104,13 @@ _cq_surge_line() { # 打印 Surge 节点行。Surge 不支持 VLESS 和 REALITY�
       ;;
     tuic)
       _cq_ok "$CQ_UUID" "$CQ_PASS" || return 0
-      printf '%s = tuic-v5, %s, %s, uuid=%s, password=%s, alpn=h3, sni=www.samsung.com, skip-cert-verify=true, block-quic=on\n' \
-        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PASS"
+      # 有证书指纹就锁定它（老节点的 node.txt 里没有指纹，只能跳过验证）
+      case "$CQ_PIN" in
+        *[!0-9A-F]*|"") _cq_tls="skip-cert-verify=true" ;;
+        *) _cq_tls="server-cert-fingerprint-sha256=${CQ_PIN}" ;;
+      esac
+      printf '%s = tuic-v5, %s, %s, uuid=%s, password=%s, alpn=h3, sni=www.samsung.com, %s, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PASS" "$_cq_tls"
       ;;
   esac
   return 0
@@ -4123,6 +4161,7 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
   CQ_PASS=$(_cq_kv "密码")
   CQ_SNI=$(_cq_kv "伪装域名")
   CQ_PATH=$(_cq_kv "WS 路径")
+  CQ_PIN=$(_cq_kv "证书指纹")
   CQ_PBK=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
   CQ_SID=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]sid=\([^&#]*\).*/\1/p')
   return 0
@@ -4138,7 +4177,7 @@ _cq_fix_nodetxt() { # _cq_fix_nodetxt <节点目录>
   grep -q '^拦截 QUIC: \|^想在客户端也拦：' "$_cf_nt" 2>/dev/null || return 0
   (
     CQ_PROTO=""; CQ_NAME=""; CQ_HOST=""; CQ_PORT=""; CQ_UUID=""; CQ_PASS=""
-    CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""
+    CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""; CQ_PIN=""
     _cq_from_nodetxt "$1" || CQ_PROTO=""
     _cq_section
   ) > "$_cf_nt.quic" 2>/dev/null || { rm -f "$_cf_nt.quic"; return 1; }
@@ -4633,7 +4672,7 @@ prepare_low_memory() {
     _oc=$(tr -d ' \r\n' 2>/dev/null < /proc/sys/vm/overcommit_memory)
     if [ "$_oc" != "1" ]; then
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
-        || printf '1\n' > /proc/sys/vm/overcommit_memory 2>/dev/null; then
+        || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
         mkdir -p /etc/sysctl.d 2>/dev/null
         printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null
         info "已放开内存申请限制（小内存机器需要这一步）"
@@ -5314,6 +5353,20 @@ _dep_log="/tmp/xray-dep-apt.log"
 # 注意：这个函数定义在 if 外面——后面存 iptables 规则时也要用它装 iptables-persistent，
 # 放里面会导致"依赖本来就齐"时函数根本没定义、调用直接报错。
 # 有的精简系统没有 timeout。没有就自己计时，避免装 curl 时先报 timeout: not found。
+_cert_pin() { # _cert_pin <cert.pem> -> 证书的 SHA256（大写十六进制）。没有 openssl 也能算
+  if command -v openssl >/dev/null 2>&1; then
+    _cp=$(openssl x509 -in "$1" -outform der 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print toupper($NF)}')
+  else
+    _cp_der="$1.der.$$"
+    awk '/BEGIN CERTIFICATE/{p=1;next} /END CERTIFICATE/{exit} p' "$1" | base64 -d > "$_cp_der" 2>/dev/null
+    _cp=$(_sha256_of "$_cp_der" | tr 'a-f' 'A-F')
+    rm -f "$_cp_der"
+  fi
+  case "$_cp" in *[!0-9A-F]*|"") return 1 ;; esac
+  [ "${#_cp}" -eq 64 ] || return 1
+  printf '%s' "$_cp"
+}
+
 _timeout_cmd() {
   _tsec="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
@@ -5522,10 +5575,17 @@ if [ "$UPDATE_MODE" = "1" ]; then
         info "$_ucore 已经是最新版（v${_u_inst}），无需更新。"
         exit 0
       fi
+      # 读不出版本号，但有节点正用这个内核跑着：内核没坏，多半是内存太紧，跑 version 的小进程被系统杀了。
+      # 这时重新下载、解压更容易把机器撑爆，这次先不更新它。
+      # 用 pidof：busybox 的 pgrep -x 匹配不到进程名
+      if [ -z "$_u_inst" ] && [ -x "$_u_bin" ] && pidof "$(basename "$_u_bin")" >/dev/null 2>&1; then
+        warn "$_ucore 读不出版本号（内存太紧），但节点正在正常运行，这次先不更新它。"
+        exit 0
+      fi
       if [ -n "$_u_inst" ]; then
         info "$_ucore 当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
       else
-        warn "$_ucore 内核文件丢失或已损坏，直接下载最新版 v${_u_latest}（节点配置保留）。"
+        warn "$_ucore 内核读不出版本号（文件可能坏了，或者内存太紧跑不起来），直接下载最新版 v${_u_latest}（节点配置保留）。"
       fi
       # 每次升级用独立备份路径；上次失败留下的备份不会被覆盖。
       _u_backup=""
@@ -5603,6 +5663,20 @@ if [ "$UPDATE_MODE" = "1" ]; then
       info "$_ucore 升级完成"
       ) || _u_any_fail=1
     done
+    # OpenRC：旧版写的节点服务只是普通后台启动，崩溃或被内存不足杀掉后不会自己起来。
+    # 不管内核有没有更新，都换成 supervise-daemon 看着的写法；停着的节点顺便拉起来。
+    if command -v rc-service >/dev/null 2>&1 && command -v supervise-daemon >/dev/null 2>&1 \
+      && ! { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+      for _ud3 in /etc/xray-node/nodes/*/; do
+        [ -f "${_ud3}core" ] || continue
+        _u3=$(basename "$_ud3")
+        case "$_u3" in ''|*[!0-9]*) continue ;; esac
+        if ! grep -q '^supervisor="supervise-daemon"' "/etc/init.d/xray-node-$_u3" 2>/dev/null \
+          || ! rc-service "xray-node-$_u3" status >/dev/null 2>&1; then
+          _svc_restart "$_u3"
+        fi
+      done
+    fi
     # UDP 节点的回程路由（有策略路由的机器上，回包要走公网网卡）
     _route_refresh_all
     # 刷新 jiedian / shanjiedian（脚本可能修过它们）
@@ -5717,6 +5791,12 @@ case "$PROTO" in
   anytls|tuic) CORE="sing-box" ;;
   *) CORE="xray" ;;
 esac
+# 内存很小的机器上已经有节点了：每个节点都要占二三十 MB，再加一个可能把旧节点挤掉
+_old_nodes=0
+for _on in /etc/xray-node/nodes/*/core; do [ -f "$_on" ] && _old_nodes=$((_old_nodes + 1)); done
+if [ "$_old_nodes" -ge 1 ] && [ -n "$MEM_MB" ] && [ "$MEM_MB" -le 128 ]; then
+  warn "这台机器大约 ${MEM_MB}MB 内存，已经装了 ${_old_nodes} 个节点。每个节点要占二三十 MB，再加一个可能会因为内存不够把旧节点挤掉（被挤掉的会自动重启，但可能反复掉线）。内存这么小，建议只留一个节点，Hysteria2 最省内存。"
+fi
 
 # ---------- 5. 问：端口 ----------
 # 默认给一个随机的空闲端口。NAT VPS 的“公网映射端口”是服务商分配给你的外部端口，要写进链接。
@@ -5840,6 +5920,7 @@ ANYTLS_PASS=$(rand_hex 16)
 HY2_PASS=$(rand_hex 32)
 HY2_OBFS=$(rand_hex 32)
 TUIC_PASS=$(rand_hex 16)
+TUIC_PIN=""
 if command -v openssl >/dev/null 2>&1; then
   SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
 else
@@ -5987,6 +6068,8 @@ elif [ "$PROTO" = "tuic" ]; then
   rm -f "$NODE_DIR/tls.pem"
   [ -s "$NODE_DIR/key.pem" ] && [ -s "$NODE_DIR/cert.pem" ] \
     || die "自签证书生成失败"
+  # 证书指纹：客户端锁定这张证书，就不用“跳过证书验证”，别人冒充不了服务器
+  TUIC_PIN=$(_cert_pin "$NODE_DIR/cert.pem") || TUIC_PIN=""
   info "自签证书已生成"
 fi
 
@@ -6637,7 +6720,7 @@ fi
       if [ "$HY2_USE_OBFS" = "1" ]; then
         printf "混淆: 已开启（salamander）。别人不容易直接看出这是代理。\n"
         printf "混淆密码: %s\n" "$HY2_OBFS"
-        printf "请用上面的整行链接导入。手填时，节点密码和混淆密码是两个，不要填反。\n"
+        printf "手填时，节点密码和混淆密码是两个，不要填反。\n"
       else
         printf "混淆: 没开。别人探测时看到的是一个普通网站。\n"
       fi
@@ -6676,6 +6759,7 @@ fi
       if [ -n "$HY_MPORT" ]; then
         _hy_loon_tail=",server-ports=\"${HY_MPORT}\",hop-interval=30"
       fi
+      printf "Loon、Surge 请复制下面专门给的那一行导入，不要用上面的链接：用链接导入时证书指纹可能带不进去，「证书锁定」是空的就连不上。\n"
       printf "Loon 可粘贴这一行（已写好 block-quic=true，导入后自动打开阻止 QUIC）:\n"
       printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail"
@@ -6716,7 +6800,13 @@ fi
         printf "    obfs: salamander\n    obfs-password: %s\n" "$HY2_OBFS"
       fi
       ;;
-    tuic)        printf "SNI: www.samsung.com（自签证书，客户端已设跳过验证）\n" ;;
+    tuic)
+      printf "SNI: www.samsung.com（自签证书）\n"
+      if [ -n "$TUIC_PIN" ]; then
+        printf "证书指纹: %s\n" "$TUIC_PIN"
+        printf "Surge 用下面那一行导入，已经锁定证书指纹。其它客户端如果有「证书指纹 / 证书锁定」，填上面的值再关掉「跳过证书验证」，别人就冒充不了服务器。\n"
+      fi
+      ;;
   esac
   # 拦截 QUIC 是客户端的开关：给 Loon / Surge 各拼一行已经打开它的节点配置，再说明别的 App 怎么开
   CQ_PROTO="$PROTO"; CQ_NAME="$NODE_NAME"; CQ_HOST="$SERVER_IP"; CQ_PORT="$LINK_PORT"
@@ -6728,6 +6818,8 @@ fi
     anytls) CQ_PASS="$ANYTLS_PASS" ;;
     tuic)   CQ_PASS="$TUIC_PASS" ;;
   esac
+  CQ_PIN=""
+  [ "$PROTO" = "tuic" ] && CQ_PIN="${TUIC_PIN:-}"
   _cq_section
   printf -- "----------------------------------------------\n"
   if [ "$NODE_KIND" = "timed" ]; then
