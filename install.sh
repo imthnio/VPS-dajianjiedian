@@ -147,6 +147,27 @@ port_in_use() { # port_in_use <端口> <tcp|udp>
   printf '%s\n' "$_pi_list" | grep -Eq ":${_pi_port}[[:space:]]"
 }
 
+# 别的 Hysteria2 节点开了端口跳跃时，它的跳跃端口没有程序在听，ss 查不出来，
+# 但发到这些 UDP 端口的包都会被转发给那个节点。新节点再用这些 UDP 端口，就会被抢走流量、连不上。
+# _hop_taken <起> <止>：和已有节点的跳跃端口（含它的主端口）重叠时打印那个节点的编号，返回 0。
+_hop_taken() {
+  for _ht_f in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/hop; do
+    [ -f "$_ht_f" ] || continue
+    _ht_id=$(basename "$(dirname "$_ht_f")")
+    _ht_list="$(sed -n 's/^main=//p' "$_ht_f" 2>/dev/null | head -1) $(sed -n 's/^ports=//p' "$_ht_f" 2>/dev/null | head -1 | tr ',' ' ')"
+    for _ht_p in $_ht_list; do
+      case "$_ht_p" in ''|*[!0-9-]*) continue ;; esac
+      _ht_a=${_ht_p%-*}; _ht_b=${_ht_p#*-}
+      case "$_ht_a$_ht_b" in ''|*[!0-9]*) continue ;; esac
+      if [ "$1" -le "$_ht_b" ] && [ "$2" -ge "$_ht_a" ]; then
+        printf '%s' "$_ht_id"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
 # 随机挑一个没人用的端口当默认值。用 20000 以上的高端口，
 # 避开 22（SSH）、80/443（网站）这些常用端口，减少冲突。
 rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
@@ -167,7 +188,7 @@ rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
       tcp|both) port_in_use "$_p" tcp && _used=1 ;;
     esac
     case "$_rp_proto" in
-      udp|both) port_in_use "$_p" udp && _used=1 ;;
+      udp|both) { port_in_use "$_p" udp || _hop_taken "$_p" "$_p" >/dev/null; } && _used=1 ;;
     esac
     if [ "$_used" -eq 0 ]; then printf "%s" "$_p"; return 0; fi
   done
@@ -3653,6 +3674,11 @@ _hy_collect_hop_ports() {
       warn "和主端口或前面填过的端口重复了，请换一个。"
       continue
     fi
+    # 和别的节点的跳跃端口重叠：两张转发表抢同一批端口，总有一个节点连不上
+    if _hh_own=$(_hop_taken "$_hh_lo" "$_hh_hi"); then
+      warn "和节点 ${_hh_own} 的端口跳跃端口重复了，两个节点会抢同一批端口，请换一个。"
+      continue
+    fi
     if _hh_busy=$(_hy_hop_busy "$_hh_lo" "$_hh_hi"); then
       warn "端口 ${_hh_busy}/UDP 已经有程序在用。转发过来会抢走它的流量，请换一个。"
       continue
@@ -5827,12 +5853,22 @@ esac
 case "$_PORT_PROTO" in
   udp|both) [ -z "$_port_busy" ] && port_in_use "$PORT" udp && _port_busy="UDP" ;;
 esac
+# 别的 Hysteria2 节点的跳跃端口：没有程序在听，但 UDP 包会被转发给那个节点
+_port_hop_id=""
+case "$_PORT_PROTO" in
+  udp|both) [ -z "$_port_busy" ] && _port_hop_id=$(_hop_taken "$PORT" "$PORT") && _port_busy="UDP" ;;
+esac
 [ -z "$_port_busy" ] && break
 _port_try=$((_port_try + 1))
-if [ "$_port_try" -ge 3 ]; then
-  die "端口 $PORT/$_port_busy 已被其他程序占用，请重跑脚本换一个端口"
+if [ -n "$_port_hop_id" ]; then
+  _port_busy_why="是节点 ${_port_hop_id} 的端口跳跃端口，发到这里的 UDP 包会被转给节点 ${_port_hop_id}"
+else
+  _port_busy_why="已被其他程序占用"
 fi
-warn "端口 $PORT/$_port_busy 已被其他程序占用，请换一个。直接回车就用 ${_DEF_PORT}（这个是空闲的）。"
+if [ "$_port_try" -ge 3 ]; then
+  die "端口 $PORT/$_port_busy ${_port_busy_why}，请重跑脚本换一个端口"
+fi
+warn "端口 $PORT/$_port_busy ${_port_busy_why}，请换一个。直接回车就用 ${_DEF_PORT}（这个是空闲的）。"
 done
 info "端口：$PORT"
 printf "如果是 NAT VPS，且服务商分配的公网端口与上面的端口不同，请填公网端口；普通 VPS 直接回车。\n"
