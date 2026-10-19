@@ -344,3 +344,41 @@ class RealityFingerprintTest(unittest.TestCase):
         self.assertNotIn("sort -R", source)
         self.assertNotIn("&fp=${REALITY_FP}&", source)
         self.assertEqual(source.count("&fp=${REALITY_FP:-chrome}&"), 3)
+
+
+class Hy2DomainTest(unittest.TestCase):
+    def run_ask(self, answer, busy=""):
+        script = (
+            "warn() { echo \"WARN $1\"; }\ninfo() { echo \"INFO $1\"; }\ndie() { echo \"DIE $1\"; exit 1; }\n"
+            + between("ask() {", "\nrand_hex() {") + "\n"
+            + "port_in_use() { case \" " + busy + " \" in *\" $1 \"*) return 0 ;; esac; return 1; }\n"
+            + between("_hy_ask_domain() {", "\n# REALITY 客户端指纹")
+            + "\n_hy_ask_domain\necho \"D=$HY2_DOMAIN T=$HY2_ACME_TYPE H=$HY2_CERT_HOST\"\n"
+        )
+        result = subprocess.run(["sh", "-c", script], input=answer, text=True, capture_output=True, timeout=10)
+        return result.stdout.strip().splitlines()[-1], result.stdout
+
+    def test_no_domain_uses_default_self_signed(self):
+        self.assertEqual(self.run_ask("\n")[0], "D= T= H=www.samsung.com")
+
+    def test_domain_always_tries_acme_without_dns_precheck(self):
+        # 不管解析到哪（CDN、NAT），都直接去申请；URL 形式也认
+        self.assertEqual(self.run_ask("https://My.Example.org/\n")[0],
+                         "D=my.example.org T=http H=my.example.org")
+        self.assertEqual(self.run_ask("my.example.org\n", "80")[0],
+                         "D=my.example.org T=tls H=my.example.org")
+
+    def test_ports_busy_falls_back_to_self_signed_for_that_domain(self):
+        last, out = self.run_ask("my.example.org\n", "80 443")
+        self.assertEqual(last, "D= T= H=my.example.org")
+        self.assertIn("WARN 这台机器的 TCP 80 和 443 都被别的程序占着", out)
+
+    def test_not_a_domain(self):
+        last, out = self.run_ask("abc\n")
+        self.assertEqual(last, "D= T= H=www.samsung.com")
+        self.assertIn("不像域名", out)
+
+    def test_self_signed_cert_and_sni_follow_domain(self):
+        source = INSTALLER.read_text()
+        self.assertIn('cert --host "$HY2_CERT_HOST"', source)
+        self.assertIn("HY2_SNI=${HY2_DOMAIN:-$HY2_CERT_HOST}", source)
