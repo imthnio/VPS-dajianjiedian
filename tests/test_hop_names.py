@@ -166,7 +166,7 @@ class NodeNameTest(unittest.TestCase):
                               text=True, check=True, timeout=10, env=env).stdout
 
     def test_urlenc_matches_python(self):
-        for name in ("香港Vless-Reality", "美国Hysteria2", "未知地区Shadowsocks2", "a b&c#d"):
+        for name in ("香港Vless", "美国Hysteria2", "未知地区Shadowsocks2", "a b&c#d"):
             self.assertEqual(self.sh(f"_urlenc '{name}'"), quote(name, safe="-._~"))
 
     def test_country_code_to_chinese(self):
@@ -177,11 +177,11 @@ class NodeNameTest(unittest.TestCase):
     def test_duplicate_names_get_a_number(self):
         with tempfile.TemporaryDirectory() as temp:
             nodes = Path(temp)
-            for i, name in ((1, "香港Vless-Reality"), (2, "香港Vless-Reality2")):
+            for i, name in ((1, "香港Vless"), (2, "香港Vless2")):
                 (nodes / str(i)).mkdir()
                 (nodes / str(i) / "name").write_text(name)
             env = dict(os.environ, XRAY_NODES_DIR=str(nodes), NODE_REGION="香港")
-            self.assertEqual(self.sh("_node_name Vless-Reality", env), "香港Vless-Reality3")
+            self.assertEqual(self.sh("_node_name Vless", env), "香港Vless3")
             self.assertEqual(self.sh("_node_name Hysteria2", env), "香港Hysteria2")
             (nodes / "3").mkdir()
             (nodes / "3" / "name").write_text("香港Hysteria2")
@@ -198,6 +198,16 @@ class QuicBlockTest(unittest.TestCase):
         self.assertIn("block-quic=true", source)
         self.assertIn("block-quic=on", source)
         self.assertIn("AND,((NETWORK,UDP),(DST-PORT,443)),REJECT", source)
+
+
+class ShortNodeNameTest(unittest.TestCase):
+    def test_names_are_region_plus_short_protocol(self):
+        s = (Path(__file__).resolve().parent.parent / "install.sh").read_text(encoding="utf-8")
+        for w in ("Vless", "Trojan", "Vmess", "Shadowsocks", "AnyTLS", "Hysteria2", "TUIC"):
+            self.assertIn(f'_nm_proto="{w}"', s)
+        self.assertNotIn('_nm_proto="Vless-Reality"', s)
+        self.assertNotIn("-Reality\"", s)
+
 
 if __name__ == "__main__":
     unittest.main()

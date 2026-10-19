@@ -81,7 +81,7 @@ OLD_VLESS_TXT = """==============================================
 ==============================================
 vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.samsung.com&fp=chrome&pbk=PUBKEYabc-_123&sid=0a1b2c3d&type=tcp#%E9%A6%99%E6%B8%AF
 ----------------------------------------------
-节点名: 香港Vless-Reality
+节点名: 香港Vless
 协议: VLESS + REALITY + Vision
 地址: 1.2.3.4
 端口: 443
@@ -296,7 +296,7 @@ class MigrationTest(unittest.TestCase):
         txt = (d / "node.txt").read_text()
         self.assertNotIn("已在服务器上打开", txt)
         self.assertNotIn("想在客户端也拦", txt)
-        self.assertIn('香港Vless-Reality = VLESS,1.2.3.4,443,"11111111-2222-3333-4444-555555555555",'
+        self.assertIn('香港Vless = VLESS,1.2.3.4,443,"11111111-2222-3333-4444-555555555555",'
                       'transport=tcp,flow=xtls-rprx-vision,public-key="PUBKEYabc-_123",short-id=0a1b2c3d,'
                       'over-tls=true,sni=www.samsung.com,udp=true,block-quic=true', txt)
         self.assertTrue(txt.rstrip().endswith("=============================================="))
