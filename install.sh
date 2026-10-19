@@ -37,7 +37,7 @@
 # systemd 服务：Linux 管“后台程序”的系统。把节点注册成服务后，程序挂了会自动拉起，
 #       服务器重启后也会自动启动。Alpine 等系统用的是 OpenRC，作用一样。
 # 定时节点：到时间后自动彻底删除的节点，适合临时给别人用。
-# 节点名：客户端里显示的名字，自动写成“地区+协议”，比如 香港Vless-Reality、美国Hysteria2。
+# 节点名：客户端里显示的名字，自动写成“地区+协议”，比如 香港Vless、美国Hysteria2。
 #       地区按服务器公网 IP 查；同名的会在后面加 2、3…
 # 端口跳跃：Hysteria2 的客户端在好几个 UDP 端口之间换着连，单个端口被限速或封掉时不容易断。
 #       服务器上只有主端口真的在听，其它端口靠 nat 转发过去。
@@ -943,7 +943,7 @@ _choose_expire_duration() {
 
 # ---------- 节点名：地区 + 协议 ----------
 # 分享链接最后 # 后面是节点名，客户端列表里显示的就是它。按“服务器所在地区 + 协议”起名，
-# 比如 香港Vless-Reality、美国Hysteria2。地区用公网 IP 查（几个免费查询网站轮流试，每个最多等 6 秒），
+# 比如 香港Vless、美国Hysteria2。地区用公网 IP 查（几个免费查询网站轮流试，每个最多等 6 秒），
 # 都查不到就写“未知地区”。同名时在后面加 2、3……
 _cc_name() { # _cc_name <两位国家代码> -> 中文地区名，不认识就原样打印代码
   case "$1" in
@@ -5769,7 +5769,7 @@ if ! SERVER_IP=$(get_ip "$IPVER"); then
   [ -z "$SERVER_IP" ] && die "没有 IP 装不了，先去查一下你的服务器 IP 再来"
 fi
 info "服务器 IP：$SERVER_IP"
-# 节点名 = 地区 + 协议，比如 香港Vless-Reality。查不到地区就写“未知地区”。
+# 节点名 = 地区 + 协议，比如 香港Vless。查不到地区就写“未知地区”。
 printf "正在查这台服务器在哪个国家/地区（用来给节点起名）…\n"
 NODE_REGION=""
 if _cc=$(_geo_cc "$SERVER_IP" "$IPVER"); then
@@ -6622,11 +6622,11 @@ LINK_EXTRA=""
 LINK_HY_OFFICIAL=""
 _hy_mport_x=""
 case "$PROTO" in
-  vless)  PROTO_NAME="VLESS + REALITY + Vision"; _nm_proto="Vless-Reality" ;;
-  trojan) PROTO_NAME="Trojan + REALITY"; _nm_proto="Trojan-Reality" ;;
+  vless)  PROTO_NAME="VLESS + REALITY + Vision"; _nm_proto="Vless" ;;
+  trojan) PROTO_NAME="Trojan + REALITY"; _nm_proto="Trojan" ;;
   vmess)  PROTO_NAME="VMess + WebSocket"; _nm_proto="Vmess" ;;
   ss)     PROTO_NAME="Shadowsocks"; _nm_proto="Shadowsocks" ;;
-  anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS-Reality" ;;
+  anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS" ;;
   hy2)    PROTO_NAME="Hysteria2"; _nm_proto="Hysteria2" ;;
   tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
 esac
