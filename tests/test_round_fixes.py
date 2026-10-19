@@ -382,3 +382,133 @@ class Hy2DomainTest(unittest.TestCase):
         source = INSTALLER.read_text()
         self.assertIn('cert --host "$HY2_CERT_HOST"', source)
         self.assertIn("HY2_SNI=${HY2_DOMAIN:-$HY2_CERT_HOST}", source)
+
+
+class Hy2AcmeShTest(unittest.TestCase):
+    """acme.sh 申请 / 续期：续期只能用 --renew（沿用私钥），公钥指纹不变。用假的 acme.sh，不联网。"""
+
+    STUBS = 'info() { echo "INFO $1"; }\nwarn() { echo "WARN $1"; }\n_pkg_add() { echo "PKG $*"; }\n_log() { echo "LOG $1"; }\n'
+
+    def make_cert(self, d, name):
+        # 固定一把 EC 私钥，每次签一张新证书：模拟“续期证书变了，私钥没变”
+        key = os.path.join(d, "fixed.key")
+        if not os.path.exists(key):
+            subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key], check=True,
+                           capture_output=True)
+        out = os.path.join(d, name)
+        subprocess.run(["openssl", "req", "-x509", "-new", "-key", key, "-out", out, "-days", "90",
+                        "-subj", "/CN=hy2.example.org"], check=True, capture_output=True)
+        return key, out
+
+    def fake_acmesh(self, home, log, rc=0, cert_days=90):
+        # 假 acme.sh：记下参数；--issue / --renew 时往 <域名>_ecc 里放证书
+        script = f"""#!/bin/sh
+echo "$*" >> {log}
+[ {rc} = 0 ] || exit {rc}
+dom=""; prev=""
+for a in "$@"; do [ "$prev" = "-d" ] && dom="$a"; prev="$a"; done
+mkdir -p {home}/"$dom"_ecc
+cp {home}/../fixed.key {home}/"$dom"_ecc/"$dom".key
+openssl req -x509 -new -key {home}/../fixed.key -out {home}/"$dom"_ecc/fullchain.cer -days {cert_days} -subj /CN="$dom" 2>/dev/null
+"""
+        path = os.path.join(home, "acme.sh")
+        Path(path).write_text(script)
+        os.chmod(path, 0o755)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.home = os.path.join(self.d, "home")
+        self.nodes = os.path.join(self.d, "nodes")
+        os.makedirs(self.home)
+        os.makedirs(os.path.join(self.nodes, "1"))
+        self.log = os.path.join(self.d, "calls")
+        self.make_cert(self.d, "dummy.pem")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def issue(self, rc=0):
+        self.fake_acmesh(self.home, self.log, rc)
+        script = (self.STUBS + between("_sha256_of() {", "\n# _gh_get ") + "\n"
+                  + between("_timeout_cmd() {", "\n_apt_do() {") + "\n"
+                  + between("_hy_acmesh_issue() {", "\n# 写 Hysteria2 的配置文件")
+                  + "\n_hy_acmesh_get() { return 0; }\n"
+                  + f"ACMESH_HOME={self.home} NODE_DIR={self.nodes}/1 HY2_DOMAIN=hy2.example.org HY2_ACME_TYPE=http\n"
+                  + "_hy_acmesh_issue; echo \"RC=$? PUB=$HY2_PUBPIN\"\n")
+        return run_sh(script).stdout
+
+    def watch(self, body, window=2764800):
+        script = (self.STUBS + between("_acmesh_deploy() {", "\n_acme_tick() {") + "\n"
+                  + f"NODES_DIR={self.nodes} ACMESH_HOME={self.home} ACME_WINDOW={window}\n" + body)
+        return run_sh(script).stdout
+
+    def pubpin(self, cert):
+        pub = subprocess.run(["openssl", "x509", "-in", cert, "-pubkey", "-noout"], capture_output=True, check=True).stdout
+        der = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "der"], input=pub, capture_output=True,
+                             check=True).stdout
+        import hashlib
+        return hashlib.sha256(der).hexdigest().upper()
+
+    def test_issue_deploys_cert_and_pubkey_pin(self):
+        out = self.issue()
+        node = os.path.join(self.nodes, "1")
+        self.assertIn("RC=0", out)
+        self.assertEqual(Path(node, "acme_sh").read_text().strip(), "hy2.example.org")
+        pin = self.pubpin(os.path.join(node, "cert.pem"))
+        self.assertIn(f"PUB={pin}", out)
+        self.assertEqual(Path(node, "pubpin").read_text().strip(), pin)
+        calls = Path(self.log).read_text()
+        self.assertIn("--issue -d hy2.example.org --server letsencrypt --keylength ec-256 --standalone --httpport 80", calls)
+
+    def test_issue_failure_keeps_self_signed(self):
+        node = os.path.join(self.nodes, "1")
+        Path(node, "cert.pem").write_text("SELF")
+        out = self.issue(rc=1)
+        self.assertIn("RC=1", out)
+        self.assertFalse(os.path.exists(os.path.join(node, "acme_sh")))
+        self.assertEqual(Path(node, "cert.pem").read_text(), "SELF")
+
+    def test_renew_uses_renew_not_issue_and_keeps_pubkey(self):
+        self.issue()
+        node = os.path.join(self.nodes, "1")
+        before_pin = self.pubpin(os.path.join(node, "cert.pem"))
+        before_cert = Path(node, "cert.pem").read_text()
+        Path(self.log).write_text("")
+        # 证书剩 90 天，窗口设成 100 天：要续期
+        out = self.watch("_acmesh_renew 1; echo RC=$?\n", window=100 * 86400)
+        self.assertIn("RC=0", out)
+        calls = Path(self.log).read_text()
+        self.assertIn("--renew -d hy2.example.org --ecc --force", calls)
+        self.assertNotIn("--issue", calls)
+        self.assertNotIn("always-force-new-domain-key", calls)
+        self.assertNotEqual(Path(node, "cert.pem").read_text(), before_cert)
+        self.assertEqual(self.pubpin(os.path.join(node, "cert.pem")), before_pin)
+
+    def test_fresh_cert_is_copied_without_renewing(self):
+        self.issue()
+        Path(self.log).write_text("")
+        out = self.watch("_acmesh_renew 1; echo RC=$?\n")
+        self.assertIn("RC=0", out)
+        self.assertEqual(Path(self.log).read_text(), "")
+
+    def test_forget_keeps_domain_used_by_other_node(self):
+        self.issue()
+        os.makedirs(os.path.join(self.nodes, "2"))
+        Path(self.nodes, "2", "acme_sh").write_text("hy2.example.org\n")
+        ecc = os.path.join(self.home, "hy2.example.org_ecc")
+        self.watch("_acmesh_forget 1\n")
+        self.assertTrue(os.path.isdir(ecc))
+        subprocess.run(["rm", "-rf", os.path.join(self.nodes, "2")])
+        self.watch("_acmesh_forget 1\n")
+        self.assertFalse(os.path.isdir(ecc))
+
+    def test_static_wiring(self):
+        source = INSTALLER.read_text()
+        write_cfg = between("_hy_write_config() {", "\n_hy_listen_for() {")
+        self.assertNotIn("acme:", write_cfg)
+        self.assertRegex(source, r"\nACMESH_SHA256=[0-9a-f]{64}\n")
+        self.assertIn('tls-pubkey-sha256=${HY2_PUBPIN}', source)
+        # 巡检：有 acme_sh 的节点就算没有 fw_acme 也要续期；删节点先 acme-forget
+        self.assertIn('[ -f "${_ad}fw_acme" ] || [ -f "${_ad}acme_sh" ] || continue', source)
+        self.assertEqual(source.count("acme-forget \"$_d_id\""), 2)
