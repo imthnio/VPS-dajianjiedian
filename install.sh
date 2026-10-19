@@ -3643,21 +3643,25 @@ _hy_ask_obfs() {
   done
 }
 
-# 自己有域名（已经解析到这台服务器）时，可以申请正规证书（Let's Encrypt），客户端不用“跳过证书验证”。
-# 没有域名就用自签证书 + 证书指纹（pinSHA256）：客户端只认这一张证书，别人冒充不了，同样安全。
-# 申请证书要外面能连到这台机器的 TCP 80（或 443）端口，NAT 小鸡一般做不到，所以 NAT 小鸡直接用自签。
+# 自己有域名时，自动给它申请正规证书（Let's Encrypt），客户端不用“跳过证书验证”。
+# 不在这里预先判断解析对不对、是不是 NAT：猜错了会把能申请的域名挡掉（比如开了 CDN 小云朵，
+# 用 80 端口照样能申请）。直接去申请，申请不下来再自动改用自签证书。
+# 自签证书也签给你的域名：客户端 SNI 填你的域名，证书指纹锁定照样能用。
+# 没填域名就用自签证书 + www.samsung.com。
 _hy_ask_domain() {
-  HY2_DOMAIN=""; HY2_ACME_TYPE=""
-  printf "\n有没有已经解析到这台服务器的域名？\n"
-  printf "有的话用它申请正规证书；没有就直接回车，用自签证书加证书指纹，一样安全。\n"
+  HY2_DOMAIN=""; HY2_ACME_TYPE=""; HY2_CERT_HOST="www.samsung.com"
+  printf "\n有没有解析到这台服务器的域名？\n"
+  printf "有的话填上，自动给它申请正规证书；没有就直接回车，用自签证书加证书指纹，一样安全。\n"
   ask "你的域名（没有就回车）" "" _hy_dom
   _hy_dom=$(printf '%s' "$_hy_dom" | tr 'A-Z' 'a-z')
+  # 有人会连 https:// 或结尾的 / 一起粘贴进来，去掉
+  _hy_dom=${_hy_dom#http://}; _hy_dom=${_hy_dom#https://}; _hy_dom=${_hy_dom%%/*}; _hy_dom=${_hy_dom%.}
   if [ -z "$_hy_dom" ]; then
     info "证书：自签证书（链接里带证书指纹）"
     return 0
   fi
   case "$_hy_dom" in
-    *[!a-z0-9.-]*|.*|*.|*..*|*.*.*.*.*.*.*) _hy_dom_bad=1 ;;
+    *[!a-z0-9.-]*|.*|*..*|*.*.*.*.*.*.*.*.*) _hy_dom_bad=1 ;;
     *.*) _hy_dom_bad=0 ;;
     *) _hy_dom_bad=1 ;;
   esac
@@ -3665,34 +3669,18 @@ _hy_ask_domain() {
     warn "「${_hy_dom}」不像域名，改用自签证书"
     return 0
   fi
-  if [ "$LINK_PORT" != "$PORT" ]; then
-    warn "NAT 小鸡一般收不到申请证书用的 80/443 端口请求，改用自签证书"
-    return 0
-  fi
-  if command -v getent >/dev/null 2>&1; then
-    _hy_dom_ips=$(getent ahosts "$_hy_dom" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-    if [ -z "$_hy_dom_ips" ]; then
-      warn "查不到 ${_hy_dom} 的解析，改用自签证书。先去域名后台加一条 A/AAAA 记录指向 ${SERVER_IP}"
-      return 0
-    fi
-    case " $_hy_dom_ips " in
-      *" $SERVER_IP "*) ;;
-      *)
-        warn "${_hy_dom} 解析到 ${_hy_dom_ips}，不是这台服务器 ${SERVER_IP}（开了 CDN 小云朵也会这样）。改用自签证书"
-        return 0
-        ;;
-    esac
-  fi
+  HY2_CERT_HOST="$_hy_dom"
+  # 申请证书时 Hysteria2 要自己占用 TCP 80（或 443）一小会儿，两个都被占着就申请不了
   if ! port_in_use 80 tcp; then
     HY2_ACME_TYPE=http
   elif ! port_in_use 443 tcp; then
     HY2_ACME_TYPE=tls
   else
-    warn "这台机器的 TCP 80 和 443 都被别的程序占着，申请不了证书，改用自签证书"
+    warn "这台机器的 TCP 80 和 443 都被别的程序占着，申请不了正规证书。改用给 ${_hy_dom} 签的自签证书（链接里带证书指纹）"
     return 0
   fi
   HY2_DOMAIN="$_hy_dom"
-  info "证书：给 ${HY2_DOMAIN} 申请正规证书（启动时自动申请，申请不下来会自动改回自签证书）"
+  info "证书：启动时自动给 ${HY2_DOMAIN} 申请正规证书（申请不下来会自动改用给这个域名签的自签证书）"
 }
 
 # REALITY 客户端指纹（链接里的 fp=）：客户端握手时装成哪个浏览器，服务器不看这个值。
@@ -5672,6 +5660,7 @@ HY_HOP_PORTS=""
 HY2_USE_OBFS=1
 HY2_DOMAIN=""
 HY2_ACME_TYPE=""
+HY2_CERT_HOST="www.samsung.com"
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
   _hy_ask_obfs
@@ -5839,7 +5828,7 @@ if [ "$PROTO" = "hy2" ]; then
   umask 077
   drop_page_cache
   # 官方 hysteria 自己会写证书和私钥，不用再拆 PEM，也不用装 openssl
-  _hy_cert_err=$("$HY_BIN" cert --host www.samsung.com \
+  _hy_cert_err=$("$HY_BIN" cert --host "$HY2_CERT_HOST" \
     --cert "$NODE_DIR/cert.pem" --key "$NODE_DIR/key.pem" \
     --valid-for 87600h --overwrite 2>&1)
   if [ $? -ne 0 ] || [ ! -s "$NODE_DIR/cert.pem" ] || [ ! -s "$NODE_DIR/key.pem" ]; then
@@ -6212,7 +6201,7 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ];
   info "正在给 ${HY2_DOMAIN} 申请证书，最多再等 60 秒…"
   _svc_recheck 60
   if [ "$_svc_listen_ok" != "1" ]; then
-    warn "证书没申请下来（常见原因：域名没解析到这台机器、80/443 端口被云安全组挡住）。改用自签证书，节点照样能用。"
+    warn "证书没申请下来（常见原因：域名没解析到这台机器、80/443 端口被云安全组挡住、NAT 小鸡外面连不进 80/443）。改用给 ${HY2_CERT_HOST} 签的自签证书，链接里带证书指纹，节点照样能用。"
     HY2_DOMAIN=""
     HY_TCP_MASQ=0
     _hy_write_config
@@ -6437,7 +6426,7 @@ case "$PROTO" in
     #   指纹仍然会校验，别人冒充不了）。pcs 给认 Xray 分享字段的客户端用，意思一样。
     # 端口跳跃：主端口留在地址里，跳跃端口放 mport（v2rayN、Clash Verge 等认这个）。
     #   官方客户端认“地址:主端口,跳跃端口”这种写法，下面单独给一行。
-    HY2_SNI=${HY2_DOMAIN:-www.samsung.com}
+    HY2_SNI=${HY2_DOMAIN:-$HY2_CERT_HOST}
     if [ -n "$HY2_DOMAIN" ]; then
       _hy_q="sni=${HY2_SNI}&alpn=h3"
     else
@@ -6526,6 +6515,7 @@ fi
       printf "SNI: %s\n" "$HY2_SNI"
       if [ -n "$HY2_DOMAIN" ]; then
         printf "证书: 正规证书（Let's Encrypt，%s），客户端不要打开「跳过证书验证」。\n" "$HY2_DOMAIN"
+        printf "正规证书大约每 60 天自动续期一次，续期后证书就变了，所以客户端不要填证书指纹或公钥指纹，填了续期后会连不上。\n"
       else
         printf "证书指纹: %s\n" "$HY2_PIN"
       fi
