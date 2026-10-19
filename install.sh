@@ -1645,6 +1645,7 @@ install_watch_bin() { # 写出 /usr/local/bin/xray-node-watch。重复运行只�
 #   xray-node-watch disarm        卸掉巡检（全部卸载时用）
 #   xray-node-watch loop          没有 systemd / OpenRC / cron 时，在后台一直循环巡检
 #   xray-node-watch acme-open|acme-close|acme-drop <节点编号>   打开 / 关上 / 删掉证书用的端口
+#   xray-node-watch acme-forget <节点编号>   删节点前调用：别的节点不用这个域名时，删掉 acme.sh 里它的证书
 #   xray-node-watch undo <防火墙记录文件>   撤销记录里本脚本加过的放行（装到一半失败时用）
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
@@ -1664,6 +1665,9 @@ FW_UNITS="nftables.service firewalld.service ufw.service netfilter-persistent.se
 FW_UNIT_DIRS=${XRAY_FW_UNIT_DIRS:-"$SD_DIR /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system"}
 # 证书剩不到 32 天就打开续期端口（Let's Encrypt 证书 90 天，剩 30 天左右开始续期）
 ACME_WINDOW=${XRAY_ACME_WINDOW:-2764800}
+# 新装的 Hysteria2 用 acme.sh 申请证书（节点目录里有 acme_sh 文件，写着域名）。
+# 续期由这里做，沿用同一把私钥，所以客户端填的公钥指纹一直不变。
+ACMESH_HOME=${XRAY_ACMESH_HOME:-/etc/xray-node/acme.sh}
 
 _log() {
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
@@ -1835,12 +1839,55 @@ _acme_close() {
 _acme_need() { # 返回 0 = 现在需要打开（还没拿到证书，或者快到期要续期）
   _an_d="$NODES_DIR/$1"
   _active "$1" || return 1
-  _an_crt=$(find "$_an_d/acme" -type f -name '*.crt' 2>/dev/null | head -1)
+  if [ -f "$_an_d/acme_sh" ]; then
+    _an_crt="$_an_d/cert.pem"
+  else
+    _an_crt=$(find "$_an_d/acme" -type f -name '*.crt' 2>/dev/null | head -1)
+  fi
   [ -n "$_an_crt" ] || return 0
   # 没有 openssl 看不了到期时间，只好一直开着，保证能续期
   command -v openssl >/dev/null 2>&1 || return 0
   openssl x509 -checkend "$ACME_WINDOW" -noout -in "$_an_crt" >/dev/null 2>&1 && return 1
   return 0
+}
+
+# 把 acme.sh 里的证书复制到节点目录。私钥续期不变，实际只有证书在变；
+# Hysteria2 发现证书文件改了会自己换上新证书，不用重启。
+_acmesh_deploy() { # _acmesh_deploy <节点目录> <域名>
+  _ad_src="$ACMESH_HOME/${2}_ecc"
+  [ -s "$_ad_src/fullchain.cer" ] && [ -s "$_ad_src/${2}.key" ] || return 1
+  cat "$_ad_src/${2}.key" > "$1/key.pem.new" && cat "$_ad_src/fullchain.cer" > "$1/cert.pem.new" || return 1
+  for _ad_f in key cert; do
+    chmod 640 "$1/$_ad_f.pem.new" 2>/dev/null
+    chgrp xray-node "$1/$_ad_f.pem.new" 2>/dev/null
+    mv -f "$1/$_ad_f.pem.new" "$1/$_ad_f.pem" || return 1
+  done
+}
+
+_acmesh_renew() { # _acmesh_renew <节点编号>：需要时续期，再复制到节点目录
+  _ar_d="$NODES_DIR/$1"
+  _ar_dom=$(head -1 "$_ar_d/acme_sh" 2>/dev/null | tr -d ' \r\n')
+  [ -n "$_ar_dom" ] && [ -x "$ACMESH_HOME/acme.sh" ] || return 1
+  # 同一个域名的别的节点刚续过，就直接拿来用，不重复申请
+  if ! openssl x509 -checkend "$ACME_WINDOW" -noout -in "$ACMESH_HOME/${_ar_dom}_ecc/fullchain.cer" >/dev/null 2>&1; then
+    # 续期（--renew）不会换私钥；不能用 --issue --force，那样会生成新私钥
+    # 用申请时记下的 CA（Let's Encrypt）和验证方式
+    "$ACMESH_HOME/acme.sh" --home "$ACMESH_HOME" --renew -d "$_ar_dom" --ecc --force \
+      >> "$ACMESH_HOME/renew.log" 2>&1 || { _log "节点 $1 的证书续期没成功，一小时后再试（详情见 $ACMESH_HOME/renew.log）"; return 1; }
+  fi
+  _acmesh_deploy "$_ar_d" "$_ar_dom"
+}
+
+_acmesh_forget() { # _acmesh_forget <节点编号>：删节点时，没有别的节点用这个域名，就把 acme.sh 里的这个域名删掉
+  _af_dom=$(head -1 "$NODES_DIR/$1/acme_sh" 2>/dev/null | tr -d ' \r\n')
+  [ -n "$_af_dom" ] || return 0
+  for _af_f in "$NODES_DIR"/*/acme_sh; do
+    [ -f "$_af_f" ] || continue
+    [ "$_af_f" = "$NODES_DIR/$1/acme_sh" ] && continue
+    [ "$(head -1 "$_af_f" | tr -d ' \r\n')" = "$_af_dom" ] && return 0
+  done
+  case "$_af_dom" in ''|*/*|.*) return 0 ;; esac
+  rm -rf "$ACMESH_HOME/${_af_dom}_ecc"
 }
 
 _acme_tick() {
@@ -1851,7 +1898,8 @@ _acme_tick() {
   fi
   : > "$_at_stamp"
   for _ad in "$NODES_DIR"/*/; do
-    [ -f "${_ad}fw_acme" ] || continue
+    # 用 acme.sh 的节点就算没有临时放行端口（端口本来就开着），也要按时续期
+    [ -f "${_ad}fw_acme" ] || [ -f "${_ad}acme_sh" ] || continue
     # 还在安装中的节点（没有 node.txt）正在申请证书，别去关它的端口
     [ -f "${_ad}node.txt" ] || continue
     _aid=$(basename "$_ad")
@@ -1860,7 +1908,11 @@ _acme_tick() {
     if _acme_need "$_aid"; then
       [ "$_ast" = "open" ] || _log "节点 $_aid 的证书要申请或续期了，临时打开证书用的端口"
       _acme_open "$_aid"
-    elif [ "$_ast" != "closed" ]; then
+      if [ -f "${_ad}acme_sh" ] && _acmesh_renew "$_aid" && ! _acme_need "$_aid"; then
+        _acme_close "$_aid"
+        _log "节点 $_aid 的证书续期好了（私钥没换，公钥指纹不变），证书用的端口关上了"
+      fi
+    elif [ -f "${_ad}fw_acme" ] && [ "$_ast" != "closed" ]; then
       _acme_close "$_aid"
       _log "节点 $_aid 的证书已经是新的，证书用的端口关上了"
     fi
@@ -1885,6 +1937,7 @@ _needed() {
   for _nd in "$NODES_DIR"/*/; do
     [ -f "${_nd}hop" ] && return 0
     [ -f "${_nd}fw_acme" ] && return 0
+    [ -f "${_nd}acme_sh" ] && return 0
   done
   # 有 UDP 节点、机器上又有策略路由：要每分钟看一下回程路由
   [ -x "$ROUTE" ] && "$ROUTE" need >/dev/null 2>&1 && return 0
@@ -2047,8 +2100,9 @@ case "$1" in
     _acme_close "$2"
     rm -f "$NODES_DIR/$2/fw_acme" "$NODES_DIR/$2/fw_acme.state"
     ;;
+  acme-forget) _id_ok "$2"; _acmesh_forget "$2" ;;
   undo) _fw_undo "$2" ;;
-  *) echo "用法：xray-node-watch tick|arm|disarm|loop|acme-open|acme-close|acme-drop <编号>|undo <文件>" >&2; exit 2 ;;
+  *) echo "用法：xray-node-watch tick|arm|disarm|loop|acme-open|acme-close|acme-drop|acme-forget <编号>|undo <文件>" >&2; exit 2 ;;
 esac
 exit 0
 WATCHEOF
@@ -2628,6 +2682,7 @@ _delete_node() {
   [ -x "$_x_rt" ] && "$_x_rt" down "$_d_id" >/dev/null 2>&1
   # 证书用的端口如果还开着，也关上
   _x_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  [ -x "$_x_watch" ] && "$_x_watch" acme-forget "$_d_id" >/dev/null 2>&1
   [ -x "$_x_watch" ] && "$_x_watch" acme-drop "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
   # 没有节点再需要巡检了，就把巡检一起卸掉
@@ -3027,6 +3082,7 @@ _del_node() {
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
   _del_fw_rules "$NODES_DIR/$_d_id/fw_info"
   # 证书用的端口如果还开着，也关上
+  [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch acme-forget "$_d_id" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch acme-drop "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
   # 没有节点再需要巡检了，就把巡检一起卸掉（全部卸载时最后统一处理）
@@ -3716,20 +3772,85 @@ _reality_ask_fp() {
   done
 }
 
+# ---------- Hysteria2 正规证书：acme.sh ----------
+# 不用 Hysteria2 自带的申请：它每次续期都换一把新私钥，客户端的「公钥锁定」续期后就对不上了。
+# acme.sh 第一次申请时生成私钥，以后续期（--renew）一直用这一把，公钥指纹不变。
+# 固定用这个版本，下载后核对 SHA256，对不上就不用。
+ACMESH_VER=3.1.6
+ACMESH_SHA256=c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7
+ACMESH_HOME=/etc/xray-node/acme.sh
+
+_hy_acmesh_get() {
+  [ -x "$ACMESH_HOME/acme.sh" ] && [ "$(_sha256_of "$ACMESH_HOME/acme.sh")" = "$ACMESH_SHA256" ] && return 0
+  mkdir -p "$ACMESH_HOME" && chmod 700 "$ACMESH_HOME" || return 1
+  _gh_prepare
+  _gh_get "https://raw.githubusercontent.com/acmesh-official/acme.sh/${ACMESH_VER}/acme.sh" "$ACMESH_HOME/acme.sh.new"
+  _ag_rc=$?
+  _dns64_off
+  [ "$_ag_rc" = 0 ] || { rm -f "$ACMESH_HOME/acme.sh.new"; return 1; }
+  if [ "$(_sha256_of "$ACMESH_HOME/acme.sh.new")" != "$ACMESH_SHA256" ]; then
+    rm -f "$ACMESH_HOME/acme.sh.new"
+    warn "下载的 acme.sh 和预期的 SHA256 对不上（可能是镜像被篡改或下载出错），不用它"
+    return 1
+  fi
+  chmod 700 "$ACMESH_HOME/acme.sh.new" && mv -f "$ACMESH_HOME/acme.sh.new" "$ACMESH_HOME/acme.sh"
+}
+
+# 申请成功：证书和私钥复制到节点目录，返回 0。失败返回 1，节点目录里还是自签证书。
+_hy_acmesh_issue() {
+  _hy_acmesh_get || { warn "acme.sh 没下载下来"; return 1; }
+  # acme.sh 自己临时开个小网站给 Let's Encrypt 验证，要 socat 或 python
+  if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
+    && ! command -v python >/dev/null 2>&1; then
+    _pkg_add "正在安装 socat（申请证书时用）" socat
+  fi
+  if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
+    && ! command -v python >/dev/null 2>&1; then
+    warn "socat 没装上，申请不了证书"
+    return 1
+  fi
+  if [ "$HY2_ACME_TYPE" = "tls" ]; then
+    _ai_mode="--alpn --tlsport 443"
+  else
+    _ai_mode="--standalone --httpport 80"
+  fi
+  info "正在给 ${HY2_DOMAIN} 申请证书（Let's Encrypt），一般半分钟到一分钟…"
+  # shellcheck disable=SC2086
+  _timeout_cmd 300 "$ACMESH_HOME/acme.sh" --home "$ACMESH_HOME" --issue -d "$HY2_DOMAIN" \
+    --server letsencrypt --keylength ec-256 $_ai_mode > "$NODE_DIR/acme.log" 2>&1
+  _ai_rc=$?
+  # 2 = 这个域名已经有没到期的证书（比如同一个域名再装一个节点），直接用
+  if [ "$_ai_rc" != 0 ] && [ "$_ai_rc" != 2 ]; then
+    grep -iE "error|invalid|timeout|refused|fail" "$NODE_DIR/acme.log" 2>/dev/null | tail -n 3 | cut -c1-200 | sed 's/^/  /'
+    return 1
+  fi
+  _ai_src="$ACMESH_HOME/${HY2_DOMAIN}_ecc"
+  [ -s "$_ai_src/fullchain.cer" ] && [ -s "$_ai_src/${HY2_DOMAIN}.key" ] || return 1
+  if command -v openssl >/dev/null 2>&1; then
+    openssl x509 -checkend 86400 -noout -in "$_ai_src/fullchain.cer" >/dev/null 2>&1 || return 1
+  fi
+  cat "$_ai_src/${HY2_DOMAIN}.key" > "$NODE_DIR/key.pem" && cat "$_ai_src/fullchain.cer" > "$NODE_DIR/cert.pem" || return 1
+  chmod 600 "$NODE_DIR/key.pem" "$NODE_DIR/cert.pem" 2>/dev/null
+  echo "$HY2_DOMAIN" > "$NODE_DIR/acme_sh"
+  # 公钥指纹（公钥的 SHA256，大写十六进制）：Loon 的「公钥锁定」填它，续期不换私钥就一直不变
+  HY2_PUBPIN=""
+  if command -v openssl >/dev/null 2>&1; then
+    HY2_PUBPIN=$(openssl x509 -in "$NODE_DIR/cert.pem" -pubkey -noout 2>/dev/null \
+      | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print toupper($NF)}')
+    case "$HY2_PUBPIN" in *[!0-9A-F]*|"") HY2_PUBPIN="" ;; esac
+    [ "${#HY2_PUBPIN}" -eq 64 ] || HY2_PUBPIN=""
+  fi
+  printf '%s\n' "$HY2_PUBPIN" > "$NODE_DIR/pubpin"
+  return 0
+}
+
 # 写 Hysteria2 的配置文件。证书申请失败时会用自签证书再写一次，所以单独做成函数。
 _hy_write_config() {
-  if [ -n "$HY2_DOMAIN" ]; then
-    _hy_tls="acme:
-  domains:
-    - $HY2_DOMAIN
-  dir: $NODE_DIR/acme
-  type: $HY2_ACME_TYPE"
-  else
-    _hy_tls="tls:
+  # 正规证书和自签证书都放在 cert.pem / key.pem。正规证书由 acme.sh 申请、巡检程序续期。
+  _hy_tls="tls:
   cert: $NODE_DIR/cert.pem
   key: $NODE_DIR/key.pem
   sniGuard: dns-san"
-  fi
   _hy_obfs_blk=""
   if [ "$HY2_USE_OBFS" = "1" ]; then
     _hy_obfs_blk="
@@ -5661,6 +5782,7 @@ HY2_USE_OBFS=1
 HY2_DOMAIN=""
 HY2_ACME_TYPE=""
 HY2_CERT_HOST="www.samsung.com"
+HY2_PUBPIN=""
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
   _hy_ask_obfs
@@ -6146,6 +6268,28 @@ if [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ]; then
   else
     rm -f "$NODE_DIR/fw_acme"
   fi
+  # 先把证书申请好再启动节点。申请不下来就用前面做好的、签给这个域名的自签证书。
+  if _hy_acmesh_issue; then
+    info "证书申请好了：${HY2_DOMAIN}（以后巡检程序自动续期，私钥不换，公钥指纹不变）"
+  else
+    warn "证书没申请下来（常见原因：域名没解析到这台机器、80/443 端口被云安全组挡住、NAT 小鸡外面连不进 80/443）。改用给 ${HY2_CERT_HOST} 签的自签证书，链接里带证书指纹，节点照样能用。"
+    HY2_DOMAIN=""
+    HY_TCP_MASQ=0
+    _hy_write_config
+  fi
+  # 证书端口：申请成功了就先关上（快到期时巡检程序会自动再打开）；改用自签证书了就整个撤掉。
+  _hap_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
+  if [ -f "$NODE_DIR/fw_acme" ] && [ -x "$_hap_watch" ]; then
+    if [ -z "$HY2_DOMAIN" ]; then
+      "$_hap_watch" acme-drop "$NODE_ID"
+      info "已撤销为申请证书临时放行的 TCP ${_acme_port}"
+    elif command -v openssl >/dev/null 2>&1; then
+      "$_hap_watch" acme-close "$NODE_ID"
+      info "为申请证书临时放行的 TCP ${_acme_port} 已关上；快到期时会自动打开续期，续好再关。"
+    else
+      warn "没有 openssl，看不了证书哪天到期，TCP ${_acme_port} 只好一直开着，保证能续期。"
+    fi
+  fi
 fi
 _svc_install "$NODE_ID"
 
@@ -6196,38 +6340,6 @@ _svc_recheck() { # _svc_recheck [等几秒]
     pgrep -f "/etc/xray-node/nodes/${NODE_ID}/config.yaml" >/dev/null 2>&1 || _svc_listen_ok=0
   fi
 }
-# 申请正规证书要先连上 Let's Encrypt，最多多等一会儿；申请不下来就改回自签证书。
-if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY2_DOMAIN" ]; then
-  info "正在给 ${HY2_DOMAIN} 申请证书，最多再等 60 秒…"
-  _svc_recheck 60
-  if [ "$_svc_listen_ok" != "1" ]; then
-    warn "证书没申请下来（常见原因：域名没解析到这台机器、80/443 端口被云安全组挡住、NAT 小鸡外面连不进 80/443）。改用给 ${HY2_CERT_HOST} 签的自签证书，链接里带证书指纹，节点照样能用。"
-    HY2_DOMAIN=""
-    HY_TCP_MASQ=0
-    _hy_write_config
-    _svc_restart "$NODE_ID"
-    _svc_recheck
-  fi
-fi
-# 证书端口：申请成功了就先关上（快到期时巡检程序会自动再打开）；改用自签证书了就整个撤掉。
-_hy_acme_ports_done() {
-  [ "$PROTO" = "hy2" ] && [ -f "$NODE_DIR/fw_acme" ] || return 0
-  _hap_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
-  [ -x "$_hap_watch" ] || return 0
-  if [ -z "$HY2_DOMAIN" ]; then
-    "$_hap_watch" acme-drop "$NODE_ID"
-    info "已撤销为申请证书临时放行的 TCP ${_acme_port}"
-    return 0
-  fi
-  [ "$_svc_listen_ok" = "1" ] || return 0
-  [ -n "$(find "$NODE_DIR/acme" -type f -name '*.crt' 2>/dev/null | head -1)" ] || return 0
-  if command -v openssl >/dev/null 2>&1; then
-    "$_hap_watch" acme-close "$NODE_ID"
-    info "证书已申请好。为申请证书临时放行的 TCP ${_acme_port} 已关上；快到期时会自动打开续期，续好再关。"
-  else
-    warn "没有 openssl，看不了证书哪天到期，TCP ${_acme_port} 只好一直开着，保证能续期。"
-  fi
-}
 # 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ ! -f /etc/xray-node/hy_root ] \
   && grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
@@ -6246,7 +6358,6 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$P
     _svc_recheck
   fi
 fi
-_hy_acme_ports_done
 # 端口跳跃：不靠“从本机连跳跃端口”来验（本机发给自己的包根本不经过 PREROUTING，永远测不通），
 # 而是看转发规则是不是真的写进了系统。服务启动时已经自动打开过一次。
 HY_HOP_V4=1
@@ -6515,7 +6626,11 @@ fi
       printf "SNI: %s\n" "$HY2_SNI"
       if [ -n "$HY2_DOMAIN" ]; then
         printf "证书: 正规证书（Let's Encrypt，%s），客户端不要打开「跳过证书验证」。\n" "$HY2_DOMAIN"
-        printf "正规证书大约每 60 天自动续期一次，续期后证书就变了，所以客户端不要填证书指纹或公钥指纹，填了续期后会连不上。\n"
+        if [ -n "$HY2_PUBPIN" ]; then
+          printf "公钥指纹: %s\n" "$HY2_PUBPIN"
+          printf "Loon 的「公钥锁定」填上面的公钥指纹（下面的 Loon 行已经写好）。证书自动续期时私钥不换，公钥指纹一直不变。\n"
+        fi
+        printf "「证书锁定」（证书指纹）不要填：证书每次续期都会变，填了续期后会连不上。\n"
       else
         printf "证书指纹: %s\n" "$HY2_PIN"
       fi
@@ -6549,7 +6664,10 @@ fi
       fi
       # 混淆密码是纯字母数字，不要加引号。Loon 导入时会把引号也收进混淆参数。
       _hy_loon_cert="skip-cert-verify=false,tls-cert-sha256=${HY2_PIN}"
-      [ -n "$HY2_DOMAIN" ] && _hy_loon_cert="skip-cert-verify=false"
+      if [ -n "$HY2_DOMAIN" ]; then
+        _hy_loon_cert="skip-cert-verify=false"
+        [ -n "$HY2_PUBPIN" ] && _hy_loon_cert="skip-cert-verify=false,tls-pubkey-sha256=${HY2_PUBPIN}"
+      fi
       _hy_loon_obfs=""
       if [ "$HY2_USE_OBFS" = "1" ]; then
         _hy_loon_obfs=",salamander-password=${HY2_OBFS}"
