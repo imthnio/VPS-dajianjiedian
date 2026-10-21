@@ -58,6 +58,11 @@
 # WireGuard 落地（wg-luodi）：另一个脚本 VPS-WireGuard-luodi。装了它以后，你指定的端口上的节点
 #   上网时用 WireGuard 落地机的 IP，其它端口照旧用服务器自己的 IP。本脚本只在节点启动前叫它一声
 #   （wg-luodi hook），没装就什么都不做。
+# 双栈监听：节点同时收 IPv4 和 IPv6 客户端。Xray / sing-box 写 listen "::"，Hysteria2 写 listen ":端口"。
+#   只写 0.0.0.0 的话，Hysteria2 只收 IPv4，客户端填服务器的 IPv6 地址就连不上。
+#   机器上没有 IPv6、IPv6 被关掉、或者系统设成 [::] 只收 IPv6（bindv6only=1）时，照旧只听 0.0.0.0。
+# 内网 IPv6（fd 开头，比如 fd66::5）：NAT 小鸡常见。外网 IPv6 是服务商转发进来的，进来时落在这个内网地址上，
+#   所以节点也要听 IPv6 才收得到；但分享链接里不能写这个内网地址（外面连不到它）。
 # 所有节点都放在 /etc/xray-node/nodes/<编号>/ 目录里，一个节点一个目录，互不影响。
 # ============================================================
 
@@ -3593,6 +3598,26 @@ _hy_local_ipv6() { # 打印本机第一个公网 IPv6。临时地址和内网地
   printf '%s' "$_hip6"
 }
 
+# 这台机器的节点能不能“同时听 IPv6”（双栈监听）。三条都满足才算：
+#   1. 网卡上有全局 IPv6（公网的、fd 开头的内网地址都算：NAT 小鸡的外网 IPv6 转发进来时落在内网地址上）；
+#   2. IPv6 没被关掉（本脚本菜单 5 关掉 IPv6 时，这里就返回“不能”）；
+#   3. 系统没把 [::] 设成只收 IPv6（bindv6only=1 时 :: 收不到 IPv4，所以不改）。
+# 不满足就照旧只听 0.0.0.0，纯 IPv4 机器和关了 IPv6 的机器行为不变。
+_v6_listen_ok() {
+  [ -r /proc/net/if_inet6 ] || return 1
+  [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ] && return 1
+  [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" = "1" ] && return 1
+  awk '$4 == "00" && $6 != "lo" && $6 != "wg-luodi" { f = 1 } END { exit !f }' /proc/net/if_inet6 2>/dev/null
+}
+
+# 这个端口现在有没有程序在 IPv6 上听（双栈 [::] 也算）：直接读内核套接字表，busybox 也能用。
+_port_on_v6() { # _port_on_v6 <端口> <tcp|udp>
+  _pv_hex=$(printf '%04X' "$1")
+  if [ "$2" = "udp" ]; then _pv_f=/proc/net/udp6; _pv_st=07; else _pv_f=/proc/net/tcp6; _pv_st=0A; fi
+  [ -r "$_pv_f" ] || return 1
+  awk -v port="$_pv_hex" -v st="$_pv_st" 'NR > 1 { n = split($2, a, ":"); if (toupper(a[n]) == port && toupper($4) == st) f = 1 } END { exit !f }' "$_pv_f"
+}
+
 # 端口跳跃：除了主端口，再多给几个 UDP 端口，客户端会在这些端口之间换着连。
 # 每个端口一个一个填，直接回车就结束。也可以填 20000-20010 这种一段连续的端口。
 # 填过的端口用逗号串起来，例如 20000,20001,30000-30010。空字符串表示不开。
@@ -4385,8 +4410,10 @@ _route_refresh_all() {
 _hy_fix_existing_ipv6() {
   # 以前装的 Hysteria2 选了 IPv4 就只听 0.0.0.0。重跑脚本选更新时改成同时听 IPv6。
   # 改完端口没起来就把配置改回去，避免把正在用的节点弄断。
-  _hy6=$(_hy_local_ipv6) || return 0
-  [ -n "$_hy6" ] || return 0
+  # 只有内网 IPv6（fd 开头，NAT 小鸡）也改：外网 IPv6 转发进来时落在内网地址上，节点不听 IPv6 就收不到。
+  # 这种情况下不往分享链接里加 IPv6 地址（内网地址外面连不到），端口跳跃也照旧只转发 IPv4。
+  _hy6=$(_hy_local_ipv6) || _hy6=""
+  [ -n "$_hy6" ] || _v6_listen_ok || return 0
   for _hd in /etc/xray-node/nodes/*/; do
     [ -f "${_hd}core" ] && [ -f "${_hd}config.yaml" ] || continue
     [ "$(tr -d ' \r\n' < "${_hd}core")" = "hysteria" ] || continue
@@ -4443,11 +4470,11 @@ _hy_fix_existing_ipv6() {
     if [ "$_hy_up" = "1" ]; then
       rm -f "${_hcfg}.bak-ipv6"
       HY_IPV6_FIXED=1
-      if [ -f "${_hd}hop" ]; then
+      if [ -f "${_hd}hop" ] && [ -n "$_hy6" ]; then
         _hop_set_family "$_hd" 46
         /usr/local/bin/xray-node-hop up "$_hid" >/dev/null 2>&1 || true
       fi
-      if [ -f "${_hd}node.txt" ] && ! grep -F "[${_hy6}]" "${_hd}node.txt" >/dev/null 2>&1; then
+      if [ -n "$_hy6" ] && [ -f "${_hd}node.txt" ] && ! grep -F "[${_hy6}]" "${_hd}node.txt" >/dev/null 2>&1; then
         _hline=$(grep -m1 '^hysteria2://' "${_hd}node.txt" 2>/dev/null)
         _hrest=${_hline#hysteria2://}
         _hpass=${_hrest%%@*}
@@ -4498,11 +4525,50 @@ _hy_fix_existing_ipv6() {
           fi
         done
       fi
-      info "节点 $_hid 的 Hysteria2 已同时听 IPv6：${_hy6}"
+      if [ -n "$_hy6" ]; then
+        info "节点 $_hid 的 Hysteria2 已同时听 IPv6：${_hy6}"
+      else
+        info "节点 $_hid 的 Hysteria2 已同时听 IPv4 和 IPv6（这台机器网卡上是内网 IPv6，外网 IPv6 要靠服务商转发进来）"
+      fi
     else
       mv -f "${_hcfg}.bak-ipv6" "$_hcfg"
       _svc_restart "$_hid"
       warn "节点 $_hid 改成同时听 IPv6 后端口没起来，已改回只听 IPv4"
+    fi
+  done
+}
+
+# 以前装的 Xray / sing-box 节点写的是 listen "0.0.0.0"。更新时，如果这台机器能听 IPv6、
+# 而这个节点的端口现在确实没在 IPv6 上听，就改成 "::"（双栈），重启这个节点，确认端口起来了才留下；
+# 没起来就换回原来的配置再重启。已经在听 IPv6 的节点（比如 Xray 自己就把 0.0.0.0 当双栈）一个字都不动、也不重启。
+_fix_existing_json_ipv6() {
+  _v6_listen_ok || return 0
+  for _jd in /etc/xray-node/nodes/*/; do
+    _jcfg="${_jd}config.json"
+    [ -f "$_jcfg" ] && [ -f "${_jd}fw_info" ] || continue
+    grep -q '"listen"[[:space:]]*:[[:space:]]*"0\.0\.0\.0"' "$_jcfg" 2>/dev/null || continue
+    _jport=""; _jproto=""
+    read -r _jport _jproto _jrest < "${_jd}fw_info"
+    case "$_jport" in ''|*[!0-9]*) continue ;; esac
+    case "$_jproto" in udp) _jp=udp ;; *) _jp=tcp ;; esac
+    _port_on_v6 "$_jport" "$_jp" && continue
+    _jid=$(basename "$_jd")
+    cp -a "$_jcfg" "${_jcfg}.bak-ipv6" || { warn "节点 $_jid 无法备份配置，跳过 IPv6"; continue; }
+    if ! sed 's/"listen"[[:space:]]*:[[:space:]]*"0\.0\.0\.0"/"listen": "::"/' "${_jcfg}.bak-ipv6" > "$_jcfg"; then
+      mv -f "${_jcfg}.bak-ipv6" "$_jcfg"; warn "节点 $_jid 没能改成同时听 IPv6"; continue
+    fi
+    _svc_restart "$_jid"
+    if wait_for_port "$_jport" "$_jp" 15 && _port_on_v6 "$_jport" "$_jp"; then
+      rm -f "${_jcfg}.bak-ipv6"
+      if command -v ip6tables >/dev/null 2>&1 && ! ip6tables -C INPUT -p "$_jp" --dport "$_jport" -j ACCEPT >/dev/null 2>&1; then
+        _fw_allow "$_jport" "$_jp" 6 "${_jd}fw_info" 0
+        [ "$_IPT_ADDED" = "1" ] && _save_fw 6
+      fi
+      info "节点 $_jid（端口 $_jport）已同时听 IPv4 和 IPv6"
+    else
+      mv -f "${_jcfg}.bak-ipv6" "$_jcfg"
+      _svc_restart "$_jid"
+      warn "节点 $_jid 改成同时听 IPv6 后端口没起来，已改回原来的配置"
     fi
   done
 }
@@ -5335,14 +5401,14 @@ fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   while true; do
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；Hysteria2 在有 IPv6 的机器上会同时听 IPv6，其它配置不动）\n"
+  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；节点在有 IPv6 的机器上会改成同时听 IPv4 和 IPv6，其它配置不动）\n"
   printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
-    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; _quic_unblock_all; break ;;
+    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; _fix_existing_json_ipv6; _quic_unblock_all; break ;;
     2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
@@ -6117,7 +6183,8 @@ mkdir -p /etc/xray-node
 if [ "$CORE" = "xray" ]; then
 # 与 Hysteria2 / sing-box 一致：纯 IPv6 机器必须听 [::]，默认 0.0.0.0 只收 IPv4，
 # 选了 IPv6 却听不到时会出现“安装成功但客户端连不上”。
-if [ "$IPVER" = "6" ]; then XRAY_LISTEN="::"; else XRAY_LISTEN="0.0.0.0"; fi
+# 机器能听 IPv6 就写 ::（双栈：IPv4、IPv6 客户端都能连），不能就照旧只听 IPv4
+if [ "$IPVER" = "6" ] || _v6_listen_ok; then XRAY_LISTEN="::"; else XRAY_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   vless)
     cat > "$NODE_DIR/config.json" <<EOF
@@ -6240,7 +6307,9 @@ HY_CONF="$NODE_DIR/config.yaml"
 HY_EXTRA_IP=""
 _hy_v6=$(_hy_local_ipv6) || _hy_v6=""
 _hy_v4=$(_hy_local_ipv4) || _hy_v4=""
-if [ -n "$_hy_v6" ] && [ -n "$_hy_v4" ]; then
+# 有 IPv4，又能听 IPv6（公网或内网 fd 开头的 IPv6 都算），就两种都听。
+# 分享链接里的“IPv6 地址”只用公网 IPv6（_hy_v6），内网地址不写进链接。
+if [ -n "$_hy_v4" ] && { [ -n "$_hy_v6" ] || _v6_listen_ok; }; then
   _hy_both=1
 else
   _hy_both=""
@@ -6299,7 +6368,8 @@ info "配置文件已写入"
 else
 # ---------- sing-box 配置（AnyTLS / TUIC） ----------
 SB_CONF="$NODE_DIR/config.json"
-if [ "$IPVER" = "6" ]; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
+# 机器能听 IPv6 就写 ::（双栈：IPv4、IPv6 客户端都能连），不能就照旧只听 IPv4
+if [ "$IPVER" = "6" ] || _v6_listen_ok; then SB_LISTEN="::"; else SB_LISTEN="0.0.0.0"; fi
 case "$PROTO" in
   anytls)
     cat > "$SB_CONF" <<EOF
