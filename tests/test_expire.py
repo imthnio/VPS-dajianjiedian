@@ -29,7 +29,7 @@ class MenuSplitTest(unittest.TestCase):
         self.assertIn("4) 开启 IPv6（恢复使用。服务商没分配地址的话，打开后仍然没有 IPv6）", source)
         self.assertIn("5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）", source)
         self.assertIn("9) 1 周（7 天）", source)
-        self.assertIn("2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）", source)
+        self.assertIn("2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响。Xray / sing-box 有新的正式版会顺便升级）", source)
         self.assertIn("3) 节点管理（查看所有节点、删除某个节点）", source)
         self.assertIn("4) 取消，什么都不做", source)
         self.assertIn("[1/4] 节点里填你服务器的哪个公网地址？", source)

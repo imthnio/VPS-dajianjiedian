@@ -21,7 +21,13 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; if ! 
 jiedian
 ```
 
-立刻显示**所有**节点的信息和链接，复制整行粘贴到客户端导入即可。
+每个节点只显示两样：**通用节点链接**（v2rayN、小火箭、Clash Verge、NekoBox 等）和 **Loon 节点行**，复制整行粘贴到客户端导入即可。
+
+想看完整参数（端口、密码、Surge / Clash 配置等），输入：
+
+```bash
+jiedian all
+```
 
 ## 赞赏支持
 如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  

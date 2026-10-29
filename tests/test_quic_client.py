@@ -127,7 +127,7 @@ class ServerSideRemovedTest(unittest.TestCase):
 
     def test_update_mode_runs_the_migration(self):
         source = INSTALLER.read_text()
-        self.assertIn("_hy_fix_existing_ipv6; _quic_unblock_all; break ;;", source)
+        self.assertIn("_hy_fix_existing_ipv6; _fix_existing_json_ipv6; _quic_unblock_all; break ;;", source)
 
 
 class ClientLineTest(unittest.TestCase):
