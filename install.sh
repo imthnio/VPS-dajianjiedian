@@ -3111,7 +3111,13 @@ _node_info() {
       _ni_kind="定时节点，${_ni_when} 失效"
       ;;
   esac
-  printf "%s，端口 %s，%s" "$_ni_proto" "$_ni_port" "$_ni_kind"
+  _ni_name=$(grep -m1 '^节点名: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^节点名: //' | tr -d '\r')
+  [ -n "$_ni_name" ] || _ni_name=$(head -n 1 "$NODES_DIR/$1/name" 2>/dev/null | tr -d '\r')
+  if [ -n "$_ni_name" ]; then
+    printf "%s，%s，端口 %s，%s" "$_ni_name" "$_ni_proto" "$_ni_port" "$_ni_kind"
+  else
+    printf "%s，端口 %s，%s" "$_ni_proto" "$_ni_port" "$_ni_kind"
+  fi
 }
 
 # _fw_save：iptables 规则改动后存盘（删规则后也要存，否则重启后删掉的规则又回来了）
@@ -5836,12 +5842,18 @@ _update_one_core() (
       { rm -f "$_u_backup"; die "$_ucore 旧内核备份失败，升级已取消"; }
     info "旧内核备份：$_u_backup"
   fi
-  FORCE_DL=1
-  if [ "$_ucore" = "xray" ]; then dl_xray
-  elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
-  else dl_singbox
+  # 下载放进子 shell：下载或校验失败时 die 只退出这一层，在新内核替换旧文件之前就停了，旧内核没动。
+  # 这时把备份删掉，免得每次失败都在 /usr/local/bin 留一个几十 MB 的备份。
+  if ! (
+    FORCE_DL=1
+    if [ "$_ucore" = "xray" ]; then dl_xray
+    elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
+    else dl_singbox
+    fi
+  ); then
+    [ -z "$_u_backup" ] || rm -f "$_u_backup"
+    die "$_ucore 新版本没装上（上面有原因），旧内核没动，节点照常使用"
   fi
-  FORCE_DL=0
   # 重启所有用这个内核的节点（子 shell 里改 FORCE_DL 不影响外面）
   step "[更新] 重启 $_ucore 的节点服务…"
   _u_failed=""
