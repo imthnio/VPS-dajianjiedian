@@ -37,8 +37,8 @@
 # systemd 服务：Linux 管“后台程序”的系统。把节点注册成服务后，程序挂了会自动拉起，
 #       服务器重启后也会自动启动。Alpine 等系统用的是 OpenRC，作用一样。
 # 定时节点：到时间后自动彻底删除的节点，适合临时给别人用。
-# 节点名：客户端里显示的名字，自动写成“地区+协议”，比如 香港Vless、美国Hysteria2。
-#       地区按服务器公网 IP 查；同名的会在后面加 2、3…
+# 节点名：客户端里显示的名字。建节点前会问你，默认是“地区+协议”，比如 香港Vless、美国Hysteria2。
+#       地区按服务器公网 IP 查；默认名重名时在后面加 2、3…
 # 端口跳跃：Hysteria2 的客户端在好几个 UDP 端口之间换着连，单个端口被限速或封掉时不容易断。
 #       服务器上只有主端口真的在听，其它端口靠 nat 转发过去。
 # nat 转发：Linux 防火墙的一项功能，把发到某个端口的包改成发到另一个端口（REDIRECT）。
@@ -949,7 +949,7 @@ _choose_expire_duration() {
 # ---------- 节点名：地区 + 协议 ----------
 # 分享链接最后 # 后面是节点名，客户端列表里显示的就是它。按“服务器所在地区 + 协议”起名，
 # 比如 香港Vless、美国Hysteria2。地区用公网 IP 查（几个免费查询网站轮流试，每个最多等 6 秒），
-# 都查不到就写“未知地区”。同名时在后面加 2、3……
+# 都查不到就写“未知地区”。同名时在后面加 2、3……这只是默认名，建节点前会问你要不要改。
 _cc_name() { # _cc_name <两位国家代码> -> 中文地区名，不认识就原样打印代码
   case "$1" in
     HK) echo 香港 ;; TW) echo 台湾 ;; MO) echo 澳门 ;; CN) echo 中国 ;; JP) echo 日本 ;; KR) echo 韩国 ;;
@@ -1035,9 +1035,19 @@ _name_ok() { # _name_ok <名字>：能放进链接、Loon 行、Clash 配置和 
   [ -n "$1" ] || return 1
   # 中文等非 ASCII 字符都行；ASCII 只认字母、数字、空格和 - _ . ( )。
   # 逗号、等号、引号、反斜杠、#、冒号这些会把 Loon 行、YAML 或 JSON 切坏。
-  _no_left=$(printf '%s' "$1" | LC_ALL=C tr -d 'A-Za-z0-9 ._()\200-\377-')
-  [ -z "$_no_left" ] || return 1
-  [ "$(printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' ')" -le 60 ] || return 1
+  # 按字节检查（和 _urlenc 一样用 od，busybox 也能用）：打印字节数，有不能用的字节就打印 bad
+  _no_r=$(printf '%s' "$1" | od -An -v -tu1 | tr -s ' \n' '\n\n' | awk '
+    $0 == "" { next }
+    {
+      d = $0 + 0; n++
+      if (d >= 128 || (d >= 48 && d <= 57) || (d >= 65 && d <= 90) || (d >= 97 && d <= 122) \
+          || d == 32 || d == 45 || d == 46 || d == 95 || d == 40 || d == 41) next
+      bad = 1
+    }
+    END { if (bad) print "bad"; else print n + 0 }
+  ')
+  case "$_no_r" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_no_r" -ge 1 ] && [ "$_no_r" -le 60 ] || return 1
   case "$1" in -*) return 1 ;; esac
   return 0
 }
@@ -2477,7 +2487,7 @@ _ipv6_strip_links() {
       /^IPv6 地址:/ { next }
       /^IPv6 端口:/ { next }
       /^hysteria2:\/\/.*@\[/ { next }
-      /^Hysteria2 = Hysteria2,/ {
+      / = Hysteria2,/ {
         n = split($0, a, ",")
         if (n >= 2 && a[2] ~ /:/) next
       }
@@ -5939,7 +5949,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
       printf "\n${YELLOW}${BOLD}更新结束：部分内核更新失败（上面有说明），其它节点不受影响。${NC}\n"
       exit 1
     elif [ "$HY_IPV6_FIXED" = "1" ]; then
-      printf "\n${GREEN}${BOLD}更新完成。${NC}Hysteria2 已同时听 IPv6。上面多出来的是 IPv6 链接，密码没变。云服务器还要在安全组放行这个 UDP 端口的 IPv6。\n"
+      printf "\n${GREEN}${BOLD}更新完成。${NC}Hysteria2 已同时听 IPv6。IPv6 链接输入 jiedian all 查看，密码没变。云服务器还要在安全组放行这个 UDP 端口的 IPv6。\n"
     else
       printf "\n${GREEN}${BOLD}更新完成！${NC}节点链接、端口、密码都没变，直接继续用。\n"
     fi
@@ -6225,7 +6235,7 @@ else
   SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | base64 | tr -d '\n')
 fi
 WS_PATH="/$(rand_hex 16)"  # 16 字节随机路径，防止被轻易探测
-info "账号密码已随机生成（装完会显示，平时输入 jiedian 也能看）"
+info "账号密码已随机生成（装完会显示在链接里，完整参数平时输入 jiedian all 能看）"
 
 # ---------- 8. 下载内核 ----------
 # 1-4 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria。已经有能用的就不重复下载。
@@ -7064,13 +7074,13 @@ fi
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail" "$_hy_loon_bw")
       printf "%s\n" "$LOON_LINE"
       if [ -n "$LINK_EXTRA" ]; then
-        if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
+        if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; _loon_sfx="-v4"; else _loon_port="$PORT"; _loon_sfx="-v6"; fi
         _hy_loon_tail2=""
         if [ -n "$_hy_mport_x" ]; then
           _hy_loon_tail2=",server-ports=\"${_hy_mport_x}\",hop-interval=30"
         fi
         printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s%s\n" \
-          "${NODE_NAME}-v6" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2" "$_hy_loon_bw"
+          "${NODE_NAME}${_loon_sfx}" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2" "$_hy_loon_bw"
       fi
       # Surge：自签证书用证书指纹锁定（server-cert-fingerprint-sha256），跳跃端口用分号隔开。
       _hy_surge_cert="server-cert-fingerprint-sha256=${HY2_PIN}"
