@@ -3075,7 +3075,10 @@ for _d in /etc/xray-node/nodes/*/; do
   if [ -n "$_loon" ]; then
     printf "${Y}%s${N}\n" "$_loon"
   else
-    printf "这个节点没有 Loon 行（Loon 不支持这个协议），请用上面的通用链接。\n"
+    case "$_link" in
+      tuic://*) printf "Loon 不支持 TUIC，请用上面的通用链接。\n" ;;
+      *) printf "这个节点是旧版脚本装的，没有现成的 Loon 行。请用上面的通用链接，或输入 jiedian all 看参数在 Loon 里手动添加。\n" ;;
+    esac
   fi
 done
 if [ "$_n" = "0" ]; then
