@@ -1023,6 +1023,44 @@ _node_name() { # _node_name <协议显示名> -> 不和已有节点重名的名�
   printf '%s' "$_nn"
 }
 
+_name_taken() { # _name_taken <名字>：已有节点用了这个名字就返回 0
+  for _nt_f in "${XRAY_NODES_DIR:-/etc/xray-node/nodes}"/*/name; do
+    [ -f "$_nt_f" ] || continue
+    [ "$(head -n 1 "$_nt_f" 2>/dev/null | tr -d '\r')" = "$1" ] && return 0
+  done
+  return 1
+}
+
+_name_ok() { # _name_ok <名字>：能放进链接、Loon 行、Clash 配置和 vmess 的 JSON 里才返回 0
+  [ -n "$1" ] || return 1
+  # 中文等非 ASCII 字符都行；ASCII 只认字母、数字、空格和 - _ . ( )。
+  # 逗号、等号、引号、反斜杠、#、冒号这些会把 Loon 行、YAML 或 JSON 切坏。
+  _no_left=$(printf '%s' "$1" | LC_ALL=C tr -d 'A-Za-z0-9 ._()\200-\377-')
+  [ -z "$_no_left" ] || return 1
+  [ "$(printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' ')" -le 60 ] || return 1
+  case "$1" in -*) return 1 ;; esac
+  return 0
+}
+
+_ask_node_name() { # _ask_node_name <协议显示名>：问节点叫什么，结果放进 NODE_NAME
+  _an_def=$(_node_name "$1")
+  printf "\n这个节点叫什么名字？会显示在客户端的节点列表里。\n"
+  printf "可以用中文、字母、数字、空格和 - _ . ( )，不能用逗号、等号、引号、#、冒号。看不懂就回车用默认。\n"
+  while true; do
+    ask "节点名称" "$_an_def" NODE_NAME
+    if ! _name_ok "$NODE_NAME"; then
+      warn "「${NODE_NAME}」里有不能用的字符，或者太长了（最多 20 个汉字或 60 个字母），请重新输入"
+      continue
+    fi
+    if _name_taken "$NODE_NAME"; then
+      warn "已经有节点叫「${NODE_NAME}」了，换一个名字吧（直接回车用 ${_an_def}）"
+      continue
+    fi
+    break
+  done
+  info "节点名称：$NODE_NAME"
+}
+
 # ---------- 机器类型：母鸡还是小鸡 ----------
 # 母鸡 = 独立服务器/宿主机（上面可能跑着 PVE、KVM 虚拟机）；小鸡 = 从母鸡上分出来的 VPS。
 # 小鸡分 KVM（完整虚拟机，什么都能做）、LXC / OpenVZ（容器，内核和宿主共用，常常不给改防火墙 nat 表）。
@@ -2989,19 +3027,52 @@ EOF
 write_helper_cmds() { # 写入/刷新 jiedian、shanjiedian，以及定时失效脚本
 cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
-# 输入 jiedian，显示所有已安装节点的信息和链接
+# 输入 jiedian：每个节点只显示两样，通用链接和 Loon 行
+# 输入 jiedian all：显示每个节点的完整参数（端口、密码、Surge / Clash 配置等）
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
+G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
+_all=0
+case "$1" in all|-a|--all) _all=1 ;; esac
 _n=0
 for _d in /etc/xray-node/nodes/*/; do
   [ -f "${_d}node.txt" ] || continue
   _n=1
-  printf "\n==================== 节点 %s ====================\n" "$(basename "$_d")"
-  cat "${_d}node.txt"
+  _id=$(basename "$_d")
+  if [ "$_all" = "1" ]; then
+    printf "\n==================== 节点 %s ====================\n" "$_id"
+    cat "${_d}node.txt"
+    continue
+  fi
+  _name=$(sed -n 's/^节点名: //p' "${_d}node.txt" | head -n 1 | tr -d '\r')
+  [ -n "$_name" ] || _name=$(head -n 1 "${_d}name" 2>/dev/null | tr -d '\r')
+  # 第一条分享链接就是主链接
+  _link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic)://' "${_d}node.txt" | tr -d '\r')
+  # Loon 行：“名字 = 协议,”，协议名首字母大写（Surge 行是小写，不会认错）
+  _loon=$(grep -m1 -E '^[^ ].* = (VLESS|Trojan|VMess|Shadowsocks|AnyTLS|Hysteria2),' "${_d}node.txt" | tr -d '\r')
+  # 去掉“（1天后…）”：那是装的时候算的，过后就不对了
+  _exp=$(sed -n 's/^失效时间: //p' "${_d}node.txt" | head -n 1 | tr -d '\r' | sed 's/（.*//')
+  printf "\n${G}${B}==================== 节点 %s：%s ====================${N}\n" "$_id" "$_name"
+  [ -n "$_exp" ] && printf "定时节点，失效时间：%s\n" "$_exp"
+  printf "\n${C}${B}【1】通用节点链接${N}（v2rayN、小火箭、Clash Verge、NekoBox 等，复制整行导入）\n\n"
+  if [ -n "$_link" ]; then
+    printf "${Y}%s${N}\n" "$_link"
+  else
+    printf "没找到链接，输入 jiedian all 看完整信息。\n"
+  fi
+  printf "\n${C}${B}【2】Loon 节点${N}（Loon 里添加节点，复制整行粘贴）\n\n"
+  if [ -n "$_loon" ]; then
+    printf "${Y}%s${N}\n" "$_loon"
+  else
+    printf "这个节点没有 Loon 行（Loon 不支持这个协议），请用上面的通用链接。\n"
+  fi
 done
 if [ "$_n" = "0" ]; then
   echo "还没安装节点，请先运行一键安装脚本"
+else
+  printf "\n${G}${B}==============================================================${N}\n"
+  [ "$_all" = "1" ] || printf "完整参数（端口、密码、Surge / Clash 配置等）输入 jiedian all 查看；管理节点输入 shanjiedian。\n"
 fi
 exit 0
 JDEOF
@@ -3773,6 +3844,40 @@ _hy_ask_obfs() {
   done
 }
 
+# 带宽：用户只填数字（单位 Mbps）。下行 = 你这边下载的速度，上行 = 你这边上传的速度。
+# 填了就写进服务器配置当上限，客户端带上同样的数字后，Hysteria2 按这个速度发包（Brutal），
+# 线路丢包时比 BBR 快。都不填就和以前一样用 BBR。
+_hy_bw_num() { # _hy_bw_num <输入>：合法就打印去掉前导 0 的数字，空输入打印空；不合法返回 1
+  case "$1" in
+    '') return 0 ;;
+    *[!0-9]*) return 1 ;;
+  esac
+  _bw_n=$(printf '%s' "$1" | sed 's/^0*//')
+  [ -n "$_bw_n" ] && [ "${#_bw_n}" -le 6 ] && [ "$_bw_n" -le 100000 ] || return 1
+  printf '%s' "$_bw_n"
+}
+
+_hy_ask_bw() {
+  HY2_BW_DOWN=""; HY2_BW_UP=""
+  printf "\n设置带宽（单位 Mbps，只填数字）。填你本地宽带的实际速度，比如 300 兆宽带就填 300。\n"
+  printf "不知道就直接回车，不限制，自动调速（BBR）。\n"
+  while true; do
+    ask "下行带宽（你这边下载的速度，Mbps）" "" _hy_bw_in
+    if _hy_bw_v=$(_hy_bw_num "$_hy_bw_in"); then HY2_BW_DOWN="$_hy_bw_v"; break; fi
+    warn "只能填 1-100000 的数字，比如 300；不限制就直接回车"
+  done
+  while true; do
+    ask "上行带宽（你这边上传的速度，Mbps）" "" _hy_bw_in
+    if _hy_bw_v=$(_hy_bw_num "$_hy_bw_in"); then HY2_BW_UP="$_hy_bw_v"; break; fi
+    warn "只能填 1-100000 的数字，比如 50；不限制就直接回车"
+  done
+  if [ -z "$HY2_BW_DOWN" ] && [ -z "$HY2_BW_UP" ]; then
+    info "带宽：不限制（BBR 自动调速）"
+  else
+    info "带宽：下行 ${HY2_BW_DOWN:-不限制}${HY2_BW_DOWN:+ Mbps}，上行 ${HY2_BW_UP:-不限制}${HY2_BW_UP:+ Mbps}"
+  fi
+}
+
 # 自己有域名时，自动给它申请正规证书（Let's Encrypt），客户端不用“跳过证书验证”。
 # 不在这里预先判断解析对不对、是不是 NAT：猜错了会把能申请的域名挡掉（比如开了 CDN 小云朵，
 # 用 80 端口照样能申请）。直接去申请，申请不下来再自动改用自签证书。
@@ -3966,6 +4071,18 @@ obfs:
   listenHTTPS: \":$PORT\""
     fi
   fi
+  if [ -n "$HY2_BW_DOWN" ] || [ -n "$HY2_BW_UP" ]; then
+    # 服务器的 up 是发给你的方向（你的下行），down 是你发上来的方向（你的上行）。
+    # 不忽略客户端带宽：客户端填了带宽就按它发包（不超过这里的上限），没填还是 BBR。
+    _hy_bw="# 带宽上限：服务器 up = 你的下行，down = 你的上行
+bandwidth:${HY2_BW_DOWN:+
+  up: ${HY2_BW_DOWN} mbps}${HY2_BW_UP:+
+  down: ${HY2_BW_UP} mbps}
+ignoreClientBandwidth: false"
+  else
+    _hy_bw="# 不听客户端报的带宽，统一用 BBR 拥塞控制，不会因为客户端乱填带宽把线路挤爆。
+ignoreClientBandwidth: true"
+  fi
   cat > "$HY_CONF" <<EOF
 listen: "$HY_LISTEN"
 
@@ -3975,8 +4092,7 @@ auth:
   type: password
   password: "$HY2_PASS"
 
-# 不听客户端报的带宽，统一用 BBR 拥塞控制，不会因为客户端乱填带宽把线路挤爆。
-ignoreClientBandwidth: true
+$_hy_bw
 # 测速接口关掉，别人不能拿它来识别这是 Hysteria2。
 speedTest: false
 
@@ -5401,8 +5517,8 @@ fi
 if [ "$_NODE_COUNT" -gt 0 ]; then
   while true; do
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
-  printf "  1) 更新内核（推荐。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；节点在有 IPv6 的机器上会改成同时听 IPv4 和 IPv6，其它配置不动）\n"
-  printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响）\n"
+  printf "  1) 更新内核到最新正式版（推荐，beta 测试版不装。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；节点在有 IPv6 的机器上会改成同时听 IPv4 和 IPv6，其它配置不动）\n"
+  printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响。Xray / sing-box 有新的正式版会顺便升级）\n"
   printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
   printf "  4) 取消，什么都不做\n"
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
@@ -5609,6 +5725,171 @@ else
 fi
 info "系统工具就绪"
 
+# ---------- 内核升级 ----------
+# _ver_gt <a> <b>：版本号 a 比 b 新返回 0（只比数字部分，如 26.3.27 > 26.2.6）
+_ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, ".")
+    n = na > nb ? na : nb
+    for (i = 1; i <= n; i++) {
+      if ((x[i] + 0) > (y[i] + 0)) exit 0
+      if ((x[i] + 0) < (y[i] + 0)) exit 1
+    }
+    exit 1
+  }'
+}
+
+_ver_stable() { # _ver_stable <版本号>：正式版（只有数字和点，比如 26.3.27）返回 0；beta、rc、alpha 之类返回 1
+  case "$1" in
+    ''|.*|*.|*..*|*[!0-9.]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _update_one_core <xray|sing-box|hysteria>：有更新的正式版就升级，并重启用这个内核的节点；
+# 新版跑不起来自动回滚。整个函数在子 shell 里跑，里面 die 只退出这个函数，返回非零。
+_update_one_core() (
+  _ucore="$1"
+  if [ "$_ucore" = "xray" ]; then
+    _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN"
+  elif [ "$_ucore" = "hysteria" ]; then
+    _u_repo="apernet/hysteria"; _u_bin="$HY_BIN"
+  else
+    _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
+  fi
+  # 首次安装时会复用机器上已有的内核；那可能属于其他服务，不能覆盖升级。
+  if ! grep -qx "$_ucore" /etc/xray-node/our_bins 2>/dev/null; then
+    warn "$_ucore 是机器上原有的内核，跳过升级，避免影响其他服务"
+    exit 0
+  fi
+  _u_inst=""
+  if [ -x "$_u_bin" ]; then
+    if [ "$_ucore" = "hysteria" ]; then
+      _u_inst=$(_hysteria_local_ver "$_u_bin")
+    else
+      _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
+    fi
+  fi
+  _gh_prepare
+  if [ "$_ucore" = "hysteria" ]; then
+    _u_latest=$(_latest_hysteria_ver) || _u_latest=""
+  else
+    _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+  fi
+  _dns64_off
+  if [ -z "$_u_latest" ]; then
+    warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
+    exit 0
+  fi
+  # 只升级到正式版：最新发布是 beta / rc 这类测试版就不动
+  if ! _ver_stable "$_u_latest"; then
+    info "$_ucore 最新发布 v${_u_latest} 不是正式版，不更新。"
+    exit 0
+  fi
+  if [ -n "$_u_inst" ]; then
+    # 装的是测试版（比如 1.13.0-beta.2）时，同号的正式版 1.13.0 也算更新
+    _u_inst_pre=0
+    if [ "$_ucore" != "hysteria" ] && [ -x "$_u_bin" ]; then
+      _u_inst_full=$("$_u_bin" version 2>/dev/null | head -1 | sed 's/^[^0-9]*//; s/[[:space:]].*//')
+      [ "$_u_inst_full" = "$_u_inst" ] || _u_inst_pre=1
+    fi
+    if ! _ver_gt "$_u_latest" "$_u_inst" && ! { [ "$_u_inst_pre" = "1" ] && [ "$_u_inst" = "$_u_latest" ]; }; then
+      if [ "$_u_inst_pre" = "1" ]; then
+        info "$_ucore 现在装的是测试版 v${_u_inst_full}，比最新正式版 v${_u_latest} 还新，不动它。"
+      else
+        info "$_ucore 已经是最新正式版（v${_u_inst}），无需更新。"
+      fi
+      exit 0
+    fi
+  fi
+  # 读不出版本号，但有节点正用这个内核跑着：内核没坏，多半是内存太紧，跑 version 的小进程被系统杀了。
+  # 这时重新下载、解压更容易把机器撑爆，这次先不更新它。
+  # 用 pidof：busybox 的 pgrep -x 匹配不到进程名
+  if [ -z "$_u_inst" ] && [ -x "$_u_bin" ] && pidof "$(basename "$_u_bin")" >/dev/null 2>&1; then
+    warn "$_ucore 读不出版本号（内存太紧），但节点正在正常运行，这次先不更新它。"
+    exit 0
+  fi
+  if [ -n "$_u_inst" ]; then
+    info "$_ucore 当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
+  else
+    warn "$_ucore 内核读不出版本号（文件可能坏了，或者内存太紧跑不起来），直接下载最新版 v${_u_latest}（节点配置保留）。"
+  fi
+  # 每次升级用独立备份路径；上次失败留下的备份不会被覆盖。
+  _u_backup=""
+  if [ -x "$_u_bin" ]; then
+    _u_backup=$(mktemp "${_u_bin}.bak.XXXXXX") ||
+      die "$_ucore 无法创建备份文件，升级已取消"
+    _cp_bin "$_u_bin" "$_u_backup" ||
+      { rm -f "$_u_backup"; die "$_ucore 旧内核备份失败，升级已取消"; }
+    info "旧内核备份：$_u_backup"
+  fi
+  FORCE_DL=1
+  if [ "$_ucore" = "xray" ]; then dl_xray
+  elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
+  else dl_singbox
+  fi
+  FORCE_DL=0
+  # 重启所有用这个内核的节点（子 shell 里改 FORCE_DL 不影响外面）
+  step "[更新] 重启 $_ucore 的节点服务…"
+  _u_failed=""
+  for _ud2 in /etc/xray-node/nodes/*/; do
+    [ -f "${_ud2}core" ] || continue
+    _uc2=$(tr -d ' \r\n' 2>/dev/null < "${_ud2}core")
+    [ "$_uc2" = "$_ucore" ] || continue
+    _u_id=$(basename "$_ud2")
+    _svc_restart "$_u_id"
+    # 读出该节点端口，硬检查真的在监听
+    _u_port=""; _u_proto="tcp"
+    if _u_pp=$(_node_port "$_u_id"); then set -- $_u_pp; _u_port="$1"; _u_proto="$2"; fi
+    if [ -n "$_u_port" ] && wait_for_port "$_u_port" "$_u_proto" 15; then
+      info "节点 $_u_id 升级成功：端口 $_u_port/$_u_proto 监听正常，配置未变"
+    else
+      warn "节点 $_u_id 更新后端口没监听（端口：${_u_port:-未知}）"
+      _u_failed="$_u_failed $_u_id"
+    fi
+  done
+  if [ -n "$_u_failed" ]; then
+    _u_rb_bad=""
+    if [ -n "$_u_backup" ] && [ -f "$_u_backup" ]; then
+      warn "新内核启动后有节点端口没监听，正在回滚到旧版本…"
+      # 不能 cp 到正在运行的可执行文件：其他节点可能正运行新版，会触发 ETXTBSY。
+      # 在同一目录先写临时文件，再原子替换路径，并保留备份直到全部恢复成功。
+      rm -f "${_u_bin}.rollback"
+      _cp_bin "$_u_backup" "${_u_bin}.rollback" ||
+        die "回滚文件写入失败，备份仍在 ${_u_backup}，请手动恢复"
+      mv -f "${_u_bin}.rollback" "$_u_bin" ||
+        die "回滚替换失败，备份仍在 ${_u_backup}，请手动恢复"
+      # 所有共享此内核的节点都要切回旧版本，不能只重启刚才失败的节点。
+      for _rd in /etc/xray-node/nodes/*/; do
+        [ -f "${_rd}core" ] || continue
+        [ "$(tr -d ' \r\n' 2>/dev/null < "${_rd}core")" = "$_ucore" ] || continue
+        _rid=$(basename "$_rd")
+        _svc_restart "$_rid"
+        sleep 1
+        _r_port=""; _r_proto="tcp"
+        if _r_pp=$(_node_port "$_rid"); then set -- $_r_pp; _r_port="$1"; _r_proto="$2"; fi
+        if [ -n "$_r_port" ] && wait_for_port "$_r_port" "$_r_proto" 15; then
+          info "节点 $_rid 已回滚到旧版本，恢复正常"
+        else
+          _u_rb_bad="$_u_rb_bad $_rid"
+          warn "节点 $_rid 回滚后端口仍未监听，请手动检查该节点的服务状态"
+        fi
+      done
+    else
+      _u_rb_bad="$_u_failed"
+      warn "没有旧内核备份，无法回滚，请手动检查节点${_u_failed}的服务状态"
+    fi
+    if [ -z "$_u_rb_bad" ]; then
+      rm -f "$_u_backup"
+      die "$_ucore 新版本在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
+    else
+      die "$_ucore 新版本跑不起来，且节点${_u_rb_bad}仍未恢复监听；备份路径：${_u_backup:-无}，请手动检查"
+    fi
+  fi
+  [ -z "$_u_backup" ] || rm -f "$_u_backup"
+  info "$_ucore 升级完成"
+)
+
 # ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
 # 重跑一键命令选"1"进到这里：不问问题、不改配置，只把各节点用的内核升到最新版。
 if [ "$UPDATE_MODE" = "1" ]; then
@@ -5631,129 +5912,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     _u_any_fail=0
     for _ucore in $_u_cores; do
       # 每个内核独立处理：一个失败不影响另一个（子 shell 里 die 只退出子 shell）
-      (
-      if [ "$_ucore" = "xray" ]; then
-        _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN"
-      elif [ "$_ucore" = "hysteria" ]; then
-        _u_repo="apernet/hysteria"; _u_bin="$HY_BIN"
-      else
-        _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
-      fi
-      # 首次安装时会复用机器上已有的内核；那可能属于其他服务，不能覆盖升级。
-      if ! grep -qx "$_ucore" /etc/xray-node/our_bins 2>/dev/null; then
-        warn "$_ucore 是机器上原有的内核，跳过升级，避免影响其他服务"
-        exit 0
-      fi
-      _u_inst=""
-      if [ -x "$_u_bin" ]; then
-        if [ "$_ucore" = "hysteria" ]; then
-          _u_inst=$(_hysteria_local_ver "$_u_bin")
-        else
-          _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
-        fi
-      fi
-      _gh_prepare
-      if [ "$_ucore" = "hysteria" ]; then
-        _u_latest=$(_latest_hysteria_ver) || _u_latest=""
-      else
-        _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
-      fi
-      _dns64_off
-      if [ -z "$_u_latest" ]; then
-        warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
-        exit 0
-      fi
-      if [ -n "$_u_inst" ] && [ "$_u_inst" = "$_u_latest" ]; then
-        info "$_ucore 已经是最新版（v${_u_inst}），无需更新。"
-        exit 0
-      fi
-      # 读不出版本号，但有节点正用这个内核跑着：内核没坏，多半是内存太紧，跑 version 的小进程被系统杀了。
-      # 这时重新下载、解压更容易把机器撑爆，这次先不更新它。
-      # 用 pidof：busybox 的 pgrep -x 匹配不到进程名
-      if [ -z "$_u_inst" ] && [ -x "$_u_bin" ] && pidof "$(basename "$_u_bin")" >/dev/null 2>&1; then
-        warn "$_ucore 读不出版本号（内存太紧），但节点正在正常运行，这次先不更新它。"
-        exit 0
-      fi
-      if [ -n "$_u_inst" ]; then
-        info "$_ucore 当前版本 v${_u_inst}，最新版本 v${_u_latest}，开始升级…"
-      else
-        warn "$_ucore 内核读不出版本号（文件可能坏了，或者内存太紧跑不起来），直接下载最新版 v${_u_latest}（节点配置保留）。"
-      fi
-      # 每次升级用独立备份路径；上次失败留下的备份不会被覆盖。
-      _u_backup=""
-      if [ -x "$_u_bin" ]; then
-        _u_backup=$(mktemp "${_u_bin}.bak.XXXXXX") ||
-          die "$_ucore 无法创建备份文件，升级已取消"
-        _cp_bin "$_u_bin" "$_u_backup" ||
-          { rm -f "$_u_backup"; die "$_ucore 旧内核备份失败，升级已取消"; }
-        info "旧内核备份：$_u_backup"
-      fi
-      FORCE_DL=1
-      if [ "$_ucore" = "xray" ]; then dl_xray
-      elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
-      else dl_singbox
-      fi
-      FORCE_DL=0
-      # 重启所有用这个内核的节点（子 shell 里改 FORCE_DL 不影响外面）
-      step "[更新] 重启 $_ucore 的节点服务…"
-      _u_failed=""
-      for _ud2 in /etc/xray-node/nodes/*/; do
-        [ -f "${_ud2}core" ] || continue
-        _uc2=$(tr -d ' \r\n' 2>/dev/null < "${_ud2}core")
-        [ "$_uc2" = "$_ucore" ] || continue
-        _u_id=$(basename "$_ud2")
-        _svc_restart "$_u_id"
-        # 读出该节点端口，硬检查真的在监听
-        _u_port=""; _u_proto="tcp"
-        if _u_pp=$(_node_port "$_u_id"); then set -- $_u_pp; _u_port="$1"; _u_proto="$2"; fi
-        if [ -n "$_u_port" ] && wait_for_port "$_u_port" "$_u_proto" 15; then
-          info "节点 $_u_id 升级成功：端口 $_u_port/$_u_proto 监听正常，配置未变"
-        else
-          warn "节点 $_u_id 更新后端口没监听（端口：${_u_port:-未知}）"
-          _u_failed="$_u_failed $_u_id"
-        fi
-      done
-      if [ -n "$_u_failed" ]; then
-        _u_rb_bad=""
-        if [ -n "$_u_backup" ] && [ -f "$_u_backup" ]; then
-          warn "新内核启动后有节点端口没监听，正在回滚到旧版本…"
-          # 不能 cp 到正在运行的可执行文件：其他节点可能正运行新版，会触发 ETXTBSY。
-          # 在同一目录先写临时文件，再原子替换路径，并保留备份直到全部恢复成功。
-          rm -f "${_u_bin}.rollback"
-          _cp_bin "$_u_backup" "${_u_bin}.rollback" ||
-            die "回滚文件写入失败，备份仍在 ${_u_backup}，请手动恢复"
-          mv -f "${_u_bin}.rollback" "$_u_bin" ||
-            die "回滚替换失败，备份仍在 ${_u_backup}，请手动恢复"
-          # 所有共享此内核的节点都要切回旧版本，不能只重启刚才失败的节点。
-          for _rd in /etc/xray-node/nodes/*/; do
-            [ -f "${_rd}core" ] || continue
-            [ "$(tr -d ' \r\n' 2>/dev/null < "${_rd}core")" = "$_ucore" ] || continue
-            _rid=$(basename "$_rd")
-            _svc_restart "$_rid"
-            sleep 1
-            _r_port=""; _r_proto="tcp"
-            if _r_pp=$(_node_port "$_rid"); then set -- $_r_pp; _r_port="$1"; _r_proto="$2"; fi
-            if [ -n "$_r_port" ] && wait_for_port "$_r_port" "$_r_proto" 15; then
-              info "节点 $_rid 已回滚到旧版本，恢复正常"
-            else
-              _u_rb_bad="$_u_rb_bad $_rid"
-              warn "节点 $_rid 回滚后端口仍未监听，请手动检查该节点的服务状态"
-            fi
-          done
-        else
-          _u_rb_bad="$_u_failed"
-          warn "没有旧内核备份，无法回滚，请手动检查节点${_u_failed}的服务状态"
-        fi
-        if [ -z "$_u_rb_bad" ]; then
-          rm -f "$_u_backup"
-          die "$_ucore 新版本在这台机器上跑不起来，已回滚到旧版本，节点不受影响"
-        else
-          die "$_ucore 新版本跑不起来，且节点${_u_rb_bad}仍未恢复监听；备份路径：${_u_backup:-无}，请手动检查"
-        fi
-      fi
-      [ -z "$_u_backup" ] || rm -f "$_u_backup"
-      info "$_ucore 升级完成"
-      ) || _u_any_fail=1
+      _update_one_core "$_ucore" || _u_any_fail=1
     done
     # OpenRC：旧版写的节点服务只是普通后台启动，崩溃或被内存不足杀掉后不会自己起来。
     # 不管内核有没有更新，都换成 supervise-daemon 看着的写法；停着的节点顺便拉起来。
@@ -5788,6 +5947,27 @@ if [ "$UPDATE_MODE" = "1" ]; then
   fi
 fi
 # 更新模式上面已经退出；新节点目录在完成输入和下载后再建，避免失败时留下空编号。
+
+# 已经装过节点、这次是来加节点的：顺便把旧节点用的 Xray / sing-box 升到最新正式版（beta 不升）。
+# 升级失败不影响加节点：旧内核原样保留（跑不起来会自动回滚）。
+if [ "$_NODE_COUNT" -gt 0 ]; then
+  _a_cores=""
+  for _ad in /etc/xray-node/nodes/*/; do
+    [ -f "${_ad}core" ] || continue
+    _ac=$(tr -d ' \r\n' 2>/dev/null < "${_ad}core")
+    case "$_ac" in
+      xray|sing-box)
+        case " $_a_cores " in *" $_ac "*) ;; *) _a_cores="$_a_cores $_ac" ;; esac
+        ;;
+    esac
+  done
+  if [ -n "$_a_cores" ]; then
+    step "[更新] 顺便检查 Xray / sing-box 有没有新的正式版…"
+    for _ac in $_a_cores; do
+      _update_one_core "$_ac" || warn "$_ac 这次没更新成功，旧节点照常使用，继续添加新节点。"
+    done
+  fi
+fi
 
 # 第一次安装，或更新失败后改走添加：先选种类。已经在上面选过就不再问。
 if [ "${_KIND_CHOSEN:-0}" != "1" ]; then
@@ -5876,6 +6056,17 @@ while true; do
     *) warn "没有这个选项，请重新选择" ;;
   esac
 done
+case "$PROTO" in
+  vless)  PROTO_NAME="VLESS + REALITY + Vision"; _nm_proto="Vless" ;;
+  trojan) PROTO_NAME="Trojan + REALITY"; _nm_proto="Trojan" ;;
+  vmess)  PROTO_NAME="VMess + WebSocket"; _nm_proto="Vmess" ;;
+  ss)     PROTO_NAME="Shadowsocks"; _nm_proto="Shadowsocks" ;;
+  anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS" ;;
+  hy2)    PROTO_NAME="Hysteria2"; _nm_proto="Hysteria2" ;;
+  tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
+esac
+# 创建节点前先问名字
+_ask_node_name "$_nm_proto"
 # 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。
 # Hysteria2 用官方 hysteria：sing-box 1.14 解压后约 80MB，64MB 内存的 NAT 会在下载或启动时被撑死。
 case "$PROTO" in
@@ -5965,10 +6156,13 @@ HY2_DOMAIN=""
 HY2_ACME_TYPE=""
 HY2_CERT_HOST="www.samsung.com"
 HY2_PUBPIN=""
+HY2_BW_DOWN=""
+HY2_BW_UP=""
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
   _hy_ask_obfs
   _hy_ask_domain
+  _hy_ask_bw
 fi
 
 # ---------- 6. REALITY 伪装域名 ----------
@@ -6690,17 +6884,9 @@ fi
 step "[完成] 生成你的节点…"
 LINK_EXTRA=""
 LINK_HY_OFFICIAL=""
+LOON_LINE=""
 _hy_mport_x=""
-case "$PROTO" in
-  vless)  PROTO_NAME="VLESS + REALITY + Vision"; _nm_proto="Vless" ;;
-  trojan) PROTO_NAME="Trojan + REALITY"; _nm_proto="Trojan" ;;
-  vmess)  PROTO_NAME="VMess + WebSocket"; _nm_proto="Vmess" ;;
-  ss)     PROTO_NAME="Shadowsocks"; _nm_proto="Shadowsocks" ;;
-  anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS" ;;
-  hy2)    PROTO_NAME="Hysteria2"; _nm_proto="Hysteria2" ;;
-  tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
-esac
-NODE_NAME=$(_node_name "$_nm_proto")
+# 名字在选完协议后已经问过了（NODE_NAME）
 printf '%s\n' "$NODE_NAME" > "$NODE_DIR/name"
 NAME_ENC=$(_urlenc "$NODE_NAME")
 [ -n "$NAME_ENC" ] || NAME_ENC="xray-node"
@@ -6830,6 +7016,10 @@ fi
       else
         printf "混淆: 没开。别人探测时看到的是一个普通网站。\n"
       fi
+      if [ -n "$HY2_BW_DOWN" ] || [ -n "$HY2_BW_UP" ]; then
+        printf "带宽: 下行 %s，上行 %s。客户端里有「带宽 / 上传 / 下载速度」的，填同样的数字（单位 Mbps）。\n" \
+          "${HY2_BW_DOWN:-不限制}${HY2_BW_DOWN:+ Mbps}" "${HY2_BW_UP:-不限制}${HY2_BW_UP:+ Mbps}"
+      fi
       if [ -n "$HY_HOP_PORTS" ]; then
         printf "端口跳跃: 主端口 %s，跳跃端口 %s\n" "$LINK_PORT" "$(printf '%s' "$HY_HOP_PORTS" | sed 's/,/、/g')"
         printf "v2rayN、Clash Verge、小火箭等导入上面那行（跳跃端口在 mport 里）。导入后没看到跳跃端口，就在节点设置的「端口跳跃/端口范围」里手填：%s\n" "$HY_HOP_PORTS"
@@ -6861,22 +7051,26 @@ fi
       if [ "$HY2_USE_OBFS" = "1" ]; then
         _hy_loon_obfs=",salamander-password=${HY2_OBFS}"
       fi
+      # 带宽：Loon / Surge 只有下行（download-bandwidth），mihomo 上下行都有
+      _hy_loon_bw=""
+      [ -n "$HY2_BW_DOWN" ] && _hy_loon_bw=",download-bandwidth=${HY2_BW_DOWN}"
       _hy_loon_tail=""
       if [ -n "$HY_MPORT" ]; then
         _hy_loon_tail=",server-ports=\"${HY_MPORT}\",hop-interval=30"
       fi
       printf "Loon、Surge 请复制下面专门给的那一行导入，不要用上面的链接：用链接导入时证书指纹可能带不进去，「证书锁定」是空的就连不上。\n"
       printf "Loon 可粘贴这一行（已写好 block-quic=true，导入后自动打开阻止 QUIC）:\n"
-      printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
-        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail"
+      LOON_LINE=$(printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s%s" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail" "$_hy_loon_bw")
+      printf "%s\n" "$LOON_LINE"
       if [ -n "$LINK_EXTRA" ]; then
         if [ "$IPVER" = "6" ]; then _loon_port="$LINK_PORT"; else _loon_port="$PORT"; fi
         _hy_loon_tail2=""
         if [ -n "$_hy_mport_x" ]; then
           _hy_loon_tail2=",server-ports=\"${_hy_mport_x}\",hop-interval=30"
         fi
-        printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s\n" \
-          "${NODE_NAME}-v6" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2"
+        printf "%s = Hysteria2,%s,%s,\"%s\",sni=%s,%s,alpn=\"h3\",udp=true,block-quic=true%s%s%s\n" \
+          "${NODE_NAME}-v6" "$HY_EXTRA_IP" "$_loon_port" "$HY2_PASS" "$HY2_SNI" "$_hy_loon_cert" "$_hy_loon_obfs" "$_hy_loon_tail2" "$_hy_loon_bw"
       fi
       # Surge：自签证书用证书指纹锁定（server-cert-fingerprint-sha256），跳跃端口用分号隔开。
       _hy_surge_cert="server-cert-fingerprint-sha256=${HY2_PIN}"
@@ -6890,11 +7084,11 @@ fi
         _hy_surge_hop=", port-hopping=\"$(printf '%s' "$HY_MPORT" | tr ',' ';')\", port-hopping-interval=30"
       fi
       printf "Surge 可粘贴这一行（已写好 block-quic=on）:\n"
-      printf "%s = hysteria2, %s, %s, password=%s, sni=%s, %s%s%s, block-quic=on\n" \
-        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_surge_cert" "$_hy_surge_obfs" "$_hy_surge_hop"
+      printf "%s = hysteria2, %s, %s, password=%s, sni=%s, %s%s%s%s, block-quic=on\n" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_surge_cert" "$_hy_surge_obfs" "$_hy_surge_hop" "${HY2_BW_DOWN:+, download-bandwidth=${HY2_BW_DOWN}}"
       # mihomo（Clash Meta、Clash Verge、FlClash 用的内核）原生支持端口跳跃：ports + hop-interval。
       printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
-      printf "  - name: %s\n    type: hysteria2\n    server: %s\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
+      printf "  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
       if [ -n "$HY_MPORT" ]; then
         printf "    ports: %s\n    hop-interval: 30\n" "$HY_MPORT"
       fi
@@ -6905,6 +7099,8 @@ fi
       if [ "$HY2_USE_OBFS" = "1" ]; then
         printf "    obfs: salamander\n    obfs-password: %s\n" "$HY2_OBFS"
       fi
+      [ -n "$HY2_BW_UP" ] && printf "    up: \"%s Mbps\"\n" "$HY2_BW_UP"
+      [ -n "$HY2_BW_DOWN" ] && printf "    down: \"%s Mbps\"\n" "$HY2_BW_DOWN"
       ;;
     tuic)
       printf "SNI: www.samsung.com（自签证书）\n"
@@ -6926,6 +7122,7 @@ fi
   esac
   CQ_PIN=""
   [ "$PROTO" = "tuic" ] && CQ_PIN="${TUIC_PIN:-}"
+  [ "$PROTO" = "hy2" ] || LOON_LINE=$(_cq_loon_line)
   _cq_section
   printf -- "----------------------------------------------\n"
   if [ "$NODE_KIND" = "timed" ]; then
@@ -6979,11 +7176,18 @@ fi
 
 # ---------- 15. 显示结果 ----------
 # 把节点信息打印出来，复制那一行链接到客户端就能用。
-printf "\n节点 %s 安装完成！\n" "$NODE_ID"
-cat "$NODE_DIR/node.txt"
-printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
-if [ "$NODE_KIND" = "timed" ]; then
-  printf "这是定时节点，%s（%s后）会彻底失效：服务停掉，链接作废，配置删掉。其它节点不受影响。\n" "$EXPIRE_SHOW" "$EXPIRE_LABEL"
-  printf "到点后不用你操作。到期记录在 /var/log/xray-node-expire.log。\n"
+# 只显示两样：通用链接、Loon 行。完整参数在 node.txt 里，输入 jiedian all 能看到。
+printf "\n${GREEN}${BOLD}==================== 节点 %s 安装完成：%s ====================${NC}\n" "$NODE_ID" "$NODE_NAME"
+printf "\n${CYAN}${BOLD}【1】通用节点链接${NC}（v2rayN、小火箭、Clash Verge、NekoBox 等，复制整行导入）\n\n"
+printf "${YELLOW}%s${NC}\n" "$LINK"
+printf "\n${CYAN}${BOLD}【2】Loon 节点${NC}（Loon 里添加节点，复制整行粘贴）\n\n"
+if [ -n "$LOON_LINE" ]; then
+  printf "${YELLOW}%s${NC}\n" "$LOON_LINE"
+else
+  printf "Loon 不支持 %s，请用上面的通用链接。\n" "$PROTO_NAME"
 fi
-printf "以后看所有节点输入 jiedian，管理节点（查看/删除）输入 shanjiedian。\n"
+printf "\n${GREEN}${BOLD}==============================================================${NC}\n"
+if [ "$NODE_KIND" = "timed" ]; then
+  printf "定时节点：%s（%s后）自动删除。\n" "$EXPIRE_SHOW" "$EXPIRE_LABEL"
+fi
+printf "完整参数（端口、密码、Surge / Clash 配置等）输入 jiedian all 查看；管理节点输入 shanjiedian。\n"
