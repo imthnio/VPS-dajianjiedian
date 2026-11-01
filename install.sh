@@ -9,7 +9,7 @@
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
 # 装完之后，想看所有节点随时输入：  jiedian（只显示通用链接和 Loon 行；jiedian all 看完整参数）
-# 输入 shanjiedian 进入节点管理：查看节点、删除单个节点，或全部卸载
+# 输入 shanjiedian 进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
 # 已经装过节点的机器再跑一次：选“更新内核”或“添加节点”时，Xray / sing-box 有新的正式版会自动升级（beta 不装）
 #
 # 节点分两种，装的时候先选：
@@ -2777,9 +2777,14 @@ _delete_node() {
   _x_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
   [ -x "$_x_watch" ] && "$_x_watch" acme-forget "$_d_id" >/dev/null 2>&1
   [ -x "$_x_watch" ] && "$_x_watch" acme-drop "$_d_id" >/dev/null 2>&1
+  # 被这个节点挤掉的设备也放开
+  _x_lim="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-limit"
+  rm -f "$NODES_DIR/$_d_id/limit"
+  [ -x "$_x_lim" ] && "$_x_lim" clear "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
   # 没有节点再需要巡检了，就把巡检一起卸掉
   [ -x "$_x_watch" ] && "$_x_watch" arm >/dev/null 2>&1
+  [ -x "$_x_lim" ] && "$_x_lim" arm >/dev/null 2>&1
   echo "节点 ${_d_id} 已到时间，已经彻底删除。"
   _log "节点 ${_d_id} 已到时间，已彻底删除（服务已停、链接作废、配置和防火墙规则已清除）"
 }
@@ -3032,6 +3037,525 @@ EOF
   return 0
 }
 
+# ---------- 设备数量限制 ----------
+# 节点目录里有 limit 文件（写着一个数字 N）就限制：同一时间最多 N 台设备在用这个节点。
+# 第 N+1 台连上时，最早连上的那台被挤掉，一段时间内连不上，以此循环。
+# 内核（Xray / sing-box / hysteria）自己都不会数设备，所以由后台小程序 xray-node-limit 来看：
+# 每隔几秒看一次谁连着节点端口，超了就用防火墙把最早那台的 IP 挡在这个节点外面。
+install_limit_bin() { # 写出 /usr/local/bin/xray-node-limit。重复运行只覆盖脚本。
+  _lb_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  mkdir -p "$_lb_dir" 2>/dev/null || return 1
+  # 先写到临时文件再换上去：后台正在跑的小程序不会读到写了一半的脚本
+  cat > "$_lb_dir/xray-node-limit.tmp" <<'LIMITEOF' || return 1
+#!/bin/sh
+# xray-node 设备数量限制小程序。用法：
+#   xray-node-limit loop            在后台一直跑：每隔几秒看一次每个节点连着哪些设备
+#   xray-node-limit tick            只看一次
+#   xray-node-limit arm             有节点设了设备数就挂上后台服务，没有就卸掉
+#   xray-node-limit disarm          卸掉后台服务，放开所有被挤掉的设备
+#   xray-node-limit clear <编号>    放开这个节点被挤掉的设备，忘掉它的在线记录
+#   xray-node-limit status <编号>   打印这个节点现在在线的设备和被挤掉的设备
+#   xray-node-limit udp-ok          这台机器能看到 UDP 连接（Hysteria2 / TUIC 要用）就返回 0
+# 一台设备按客户端的公网 IP 算。IPv6 按前 64 位算：同一台手机的 IPv6 地址会经常换。
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
+BIN_DIR=${XRAY_BIN_DIR:-/usr/local/bin}
+STATE_DIR=${XRAY_LIMIT_STATE:-/run/xray-node-limit}
+SD_DIR=${XRAY_SYSTEMD_DIR:-/etc/systemd/system}
+SD_RUN=${XRAY_SYSTEMD_RUN:-/run/systemd/system}
+INITD=${XRAY_INITD:-/etc/init.d}
+CRON_DIR=${XRAY_CRON_DIR:-/etc/cron.d}
+PIDF=${XRAY_LIMIT_PID:-/run/xray-node-limit.pid}
+LOG=${XRAY_LIMIT_LOG:-/var/log/xray-node-limit.log}
+PROC_NET=${XRAY_LIMIT_PROC:-/proc/net}
+SELF="$BIN_DIR/xray-node-limit"
+# 每隔几秒看一次
+INTERVAL=${XRAY_LIMIT_INTERVAL:-5}
+# 连续连着这么多秒才算一台设备：探测服务器的扫描、一闪而过的连接不算，免得把真用户挤掉
+CONFIRM=${XRAY_LIMIT_CONFIRM:-5}
+# 设备没有任何连接超过这么多秒，就不再算在线，名额让出来
+IDLE=${XRAY_LIMIT_IDLE:-180}
+# 被挤掉的设备多少秒内连不上这个节点。到时间放开，它再连上就会挤掉当时最早的那台
+BAN=${XRAY_LIMIT_BAN:-600}
+TABLE=xray_node_limit
+CHAIN=XRAY_NODE_LIMIT
+
+_log() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  # 日志超过 64KB 只留最后 200 行，不会越写越大
+  if [ -f "$LOG" ] && [ "$(wc -c 2>/dev/null < "$LOG" || echo 0)" -gt 65536 ]; then
+    tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$1" >> "$LOG" 2>/dev/null
+}
+
+_has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d "$SD_RUN" ]; }
+
+_limit_of() { # _limit_of <节点编号>：打印设备数上限，没设（或写坏了）什么都不打印
+  _lo=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/limit")
+  case "$_lo" in ''|*[!0-9]*) return 1 ;; esac
+  _lo=$(printf '%s' "$_lo" | sed 's/^0*//')
+  [ -n "$_lo" ] || return 1
+  printf '%s' "$_lo"
+}
+
+_ports() { # _ports <节点编号>：每行“端口 协议”，就是客户端连的那几个
+  _pc=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/core")
+  # Hysteria2 节点 fw_info 里的 TCP 端口是伪装网站，不是客户端连的
+  awk -v core="$_pc" '
+    $1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") {
+      if (core == "hysteria" && $2 == "tcp") next
+      k = $1 " " $2
+      if (!(k in s)) { s[k] = 1; print k }
+    }' "$NODES_DIR/$1/fw_info" 2>/dev/null
+}
+
+_udp_ok() {
+  [ -r "$PROC_NET/nf_conntrack" ] && return 0
+  command -v conntrack >/dev/null 2>&1 && conntrack -L -p udp >/dev/null 2>&1
+}
+
+_seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址，或 IPv6 的 前缀::/64）
+  {
+    for _sf in "$PROC_NET/tcp" "$PROC_NET/tcp6"; do
+      [ -r "$_sf" ] && sed 's/^/T /' "$_sf"
+    done
+    # UDP 没有“连接”，要看防火墙的连接跟踪表（端口跳跃转发过来的也在里面）
+    if grep -q ' udp$' "$1"; then
+      if [ -r "$PROC_NET/nf_conntrack" ]; then
+        sed 's/^/U /' "$PROC_NET/nf_conntrack"
+      elif command -v conntrack >/dev/null 2>&1; then
+        conntrack -L -p udp 2>/dev/null | sed 's/^/U /'
+      fi
+    fi
+  } | awk -v ports="$(tr '\n' ' ' < "$1")" '
+    function hx(s,  i, n) {
+      n = 0; s = tolower(s)
+      for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+      return n
+    }
+    function out(k) { if (k != "" && !(k in seen)) { seen[k] = 1; print k } }
+    function v4(a) { if (a !~ /^127\./ && a != "0.0.0.0") out(a) }
+    function v6(g1, g2, g3, g4, low) {
+      if (g1 == 0 && g2 == 0 && g3 == 0 && g4 == 0) return   # ::1 之类
+      if (g1 >= 65152 && g1 <= 65215) return                  # fe80::/10 本地链路
+      out(sprintf("%x:%x:%x:%x::/64", g1, g2, g3, g4))
+    }
+    function text(a,  k, l, r, nl, nr, i, g) {
+      if (index(a, ":") == 0) { v4(a); return }
+      if (index(a, ".")) { sub(/.*:/, "", a); v4(a); return }   # ::ffff:1.2.3.4
+      k = index(a, "::")
+      if (k) { l = substr(a, 1, k - 1); r = substr(a, k + 2) } else { l = a; r = "" }
+      nl = (l == "") ? 0 : split(l, L, ":")
+      nr = (r == "") ? 0 : split(r, R, ":")
+      for (i = 1; i <= 8; i++) g[i] = 0
+      for (i = 1; i <= nl; i++) g[i] = hx(L[i])
+      for (i = 1; i <= nr; i++) g[8 - nr + i] = hx(R[i])
+      v6(g[1], g[2], g[3], g[4])
+    }
+    BEGIN {
+      n = split(ports, P, " ")
+      for (i = 1; i < n; i += 2) want[P[i + 1] " " P[i]] = 1
+    }
+    # /proc/net/tcp：本机地址:端口、对方地址:端口、状态（01 = 已连上），都是十六进制
+    $1 == "T" {
+      if ($5 != "01") next
+      split($3, la, ":")
+      if (!(("tcp " hx(la[2])) in want)) next
+      split($4, ra, ":"); h = ra[1]
+      if (length(h) == 8) {
+        v4(hx(substr(h, 7, 2)) "." hx(substr(h, 5, 2)) "." hx(substr(h, 3, 2)) "." hx(substr(h, 1, 2)))
+      } else if (length(h) == 32) {
+        # 每 4 个字节一组倒着存
+        for (w = 0; w < 4; w++) for (b = 0; b < 4; b++) by[w * 4 + b] = substr(h, w * 8 + 7 - 2 * b, 2)
+        z = ""; for (i = 0; i < 10; i++) z = z by[i]
+        if (z == "00000000000000000000" && tolower(by[10] by[11]) == "ffff") {
+          v4(hx(by[12]) "." hx(by[13]) "." hx(by[14]) "." hx(by[15]))
+        } else {
+          v6(hx(by[0] by[1]), hx(by[2] by[3]), hx(by[4] by[5]), hx(by[6] by[7]))
+        }
+      }
+      next
+    }
+    # 连接跟踪：第一个 src= 是客户端；第二个 sport= 是服务器回包用的端口，也就是节点主端口
+    $1 == "U" {
+      u = 0; for (i = 2; i <= 5; i++) if ($i == "udp") u = 1
+      if (!u) next
+      src = ""; sp = 0; rs = ""
+      for (i = 2; i <= NF; i++) {
+        if ($i == "[UNREPLIED]") next   # 节点没回过话的不算
+        if (src == "" && $i ~ /^src=/) src = substr($i, 5)
+        if ($i ~ /^sport=/) { sp++; if (sp == 2) rs = substr($i, 7) }
+      }
+      if (rs != "" && (("udp " rs) in want)) text(src)
+    }'
+}
+
+_kill_tcp() { # _kill_tcp <设备> <端口文件>：已经连着的 TCP 连接马上断掉（内核不支持就算了，防火墙挡住后它自己会断）
+  command -v ss >/dev/null 2>&1 || return 0
+  while read -r _kp _kpr; do
+    [ "$_kpr" = "tcp" ] || continue
+    ss -K dst "$1" sport = ":$_kp" >/dev/null 2>&1 || true
+  done < "$2"
+}
+
+# ---- 防火墙：把被挤掉的设备挡在它那个节点的端口外面，别的节点照常用 ----
+_rules() { # 每行：地址族 设备 协议 端口
+  for _rb in "$STATE_DIR"/*.ban; do
+    [ -s "$_rb" ] || continue
+    _rid=$(basename "$_rb" .ban)
+    [ -s "$STATE_DIR/$_rid.ports" ] || continue
+    while read -r _rk _ru; do
+      case "$_rk" in *:*) _rf=6 ;; *) _rf=4 ;; esac
+      while read -r _rp _rpr; do
+        printf '%s %s %s %s\n' "$_rf" "$_rk" "$_rpr" "$_rp"
+      done < "$STATE_DIR/$_rid.ports"
+    done < "$_rb"
+  done
+}
+
+_nft_clear() {
+  command -v nft >/dev/null 2>&1 || return 0
+  nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+}
+
+_nft_apply() { # 先删同名旧表再整张写入，重复运行不会叠规则
+  command -v nft >/dev/null 2>&1 || return 1
+  {
+    printf 'table inet %s {}\ndelete table inet %s\n' "$TABLE" "$TABLE"
+    printf 'table inet %s {\n  chain input {\n    type filter hook input priority -5; policy accept;\n' "$TABLE"
+    while read -r _nf _nk _npr _np; do
+      if [ "$_nf" = "6" ]; then _nfam=ip6; else _nfam=ip; fi
+      printf '    %s saddr %s %s dport %s drop\n' "$_nfam" "$_nk" "$_npr" "$_np"
+    done < "$1"
+    printf '  }\n}\n'
+  } | nft -f - >/dev/null 2>&1
+}
+
+_ipt_clear() { # _ipt_clear <iptables|ip6tables>
+  command -v "$1" >/dev/null 2>&1 || return 0
+  while "$1" -w -D INPUT -j "$CHAIN" >/dev/null 2>&1; do :; done
+  "$1" -w -F "$CHAIN" >/dev/null 2>&1 || true
+  "$1" -w -X "$CHAIN" >/dev/null 2>&1 || true
+}
+
+_ipt_apply() { # _ipt_apply <iptables|ip6tables> <4|6> <规则文件>
+  if ! grep -q "^$2 " "$3"; then _ipt_clear "$1"; return 0; fi
+  command -v "$1" >/dev/null 2>&1 || { _log "没有 $1，IPv$2 的设备挤不掉"; return 1; }
+  "$1" -w -N "$CHAIN" >/dev/null 2>&1 || true
+  "$1" -w -F "$CHAIN" >/dev/null 2>&1 || return 1
+  while read -r _if _ik _ipr _ip; do
+    [ "$_if" = "$2" ] || continue
+    "$1" -w -A "$CHAIN" -s "$_ik" -p "$_ipr" --dport "$_ip" -j DROP >/dev/null 2>&1 || return 1
+  done < "$3"
+  # 放在 INPUT 最前面：排在“已建立的连接一律放行”前面，已经连着的也挡住
+  "$1" -w -C INPUT -j "$CHAIN" >/dev/null 2>&1 || "$1" -w -I INPUT 1 -j "$CHAIN" >/dev/null 2>&1
+}
+
+_fw_clear() {
+  _nft_clear
+  _ipt_clear iptables
+  _ipt_clear ip6tables
+  rm -f "$STATE_DIR/backend"
+}
+
+_fw_apply() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  _rules > "$STATE_DIR/rules"
+  if [ ! -s "$STATE_DIR/rules" ]; then
+    _fw_clear
+    return 0
+  fi
+  # 优先用 nftables 单独建一张表：不和 ufw、firewalld、本脚本放行端口的规则搅在一起
+  if _nft_apply "$STATE_DIR/rules"; then
+    _ipt_clear iptables
+    _ipt_clear ip6tables
+    echo nft > "$STATE_DIR/backend"
+    return 0
+  fi
+  _nft_clear
+  _fa_ok=0
+  _ipt_apply iptables 4 "$STATE_DIR/rules" || _fa_ok=1
+  _ipt_apply ip6tables 6 "$STATE_DIR/rules" || _fa_ok=1
+  echo ipt > "$STATE_DIR/backend"
+  [ "$_fa_ok" = "0" ] || _log "防火墙规则没加全，被挤掉的设备可能还能连"
+  return "$_fa_ok"
+}
+
+_fw_ok() { # 防火墙重启、重载后我们的规则可能没了
+  [ -s "$STATE_DIR/rules" ] || return 0
+  case "$(cat "$STATE_DIR/backend" 2>/dev/null)" in
+    nft) nft list table inet "$TABLE" >/dev/null 2>&1 ;;
+    ipt)
+      if grep -q '^4 ' "$STATE_DIR/rules" && command -v iptables >/dev/null 2>&1; then
+        iptables -w -C INPUT -j "$CHAIN" >/dev/null 2>&1 || return 1
+      fi
+      if grep -q '^6 ' "$STATE_DIR/rules" && command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -w -C INPUT -j "$CHAIN" >/dev/null 2>&1 || return 1
+      fi
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---- 看一次 ----
+_lock() { # 后台循环和菜单里的 clear 可能同时改状态，排队来
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 8>"$STATE_DIR/.lock" || return 0
+  flock 8 2>/dev/null || true
+}
+
+_tick_node() { # _tick_node <节点编号> <上限> <现在>
+  _tid=$1; _tlim=$2; _tnow=$3
+  _st="$STATE_DIR/$_tid"
+  _ports "$_tid" > "$_st.ports"
+  touch "$_st.on" "$_st.ban"
+  # 到时间的放开
+  awk -v now="$_tnow" '$2 > now' "$_st.ban" > "$_st.ban.tmp"
+  cmp -s "$_st.ban" "$_st.ban.tmp" || _changed=1
+  mv -f "$_st.ban.tmp" "$_st.ban"
+  [ -s "$_st.ports" ] || { : > "$_st.on"; return 0; }
+  # 被挤掉的设备，旧连接在连接跟踪表里还会留一会儿，不能再算进来
+  _seen "$_st.ports" | awk 'FILENAME == ARGV[1] { b[$1] = 1; next } !($1 in b)' "$_st.ban" - > "$_st.seen"
+  # 状态文件每行：设备 第一次看到 最后看到 1=已算一台
+  awk -v now="$_tnow" -v lim="$_tlim" -v idle="$IDLE" -v confirm="$CONFIRM" '
+    FILENAME == ARGV[1] { if ($1 != "") seen[$1] = 1; next }
+    { first[$1] = $2; last[$1] = $3; ok[$1] = $4; had[$1] = 1 }
+    END {
+      for (k in had) {
+        if (k in seen) {
+          last[k] = now
+          if (!ok[k] && now - first[k] >= confirm) ok[k] = 1
+          keep[k] = 1
+        } else if (ok[k] && now - last[k] < idle) {
+          keep[k] = 1
+        }
+        # 还没算数、这次又没看到的（一闪而过的连接）直接忘掉
+      }
+      for (k in seen) if (!(k in had)) {
+        first[k] = now; last[k] = now; ok[k] = (confirm <= 0) ? 1 : 0; keep[k] = 1
+      }
+      c = 0
+      for (k in keep) if (ok[k]) c++
+      # 超了：最早连上的先挤掉
+      while (c > lim) {
+        best = ""
+        for (k in keep) if (ok[k] && !(k in kick) && (best == "" || first[k] < first[best])) best = k
+        if (best == "") break
+        kick[best] = 1; c--
+        print "KICK " best
+      }
+      for (k in keep) if (!(k in kick)) print "ON " k " " first[k] " " last[k] " " ok[k]
+    }' "$_st.seen" "$_st.on" > "$_st.out"
+  sed -n 's/^ON //p' "$_st.out" > "$_st.on"
+  for _tk in $(sed -n 's/^KICK //p' "$_st.out"); do
+    printf '%s %s\n' "$_tk" "$((_tnow + BAN))" >> "$_st.ban"
+    _changed=1
+    printf '%s %s\n' "$_tid" "$_tk" >> "$STATE_DIR/kicks"
+    _log "节点 ${_tid}：超过 ${_tlim} 台设备，最早连上的 ${_tk} 被挤掉，$((BAN / 60)) 分钟内连不上"
+  done
+  rm -f "$_st.seen" "$_st.out"
+}
+
+_tick() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  _lock
+  _now=$(date +%s)
+  _changed=0
+  : > "$STATE_DIR/kicks"
+  _active=" "
+  for _nd in "$NODES_DIR"/*/; do
+    [ -d "$_nd" ] || continue
+    _id=$(basename "$_nd")
+    case "$_id" in ''|*[!0-9]*) continue ;; esac
+    _lim=$(_limit_of "$_id") || continue
+    _active="$_active$_id "
+    _tick_node "$_id" "$_lim" "$_now"
+  done
+  # 节点删了或者不限了：它的记录和挡人的规则都不要了
+  for _sf in "$STATE_DIR"/*.on "$STATE_DIR"/*.ban "$STATE_DIR"/*.ports; do
+    [ -e "$_sf" ] || continue
+    _sid=$(basename "$_sf"); _sid=${_sid%.*}
+    case "$_active" in *" $_sid "*) continue ;; esac
+    case "$_sf" in *.ban) [ -s "$_sf" ] && _changed=1 ;; esac
+    rm -f "$_sf"
+  done
+  # 规则先加后断：挡住以后再断旧连接，客户端重连也连不上
+  if [ "$_changed" = "1" ] || ! _fw_ok; then
+    _fw_apply
+  fi
+  while read -r _kid _kk; do
+    _kill_tcp "$_kk" "$STATE_DIR/$_kid.ports"
+  done < "$STATE_DIR/kicks"
+  rm -f "$STATE_DIR/kicks"
+}
+
+_clear() { # _clear <节点编号>
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  _lock
+  rm -f "$STATE_DIR/$1.on" "$STATE_DIR/$1.ban" "$STATE_DIR/$1.ports"
+  _fw_apply
+}
+
+_when() { date -d "@$1" '+%H:%M' 2>/dev/null || date -r "$1" '+%H:%M' 2>/dev/null || printf '%s' "$1"; }
+
+_status() {
+  _sl=$(_limit_of "$1") || { echo "节点 $1 没有限制设备数量。"; return 0; }
+  _sn=$(date +%s)
+  echo "节点 $1 最多同时 ${_sl} 台设备。"
+  _sc=0
+  if [ -s "$STATE_DIR/$1.on" ]; then
+    while read -r _sk _sfirst _slast _sok; do
+      [ "$_sok" = "1" ] || continue
+      _sc=$((_sc + 1))
+      printf '  在线：%s（%s 连上）\n' "$_sk" "$(_when "$_sfirst")"
+    done < "$STATE_DIR/$1.on"
+  fi
+  [ "$_sc" = "0" ] && echo "  现在没有设备在用。"
+  if [ -s "$STATE_DIR/$1.ban" ]; then
+    while read -r _sk _suntil; do
+      [ "$_suntil" -gt "$_sn" ] 2>/dev/null || continue
+      printf '  被挤掉：%s（%s 后能再连）\n' "$_sk" "$(_when "$_suntil")"
+    done < "$STATE_DIR/$1.ban"
+  fi
+}
+
+# ---- 挂上 / 卸掉后台服务 ----
+_needed() {
+  for _nd in "$NODES_DIR"/*/; do
+    [ -d "$_nd" ] || continue
+    _limit_of "$(basename "$_nd")" >/dev/null && return 0
+  done
+  return 1
+}
+
+_loop_alive() {
+  [ -f "$PIDF" ] || return 1
+  _op=$(tr -d ' \r\n' 2>/dev/null < "$PIDF")
+  case "$_op" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_op" 2>/dev/null
+}
+
+_ensure() { # 没有服务管理器时：后台循环没在跑就拉起来
+  _loop_alive && return 0
+  nohup "$SELF" loop >/dev/null 2>&1 &
+  echo $! > "$PIDF" 2>/dev/null || true
+}
+
+_disarm() {
+  if _has_systemd && [ -f "$SD_DIR/xray-node-limit.service" ]; then
+    systemctl disable --now xray-node-limit.service >/dev/null 2>&1 || true
+    rm -f "$SD_DIR/xray-node-limit.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  if [ -f "$INITD/xray-node-limit" ]; then
+    rc-service xray-node-limit stop >/dev/null 2>&1 || true
+    rc-update del xray-node-limit default >/dev/null 2>&1 || true
+    rm -f "$INITD/xray-node-limit"
+  fi
+  rm -f "$CRON_DIR/xray-node-limit"
+  if _loop_alive; then kill "$(tr -d ' \r\n' < "$PIDF")" >/dev/null 2>&1 || true; fi
+  rm -f "$PIDF"
+  _fw_clear
+  rm -rf "$STATE_DIR"
+}
+
+_arm() {
+  if ! _needed; then
+    _disarm
+    return 0
+  fi
+  if _has_systemd && [ -d "$SD_DIR" ] && [ -w "$SD_DIR" ]; then
+    cat > "$SD_DIR/xray-node-limit.service" <<EOF
+[Unit]
+Description=xray-node device limit: kick the oldest device when a node has too many
+After=network.target
+[Service]
+ExecStart=$SELF loop
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now xray-node-limit.service >/dev/null 2>&1 && return 0
+  fi
+  if command -v rc-update >/dev/null 2>&1 && [ -d "$INITD" ] && [ -w "$INITD" ]; then
+    if command -v supervise-daemon >/dev/null 2>&1; then
+      _ao_bg='supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0'
+    else
+      _ao_bg='command_background="yes"'
+    fi
+    cat > "$INITD/xray-node-limit" <<EOF
+#!/sbin/openrc-run
+name="xray-node-limit"
+description="xray-node device limit: kick the oldest device when a node has too many"
+command="$SELF"
+command_args="loop"
+$_ao_bg
+pidfile="/run/xray-node-limit-openrc.pid"
+depend() { after net firewall; }
+EOF
+    chmod 755 "$INITD/xray-node-limit"
+    rc-update add xray-node-limit default >/dev/null 2>&1 || true
+    rc-service xray-node-limit status >/dev/null 2>&1 || rc-service xray-node-limit start >/dev/null 2>&1 || true
+    return 0
+  fi
+  if [ -d "$CRON_DIR" ] && [ -w "$CRON_DIR" ]; then
+    # cron 每分钟看一眼：后台循环没在跑（比如重启过）就拉起来
+    cat > "$CRON_DIR/xray-node-limit" <<EOF
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root $SELF ensure
+EOF
+    _ensure
+    return 0
+  fi
+  _ensure
+  return 2
+}
+
+_id_ok() { case "$1" in ''|*[!0-9]*) echo "节点编号不对：$1" >&2; exit 2 ;; esac; }
+
+case "$1" in
+  tick) _tick ;;
+  loop)
+    # 刚启动（比如服务器重启过）：以前挡人的规则可能被防火墙存盘又恢复了，先全部放开
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    _fw_clear
+    rm -f "$STATE_DIR"/*.on "$STATE_DIR"/*.ban "$STATE_DIR"/*.ports "$STATE_DIR/rules"
+    while :; do
+      ( _tick )
+      sleep "$INTERVAL"
+    done
+    ;;
+  ensure) _needed && _ensure ;;
+  arm) _arm; exit $? ;;
+  disarm) _disarm ;;
+  clear) _id_ok "$2"; _clear "$2" ;;
+  status) _id_ok "$2"; _status "$2" ;;
+  udp-ok) _udp_ok; exit $? ;;
+  *) echo "用法：xray-node-limit loop|tick|arm|disarm|udp-ok|clear <编号>|status <编号>" >&2; exit 2 ;;
+esac
+exit 0
+LIMITEOF
+  chmod 700 "$_lb_dir/xray-node-limit.tmp" || return 1
+  mv -f "$_lb_dir/xray-node-limit.tmp" "$_lb_dir/xray-node-limit" || return 1
+}
+
+# 有节点设了设备数就挂上后台服务，没有就卸掉
+arm_device_limit() {
+  install_limit_bin || { warn "设备数限制小程序没写进去：设了设备数的节点暂时不限制"; return 0; }
+  "${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-limit" arm
+  if [ $? -eq 2 ]; then
+    warn "这台机器没有 systemd、OpenRC 或 cron，设备数限制先在后台跑着。服务器重启后，请再运行一次安装脚本。"
+  fi
+  return 0
+}
+
 # ---------- 写入 jiedian / shanjiedian 两个快捷命令 ----------
 # jiedian：显示所有节点的分享链接；shanjiedian：删除某个节点或全部卸载。
 # 它们是普通的 shell 脚本，放在 /usr/local/bin，以后直接输入名字就能用。
@@ -3093,7 +3617,7 @@ JDEOF
 chmod 700 /usr/local/bin/jiedian
 cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
-# 输入 shanjiedian，进入节点管理：查看节点、删除单个节点，或全部卸载
+# 输入 shanjiedian，进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
@@ -3111,6 +3635,11 @@ _node_info() {
       _ni_when=$(date -d "@$_ni_exp" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$_ni_exp" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$_ni_exp")
       _ni_kind="定时节点，${_ni_when} 失效"
       ;;
+  esac
+  _ni_lim=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/limit" | sed 's/^0*//')
+  case "$_ni_lim" in
+    ''|*[!0-9]*) ;;
+    *) _ni_kind="${_ni_kind}，最多 ${_ni_lim} 台设备" ;;
   esac
   _ni_name=$(grep -m1 '^节点名: ' "$NODES_DIR/$1/node.txt" 2>/dev/null | sed 's/^节点名: //' | tr -d '\r')
   [ -n "$_ni_name" ] || _ni_name=$(head -n 1 "$NODES_DIR/$1/name" 2>/dev/null | tr -d '\r')
@@ -3219,9 +3748,13 @@ _del_node() {
   # 证书用的端口如果还开着，也关上
   [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch acme-forget "$_d_id" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch acme-drop "$_d_id" >/dev/null 2>&1
+  # 被这个节点挤掉的设备也放开
+  rm -f "$NODES_DIR/$_d_id/limit"
+  [ -x /usr/local/bin/xray-node-limit ] && /usr/local/bin/xray-node-limit clear "$_d_id" >/dev/null 2>&1
   rm -rf "$NODES_DIR/$_d_id"
   # 没有节点再需要巡检了，就把巡检一起卸掉（全部卸载时最后统一处理）
   [ "$2" != "skip_confirm" ] && [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch arm >/dev/null 2>&1
+  [ "$2" != "skip_confirm" ] && [ -x /usr/local/bin/xray-node-limit ] && /usr/local/bin/xray-node-limit arm >/dev/null 2>&1
   echo "节点 $_d_id 已删除，其它节点不受影响。"
 }
 
@@ -3234,6 +3767,8 @@ _uninstall_all() {
   done
   # 巡检（每分钟检查端口跳跃规则、证书端口的小程序）也卸掉
   [ -x /usr/local/bin/xray-node-watch ] && /usr/local/bin/xray-node-watch disarm >/dev/null 2>&1
+  # 设备数限制的后台服务也卸掉，被挤掉的设备全部放开
+  [ -x /usr/local/bin/xray-node-limit ] && /usr/local/bin/xray-node-limit disarm >/dev/null 2>&1
   # _svc_install 建的 systemd 模板（xray-node@.service / singbox-node@.service）
   # 不是按节点实例建的，上面的循环删不掉，不清会残留在系统里
   if [ -d /run/systemd/system ]; then
@@ -3302,7 +3837,8 @@ _uninstall_all() {
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
   rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
   rm -f /usr/local/bin/xray-node-route /usr/local/bin/xray-node-route.tmp
-  rm -rf /run/xray-node-hop /run/xray-node-watch /run/xray-node-route
+  rm -f /usr/local/bin/xray-node-limit /usr/local/bin/xray-node-limit.tmp
+  rm -rf /run/xray-node-hop /run/xray-node-watch /run/xray-node-route /run/xray-node-limit
   echo "卸载完成：所有节点、配置、开机自启、防火墙规则都已清除干净。"
   # IPv6 开关是整台服务器的设置，不跟着节点删。关过的话提醒一下怎么打开。
   if [ -f /etc/sysctl.d/99-xray-node-ipv6.conf ]; then
@@ -3313,6 +3849,72 @@ _uninstall_all() {
 # 去掉空格和回车符。复制进去时经常带上这些。
 _clean_choice() {
   printf '%s' "$1" | tr -d '[:space:]'
+}
+
+# _limit_menu：设置某个节点同一时间最多能连几台设备（手机、电脑、电视加起来）
+_limit_menu() {
+  _lm_bin=/usr/local/bin/xray-node-limit
+  echo "==================== 限制设备数量 ===================="
+  echo "设成 N：手机、电脑、电视等加起来，同一时间最多 N 台在用这个节点。"
+  echo "第 N+1 台连上时，最早连上的那台会被挤掉（10 分钟内连不上这个节点），以此循环。"
+  echo "设备按上网的 IP 算：同一个 Wi-Fi 下的几台设备 IP 一样，只算 1 台；"
+  echo "手机从 Wi-Fi 换到流量，IP 变了，会算成新的一台。设备几分钟没用，名额自动让出来。"
+  for _lm_id in $_n_sorted; do
+    printf "  %s) 节点 %s（%s）\n" "$_lm_id" "$_lm_id" "$(_node_info "$_lm_id")"
+  done
+  printf "  0) 返回，什么都不改\n"
+  printf "请输入要设置的节点编号: "
+  read -r _lm_sel || { echo "已取消"; return 0; }
+  _lm_sel=$(_clean_choice "$_lm_sel" | sed 's/^0*//')
+  case "$_lm_sel" in
+    "") echo "已取消"; return 0 ;;
+    *[!0-9]*) echo "输入不对，已取消"; return 0 ;;
+  esac
+  case " $_n_ids " in
+    *" $_lm_sel "*) ;;
+    *) echo "没有这个编号，已取消"; return 0 ;;
+  esac
+  _lm_cur=$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$_lm_sel/limit" | sed 's/^0*//')
+  case "$_lm_cur" in ''|*[!0-9]*) _lm_cur="" ;; esac
+  if [ -n "$_lm_cur" ] && [ -x "$_lm_bin" ]; then
+    "$_lm_bin" status "$_lm_sel"
+  fi
+  printf "节点 %s 同一时间最多能连几台设备？输入数字，0 = 不限制 [现在：%s]: " "$_lm_sel" "${_lm_cur:-不限制}"
+  read -r _lm_n || { echo "已取消"; return 0; }
+  _lm_n=$(_clean_choice "$_lm_n")
+  case "$_lm_n" in
+    "") echo "没有改动"; return 0 ;;
+    *[!0-9]*) echo "要输入数字，已取消"; return 0 ;;
+  esac
+  _lm_n=$(printf '%s' "$_lm_n" | sed 's/^0*//')
+  if [ -z "$_lm_n" ]; then
+    rm -f "$NODES_DIR/$_lm_sel/limit"
+    [ -x "$_lm_bin" ] && "$_lm_bin" clear "$_lm_sel" >/dev/null 2>&1
+    [ -x "$_lm_bin" ] && "$_lm_bin" arm >/dev/null 2>&1
+    echo "节点 $_lm_sel 已改成不限制设备数量，被挤掉的设备也都放开了。"
+    return 0
+  fi
+  if [ "${#_lm_n}" -gt 4 ]; then
+    echo "数字太大了，已取消"
+    return 0
+  fi
+  if [ ! -x "$_lm_bin" ]; then
+    echo "设备数限制程序还没装上。请重新运行一键安装脚本，选「更新内核」后再来设置。"
+    return 0
+  fi
+  printf '%s\n' "$_lm_n" > "$NODES_DIR/$_lm_sel/limit"
+  chmod 600 "$NODES_DIR/$_lm_sel/limit" 2>/dev/null
+  "$_lm_bin" arm >/dev/null 2>&1
+  _lm_rc=$?
+  echo "节点 $_lm_sel 已设成：同一时间最多 $_lm_n 台设备。几秒内生效。"
+  if [ "$_lm_rc" = "2" ]; then
+    echo "注意：这台机器没有 systemd、OpenRC 或 cron，限制先在后台跑着。服务器重启后，请再进一次 shanjiedian 或运行安装脚本。"
+  fi
+  # Hysteria2、TUIC、Shadowsocks 的 UDP 要看连接跟踪表，有的容器（LXC/OpenVZ）里看不到
+  if awk '$2 == "udp" { f = 1 } END { exit !f }' "$NODES_DIR/$_lm_sel/fw_info" 2>/dev/null &&
+     ! "$_lm_bin" udp-ok; then
+    echo "注意：这台机器看不到 UDP 连接（多半是容器 VPS）。这个节点走 UDP 的设备数不出来，限制可能不起作用。"
+  fi
 }
 
 _n_count=0
@@ -3334,12 +3936,14 @@ if [ "$_n_count" = "0" ]; then
 fi
 # 有节点 1、2、3 时，4 就是删除全部。有节点 1、2、5 时，6 才是删除全部。
 _n_all=$((_n_max + 1))
+_n_lim=$((_n_max + 2))
 echo "==================== 节点管理 ===================="
 _n_sorted=$(printf '%s\n' $_n_ids | sort -n)
 for _n_id in $_n_sorted; do
   printf "  %s) 删除节点 %s（%s）\n" "$_n_id" "$_n_id" "$(_node_info "$_n_id")"
 done
 printf "  %s) 删除全部节点并卸载干净\n" "$_n_all"
+printf "  %s) 限制节点能连几台设备（手机、电脑、电视加起来，超了挤掉最早连上的）\n" "$_n_lim"
 printf "  0) 取消，什么都不删\n"
 printf "请选择: "
 read -r _sel || { echo "已取消"; exit 0; }
@@ -3352,6 +3956,8 @@ case "$_sel" in
     _sel=$(printf '%s' "$_sel" | sed 's/^0*//')
     if [ -z "$_sel" ] || [ "$_sel" = "0" ]; then
       echo "已取消"
+    elif [ "$_sel" = "$_n_lim" ]; then
+      _limit_menu
     elif [ "$_sel" = "$_n_all" ]; then
       printf "这会删除全部 %s 个节点，并卸掉内核、命令和配置。删了就不能用了。\n" "$_n_count"
       printf "确定删除全部节点并卸载干净吗？[y/N]: "
@@ -3395,6 +4001,8 @@ install_expire_bins || true
 arm_expire_watch || true
 # 端口跳跃 / 证书端口的巡检：有节点要用就挂上，没有就卸掉
 arm_node_watch || true
+# 设备数限制：有节点设了就挂上，没有就卸掉
+arm_device_limit || true
 }
 
 # ---------- 服务（让节点在后台一直跑、开机自启） ----------
@@ -5528,6 +6136,7 @@ if [ -x /usr/local/bin/xray-node-expire ]; then
 fi
 arm_expire_watch || true
 arm_node_watch || true
+arm_device_limit || true
 _NODE_COUNT=0
 if [ -d /etc/xray-node/nodes ]; then
   for _nd in /etc/xray-node/nodes/*/; do
@@ -5539,7 +6148,7 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "\n检测到这台机器已经装了 %s 个节点。\n" "$_NODE_COUNT"
   printf "  1) 更新内核到最新正式版（推荐，beta 测试版不装。顺便把旧版端口跳跃改成新写法、去掉旧版在服务器上拦 QUIC 的设置；节点在有 IPv6 的机器上会改成同时听 IPv4 和 IPv6，其它配置不动）\n"
   printf "  2) 添加节点（下一步再选永久节点或定时节点，旧节点不受影响。Xray / sing-box 有新的正式版会顺便升级）\n"
-  printf "  3) 节点管理（查看所有节点、删除某个节点）\n"
+  printf "  3) 节点管理（查看所有节点、删除某个节点、限制节点能连几台设备）\n"
   printf "  4) 取消，什么都不做\n"
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
