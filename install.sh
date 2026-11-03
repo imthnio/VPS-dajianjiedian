@@ -252,16 +252,25 @@ get_ip() { # get_ip 4|6 -> 打印客户端要连接的地址，失败返回非�
   if ip -4 addr show dev l2tp-aa 2>/dev/null | grep -q 'inet '; then
     return 1
   fi
-  if [ "$_v" = "6" ]; then _f="-6"; else _f="-4"; fi
-  for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
+  if [ "$_v" = "6" ]; then
+    _f="-6"
+    _urls="https://ifconfig.me https://api6.ipify.org https://ipv6.icanhazip.com http://api6.ipify.org http://ipv6.icanhazip.com"
+  else
+    _f="-4"
+    _urls="https://ifconfig.me https://api.ipify.org https://ipv4.icanhazip.com http://api.ipify.org http://ipv4.icanhazip.com"
+  fi
+  # busybox wget 不认 -4/-6，带上就直接报错；有的精简系统 wget 也不支持 https。
+  # 所以 wget 带参数失败后再不带参数试一次，最后再试 http 的检测地址。
+  # 这几个检测地址大多只有一种 IP 版本，返回的结果下面还会按版本检查。
+  for _u in $_urls; do
+    _ip=""
     if command -v curl >/dev/null 2>&1; then
       _ip=$(curl -fsSL --max-time 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
     elif command -v wget >/dev/null 2>&1; then
       _ip=$(wget -qO- -T 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
+      [ -n "$_ip" ] || _ip=$(wget -qO- -T 10 "$_u" 2>/dev/null | tr -d ' \r\n')
     elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
-      _ip=$(busybox wget -qO- -T 10 $_f "$_u" 2>/dev/null | tr -d ' \r\n')
-    else
-      _ip=""
+      _ip=$(busybox wget -qO- -T 10 "$_u" 2>/dev/null | tr -d ' \r\n')
     fi
     # 检测网站偶尔返回非 IP 的垃圾（比如限流提示页）：长得不像 IP 就换下一个
     if [ -n "$_ip" ] && _valid_ip "$_v" "$_ip"; then
@@ -967,6 +976,47 @@ _cc_name() { # _cc_name <两位国家代码> -> 中文地区名，不认识就�
     KZ) echo 哈萨克斯坦 ;; GE) echo 格鲁吉亚 ;; AM) echo 亚美尼亚 ;; IR) echo 伊朗 ;; QA) echo 卡塔尔 ;; BH) echo 巴林 ;;
     *) echo "$1" ;;
   esac
+}
+
+_valid_host() { # _valid_host <串>：长得像域名（a.b.c，至少一个点，不能全是数字）才返回 0
+  _vh="$1"
+  case "$_vh" in
+    ''|*[!0-9A-Za-z.-]*|.*|*.|-*|*-|*..*|*.-*|*-.*) return 1 ;;
+    *.*) ;;
+    *) return 1 ;;
+  esac
+  [ "${#_vh}" -le 253 ] || return 1
+  # 最后一段（.com / .de）必须有字母，避免把 1.2.3 这种输错的 IP 当成域名
+  case "${_vh##*.}" in *[A-Za-z]*) ;; *) return 1 ;; esac
+  return 0
+}
+
+_resolve_host() { # _resolve_host <域名> <4|6> -> 打印解析出的一个 IP，失败返回非零
+  _rh_name="$1"; _rh_v="$2"
+  _rh_list=""
+  if command -v getent >/dev/null 2>&1; then
+    if [ "$_rh_v" = "6" ]; then
+      _rh_list=$(getent ahostsv6 "$_rh_name" 2>/dev/null | awk '{print $1}')
+    else
+      _rh_list=$(getent ahostsv4 "$_rh_name" 2>/dev/null | awk '{print $1}')
+    fi
+    [ -n "$_rh_list" ] || _rh_list=$(getent hosts "$_rh_name" 2>/dev/null | awk '{print $1}')
+  fi
+  if [ -z "$_rh_list" ] && command -v nslookup >/dev/null 2>&1; then
+    # 跳过开头 DNS 服务器自己的地址，只取 Name: 之后的 Address 行
+    _rh_list=$(nslookup "$_rh_name" 2>/dev/null | awk '/^Name:/ { f = 1; next } f && /Address/ { sub(/^Address( [0-9]+)?:[[:space:]]*/, ""); print $1 }')
+  fi
+  if [ -z "$_rh_list" ] && command -v ping >/dev/null 2>&1; then
+    _rh_list=$(ping -c 1 -W 2 "$_rh_name" 2>/dev/null | head -1 | sed -n 's/^[^(]*(\([^)]*\)).*/\1/p')
+  fi
+  for _rh_ip in $_rh_list; do
+    if _valid_ip "$_rh_v" "$_rh_ip"; then printf "%s" "$_rh_ip"; return 0; fi
+  done
+  # 要的版本没有，就用另一个版本的地址查地区，地区是一样的
+  for _rh_ip in $_rh_list; do
+    if _valid_ip 4 "$_rh_ip" || _valid_ip 6 "$_rh_ip"; then printf "%s" "$_rh_ip"; return 0; fi
+  done
+  return 1
 }
 
 _geo_cc() { # _geo_cc <公网 IP> <4|6> -> 两位国家代码
@@ -6633,27 +6683,40 @@ done
 printf "正在检测公网 IP…\n"
 if ! SERVER_IP=$(get_ip "$IPVER"); then
   warn "自动检测 IP 失败，请手动输入。"
+  printf "NAT 小鸡商家给的是域名（比如 nat1.example.com）的话，直接填域名也行。\n"
   _iptry=0
   SERVER_IP=""
   while [ "$_iptry" -lt 3 ]; do
     _iptry=$((_iptry + 1))
-    ask "请输入你的服务器公网 IPv$IPVER 地址" "" SERVER_IP
+    ask "请输入你的服务器公网 IPv$IPVER 地址或域名" "" SERVER_IP
+    SERVER_IP=$(printf "%s" "$SERVER_IP" | tr -d ' \t\r')
     if [ -z "$SERVER_IP" ]; then
-      warn "IP 不能为空"
+      warn "地址不能为空"
     elif _valid_ip "$IPVER" "$SERVER_IP"; then
       break
+    elif _valid_host "$SERVER_IP"; then
+      SERVER_IP=$(printf "%s" "$SERVER_IP" | tr 'A-Z' 'a-z')
+      break
     else
-      warn "「${SERVER_IP}」不像个 IPv$IPVER 地址，检查一下再输"
+      warn "「${SERVER_IP}」既不像 IPv$IPVER 地址，也不像域名，检查一下再输"
     fi
     SERVER_IP=""
   done
-  [ -z "$SERVER_IP" ] && die "没有 IP 装不了，先去查一下你的服务器 IP 再来"
+  [ -z "$SERVER_IP" ] && die "没有服务器地址装不了，先去商家后台查一下你的服务器 IP 或域名再来"
 fi
-info "服务器 IP：$SERVER_IP"
+info "服务器地址：$SERVER_IP"
+# 填的是域名时，查地区要用它解析出来的 IP。解析不出来不影响安装，只是地区写“未知地区”。
+_geo_ip="$SERVER_IP"
+if ! _valid_ip 4 "$SERVER_IP" && ! _valid_ip 6 "$SERVER_IP"; then
+  _geo_ip=$(_resolve_host "$SERVER_IP" "$IPVER") || _geo_ip=""
+  if [ -z "$_geo_ip" ]; then
+    warn "这台机器解析不出「${SERVER_IP}」。请确认这个域名确实指向这台服务器，否则节点连不上。"
+  fi
+fi
 # 节点名 = 地区 + 协议，比如 香港Vless。查不到地区就写“未知地区”。
 printf "正在查这台服务器在哪个国家/地区（用来给节点起名）…\n"
 NODE_REGION=""
-if _cc=$(_geo_cc "$SERVER_IP" "$IPVER"); then
+if [ -n "$_geo_ip" ] && _cc=$(_geo_cc "$_geo_ip" "$IPVER"); then
   NODE_REGION=$(_cc_name "$_cc")
 fi
 [ -n "$NODE_REGION" ] || NODE_REGION="未知地区"
