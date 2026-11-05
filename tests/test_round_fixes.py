@@ -274,7 +274,7 @@ class Ipv6OnlyTest(unittest.TestCase):
     def hint(self, v4_route):
         script = (
             "ip() { case \"$*\" in \"-4 route show default\") printf '%s' '" + v4_route + "';; esac; }\n"
-            + between("_no_ipv4_route() {", "\n# 临时换 DNS")
+            + between("# 有没有 IPv4 默认路由", "\n# 临时换 DNS")
             + "\n"
             + between("_gh_hint() {", "\n# 下载的安装包")
             + "\nprintf '[%s]' \"$(_gh_hint)\"\n"
