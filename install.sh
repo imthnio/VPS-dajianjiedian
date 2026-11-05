@@ -638,6 +638,13 @@ _dns_fix_broken() {
     warn "换了公共 DNS 还是解析不了，已换回原来的。请检查服务器能不能上网，或联系服务商"
     return 1
   fi
+  # 脚本开头设了 umask 077，新建的文件只有 root 能读；Hysteria2 用普通用户 xray-node 跑，读不到就没法解析域名。
+  chmod 644 /etc/resolv.conf 2>/dev/null
+  # Alpine 等系统的 dhcpcd 续租时会重新生成 resolv.conf，商家 DHCP 不给 DNS 时只剩几行注释，
+  # 节点能连上却打不开任何网站。dhcpcd 会把 resolv.conf.head 原样放在最前面，写一份进去就不会被冲掉。
+  if command -v dhcpcd >/dev/null 2>&1 || [ -f /etc/dhcpcd.conf ]; then
+    cat /etc/resolv.conf > /etc/resolv.conf.head 2>/dev/null && chmod 644 /etc/resolv.conf.head 2>/dev/null
+  fi
   info "DNS 已换成：${_dfb_servers}（原来的备份在 ${_dfb_bak}）"
   return 0
 }
