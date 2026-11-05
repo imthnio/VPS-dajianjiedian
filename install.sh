@@ -514,9 +514,18 @@ DNS64_SERVERS="2a00:1098:2b::1 2a01:4f8:c2c:123f::1 2a00:1098:2c::1 2001:67c:2b0
 _DNS64_ON=0
 _GH_VIA=""
 
+# 有没有 IPv4 默认路由。没有 ip 命令时看 /proc/net/route；两样都没有就当作有（不乱换 DNS）。
+_has_ipv4_default() {
+  if command -v ip >/dev/null 2>&1; then
+    [ -n "$(ip -4 route show default 2>/dev/null)" ]
+    return $?
+  fi
+  [ -r /proc/net/route ] || return 0
+  awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null
+}
+
 _no_ipv4_route() {
-  command -v ip >/dev/null 2>&1 || return 1
-  [ -z "$(ip -4 route show default 2>/dev/null)" ]
+  ! _has_ipv4_default
 }
 
 # 临时换 DNS。/etc/resolv.conf 可能是指向 systemd-resolved 的链接，整个挪开再写新的，换回时原样挪回。
@@ -557,6 +566,80 @@ _dns64_recover() {
     _DNS64_ON=1
     _dns64_off
   fi
+}
+
+# ---------- DNS 坏了：一个域名都解析不出来时，长期换成公共 DNS ----------
+# NAT / LXC 小鸡常见：/etc/resolv.conf 里写的是 IPv4 的 DNS，机器却只有 IPv6；
+# 或者商家的 DNS 挂了。表现是 wget 报 bad address、curl 报 Could not resolve host，
+# 装软件、下载内核全都失败，节点装上了也打不开网站。
+# 这种情况下原来的 DNS 本来就不能用，所以直接换掉（不是临时的），原文件备份成 /etc/resolv.conf.xray-node-orig。
+# _resolves <域名>：能解析出地址返回 0。两个工具都没有时当作能解析（不乱动 DNS）。
+_resolves() {
+  if command -v getent >/dev/null 2>&1; then
+    getent hosts "$1" >/dev/null 2>&1 && return 0
+    command -v nslookup >/dev/null 2>&1 || return 1
+  fi
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup "$1" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx nslookup; then
+    busybox nslookup "$1" >/dev/null 2>&1
+    return $?
+  fi
+  return 0
+}
+
+_dns_broken() {
+  _resolves raw.githubusercontent.com && return 1
+  _resolves github.com && return 1
+  _resolves www.cloudflare.com && return 1
+  return 0
+}
+
+# _resolv_restore <备份>：把备份原样放回。备份是链接就挪回链接；
+# /etc/resolv.conf 被容器挂载成单个文件时不能删也不能挪，只能把内容写回去。
+_resolv_restore() {
+  if [ -L "$1" ]; then
+    rm -f /etc/resolv.conf 2>/dev/null
+    mv -f "$1" /etc/resolv.conf 2>/dev/null
+  elif [ -e "$1" ]; then
+    cat "$1" > /etc/resolv.conf 2>/dev/null
+    rm -f "$1"
+  fi
+}
+
+_dns_fix_broken() {
+  _dns_broken || return 0
+  warn "这台服务器的 DNS 解析不了任何域名（wget 会报 bad address），先换成公共 DNS"
+  if _has_ipv4_default; then
+    _dfb_servers="1.1.1.1 8.8.8.8 2606:4700:4700::1111"
+  else
+    # 只有 IPv6：用 NAT64/DNS64，顺带让只有 IPv4 的网站（比如 github.com）也能连上
+    _dfb_servers="$DNS64_SERVERS"
+  fi
+  _dfb_bak=/etc/resolv.conf.xray-node-orig
+  _dfb_new=0
+  if [ ! -e "$_dfb_bak" ] && [ ! -L "$_dfb_bak" ]; then
+    if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+      cp -P /etc/resolv.conf "$_dfb_bak" 2>/dev/null || cp /etc/resolv.conf "$_dfb_bak" 2>/dev/null
+      _dfb_new=1
+    fi
+  fi
+  # 链接（systemd-resolved 的 stub）先拿掉，写成普通文件，别的程序就不会再改回去
+  [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+  if ! { for _ds in $_dfb_servers; do printf 'nameserver %s\n' "$_ds"; done; } > /etc/resolv.conf 2>/dev/null; then
+    [ "$_dfb_new" = "1" ] && _resolv_restore "$_dfb_bak"
+    warn "改不了 /etc/resolv.conf（可能被锁住或只读），请到服务商后台把 DNS 改成 1.1.1.1 / 8.8.8.8 后再运行"
+    return 1
+  fi
+  if _dns_broken; then
+    [ "$_dfb_new" = "1" ] && _resolv_restore "$_dfb_bak"
+    warn "换了公共 DNS 还是解析不了，已换回原来的。请检查服务器能不能上网，或联系服务商"
+    return 1
+  fi
+  info "DNS 已换成：${_dfb_servers}（原来的备份在 ${_dfb_bak}）"
+  return 0
 }
 
 _sha256_of() { # _sha256_of <文件> -> 64 位小写十六进制
@@ -5955,6 +6038,8 @@ fi
 umask 077
 # 上次脚本中途被关掉、临时 DNS 没换回时，先换回来。
 _dns64_recover
+# DNS 完全不通时（wget 报 bad address），后面装软件、下载内核都会失败，先修好。
+_dns_fix_broken || true
 # 旧版本可能把节点链接和密码写成全机可读；升级时也一并收紧。
 for _sec_dir in /etc/xray-node /etc/xray-node/nodes /etc/xray-node/nodes/*/; do
   [ -d "$_sec_dir" ] && chmod 700 "$_sec_dir"
