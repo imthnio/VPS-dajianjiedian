@@ -420,7 +420,9 @@ class InstallPromptTest(unittest.TestCase):
         ]
         self.assertEqual(len(lines), 1, block)
         command = lines[0]
-        self.assertIn("sh /tmp/xray-install.sh", command)
+        self.assertIn("/tmp/xray-install.sh", command)
+        # 终端一行最多收 4096 字节，超过会被截断（粘贴后卡在 > 提示符）。留足余量。
+        self.assertLess(len(command.encode()), 2000)
         self.assertNotIn("<<", command)
         self.assertIn(
             'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
