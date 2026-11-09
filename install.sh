@@ -6043,6 +6043,8 @@ if [ ! -t 0 ] && [ -r /dev/tty ] && (: < /dev/tty) 2>/dev/null; then
   exec < /dev/tty
 fi
 umask 077
+# 先打一行字：下面查 DNS 在网络差的机器上要几十秒，屏幕一片空白像是卡死了。
+printf "检查网络（DNS 不通时要等几十秒）…\n"
 # 上次脚本中途被关掉、临时 DNS 没换回时，先换回来。
 _dns64_recover
 # DNS 完全不通时（wget 报 bad address），后面装软件、下载内核都会失败，先修好。
