@@ -412,7 +412,8 @@ class InstallPromptTest(unittest.TestCase):
     def readme_command(self):
         readme = (INSTALLER.parent / "README.md").read_text()
         self.assertNotIn("sh <<'EOF'", readme)
-        start = readme.index("```bash\n") + len("```bash\n")
+        # README 里有两条安装命令：短的 bash <(curl …) 给常见系统，长的这一行兜底。这里测长的那行。
+        start = readme.index("```bash\n", readme.index("上面那行报错")) + len("```bash\n")
         block = readme[start:readme.index("\n```", start)]
         lines = [
             line for line in block.splitlines()
@@ -433,6 +434,12 @@ class InstallPromptTest(unittest.TestCase):
 
     def test_readme_command_is_one_line(self):
         self.readme_command()
+
+    def test_readme_short_command_comes_first(self):
+        readme = (INSTALLER.parent / "README.md").read_text()
+        short = "bash <(curl -fsSL https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh)"
+        self.assertIn(short, readme)
+        self.assertLess(readme.index(short), readme.index("/tmp/xray-install.sh"))
 
     def ask_script(self):
         ask = between("ask() {", "\nrand_hex() {")
@@ -622,9 +629,18 @@ class InstallPromptTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("[2/3] 装 curl", result.stdout)
-        self.assertIn("apk add --no-cache curl", logged)
+        self.assertIn("apk add --wait 90 --no-cache curl", logged)
         self.assertIn("GOT 8443", result.stdout)
         self.assertNotIn("fail:", result.stdout)
+
+    def test_busybox_wget_is_tried_once_per_url(self):
+        # Alpine 上 wget 就是 busybox：以前同一个网址先 wget 再 busybox wget，各等一轮超时，看起来像卡死
+        _result, logged, _out = self.run_line(
+            {"wget": BUSYBOX_NO_TLS_WGET, "busybox": BUSYBOX_NO_TLS, "apk": FAIL_STUB},
+            "#!/bin/sh\nexit 0\n",
+        )
+        tries = [l for l in logged.splitlines() if l.startswith("bbwget -O")]
+        self.assertEqual(len(tries), 5, logged)
 
     def test_download_failure_shows_the_real_error(self):
         result, _logged, out = self.run_line(
@@ -655,7 +671,7 @@ class InstallPromptTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("GOT 8443", result.stdout)
-        self.assertIn("apk add --no-cache curl", logged)
+        self.assertIn("apk add --wait 90 --no-cache curl", logged)
         self.assertNotIn("ForceIPv4", logged)
 
     def test_failed_download_does_not_run_the_installer(self):

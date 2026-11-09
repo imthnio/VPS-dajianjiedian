@@ -10,6 +10,7 @@
 #
 # 装完之后，想看所有节点随时输入：  jiedian（只显示通用链接和 Loon 行；jiedian all 看完整参数）
 # 输入 shanjiedian 进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
+# 输入 gl 直接打开主菜单（更新内核、添加节点、节点管理等），不用再粘贴一键安装命令
 # 已经装过节点的机器再跑一次：选“更新内核”或“添加节点”时，Xray / sing-box 有新的正式版会自动升级（beta 不装）
 #
 # 节点分两种，装的时候先选：
@@ -3696,6 +3697,65 @@ arm_device_limit() {
   return 0
 }
 
+# ---------- gl：输入 gl 直接打开节点主菜单 ----------
+# gl 每次先下载最新的 install.sh（连不上就用本机保存的那份），再运行它；装过节点的机器会直接出主菜单。
+# 本机那份存在 /etc/xray-node/install.sh，安装时顺手把当前脚本存进去，所以断网也能打开菜单。
+# 别的程序已经占用了 gl 这个名字时不覆盖，只提示一句。
+_write_gl_cmd() {
+  _gl_dir=${XRAY_BIN_DIR:-/usr/local/bin}
+  _gl_bin="$_gl_dir/gl"
+  _gl_cache=${XRAY_GL_CACHE:-/etc/xray-node/install.sh}
+  # 先把正在运行的这份脚本存一份（README 的命令是 sh /tmp/xray-install.sh，$0 就是脚本文件）
+  if [ -f "$0" ] && [ "$0" != "$_gl_cache" ] && head -n 3 "$0" 2>/dev/null | grep -q 'xray-node 一键安装脚本'; then
+    mkdir -p "$(dirname "$_gl_cache")" 2>/dev/null
+    cp -f "$0" "$_gl_cache" 2>/dev/null && chmod 700 "$_gl_cache" 2>/dev/null
+  fi
+  if [ -e "$_gl_bin" ] && ! grep -q 'xray-node-gl' "$_gl_bin" 2>/dev/null; then
+    warn "系统里已经有别的 gl 命令（$_gl_bin），没有覆盖它。打开菜单请重新粘贴一键安装命令。"
+    return 0
+  fi
+  _gl_other=$(command -v gl 2>/dev/null)
+  case "$_gl_other" in
+    ""|"$_gl_bin") ;;
+    /*) warn "系统里已经有别的 gl 命令（$_gl_other），没有覆盖它。打开菜单请重新粘贴一键安装命令。"; return 0 ;;
+  esac
+  mkdir -p "$_gl_dir" 2>/dev/null
+  cat > "$_gl_bin" <<'GLEOF'
+#!/bin/sh
+# xray-node-gl：输入 gl 打开节点主菜单。由一键安装脚本写入，卸载节点时一起删除。
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; export PATH
+F=${XRAY_GL_CACHE:-/etc/xray-node/install.sh}
+T="$F.new"
+E="$F.err"
+G=${XRAY_GL_URL:-https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh}
+mkdir -p "$(dirname "$F")" 2>/dev/null
+echo "正在获取最新的脚本…（连不上会用本机保存的那份）"
+n=0
+for u in "$G" "https://cdn.jsdelivr.net/gh/imthnio/VPS-dajianjiedian@main/install.sh" "https://v6.gh-proxy.org/$G" "https://gh.llkk.cc/$G"; do
+  # 本机已经有一份时只试两个网址，别让人干等
+  [ -s "$F" ] && [ "$n" -ge 2 ] && break
+  n=$((n + 1))
+  rm -f "$T"
+  { curl -fsSL --connect-timeout 5 -m 30 -o "$T" "$u" || wget -q -T 10 -t 1 -O "$T" "$u" || busybox wget -q -T 10 -O "$T" "$u"; } 2>"$E"
+  l=
+  [ -s "$T" ] && read -r l < "$T"
+  case "$l" in "#!"*) mv -f "$T" "$F"; chmod 700 "$F"; rm -f "$E"; exec sh "$F" "$@" ;; esac
+done
+rm -f "$T"
+if [ -s "$F" ]; then
+  rm -f "$E"
+  echo "没下载到最新版，先用本机保存的版本打开菜单。"
+  exec sh "$F" "$@"
+fi
+echo "下载不到安装脚本，本机也没有保存的版本。最后的报错："
+tail -n 3 "$E" 2>/dev/null | sed 's/^/  /'
+rm -f "$E"
+echo "请重新粘贴 README 里的一键安装命令。"
+exit 1
+GLEOF
+  chmod 755 "$_gl_bin"
+}
+
 # ---------- 写入 jiedian / shanjiedian 两个快捷命令 ----------
 # jiedian：显示所有节点的分享链接；shanjiedian：删除某个节点或全部卸载。
 # 它们是普通的 shell 脚本，放在 /usr/local/bin，以后直接输入名字就能用。
@@ -3973,6 +4033,7 @@ _uninstall_all() {
   rm -f /etc/sysctl.d/99-xray-node-bbr.conf
   rm -f /usr/local/bin/jiedian
   rm -f /usr/local/bin/shanjiedian /usr/local/bin/xiezai
+  grep -q 'xray-node-gl' /usr/local/bin/gl 2>/dev/null && rm -f /usr/local/bin/gl
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
   rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
@@ -4122,6 +4183,7 @@ case "$_sel" in
 esac
 XZEOF
 chmod 700 /usr/local/bin/shanjiedian
+_write_gl_cmd
 # 旧版的 xiezai 是"一键全删"，改名后把它删掉，免得留着误导人
 rm -f /usr/local/bin/xiezai
 for _hy_node in /etc/xray-node/nodes/*/; do
@@ -6458,7 +6520,7 @@ _pkg_add() { # _pkg_add 描述 包名…
   fi
   printf "%s…\n" "$_pa_desc"
   if command -v apk >/dev/null 2>&1; then
-    _timeout_cmd 300 apk add --no-cache "$@" >"$_dep_log" 2>&1 || _dep_fail
+    _timeout_cmd 300 apk add --wait 90 --no-cache "$@" >"$_dep_log" 2>&1 || _dep_fail
   elif command -v dnf >/dev/null 2>&1; then
     _timeout_cmd 300 dnf install -y -q "$@" >"$_dep_log" 2>&1 \
       || _timeout_cmd 300 dnf install -y -q --setopt=ip_resolve=4 "$@" >"$_dep_log" 2>&1 \
@@ -6722,7 +6784,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     _route_refresh_all
     # 刷新 jiedian / shanjiedian（脚本可能修过它们）
     write_helper_cmds
-    info "jiedian / shanjiedian 命令已同步为最新版"
+    info "jiedian / shanjiedian / gl 命令已同步为最新版"
     printf "\n"
     sh /usr/local/bin/jiedian
     if [ "$_u_any_fail" = "1" ]; then
@@ -7994,3 +8056,4 @@ if [ "$NODE_KIND" = "timed" ]; then
   printf "定时节点：%s（%s后）自动删除。\n" "$EXPIRE_SHOW" "$EXPIRE_LABEL"
 fi
 printf "完整参数（端口、密码、Surge / Clash 配置等）输入 jiedian all 查看；管理节点输入 shanjiedian。\n"
+printf "以后想打开主菜单（更新内核、添加节点、节点管理），直接输入 gl。\n"
