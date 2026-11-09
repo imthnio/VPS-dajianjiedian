@@ -6427,6 +6427,9 @@ _have_wget() {
   command -v wget >/dev/null 2>&1 && return 0
   command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget
 }
+# busybox wget 算不上能用的下载工具：Alpine 精简系统上它要靠 ssl_client 才能下 https，
+# 没装 ssl_client 时所有 https 都失败（报错还被藏起来）。只有 curl 或 GNU wget 才算靠得住。
+_have_gnu_wget() { wget -V 2>&1 | grep -q 'GNU Wget'; }
 _have_pkgman() {
   command -v apt-get >/dev/null 2>&1 && return 0
   command -v apk >/dev/null 2>&1 && return 0
@@ -6472,26 +6475,34 @@ _pkg_add() { # _pkg_add 描述 包名…
 }
 if _have_curl; then
   info "curl 已有，直接跳过安装"
-elif _have_wget; then
+elif _have_gnu_wget; then
   info "没有 curl，用已有的 wget 继续"
+elif _have_wget && ! _have_pkgman; then
+  warn "没有 curl，只有 busybox wget，也装不了软件。试着用它继续（下不了 https 就需要手动装 curl）"
 else
-  printf "没有 curl，也没有 wget。正在识别系统并自动安装，装完继续…\n"
-  _have_pkgman || die "识别不到软件安装方式。请先手动安装 curl 或 wget，然后再运行。"
+  if _have_wget; then
+    printf "没有 curl，只有 busybox wget（精简系统上常常下不了 https）。先装上 curl，装完继续…\n"
+  else
+    printf "没有 curl，也没有 wget。正在识别系统并自动安装，装完继续…\n"
+    _have_pkgman || die "识别不到软件安装方式。请先手动安装 curl 或 wget，然后再运行。"
+  fi
   _pkg_add "正在安装 curl" curl ca-certificates
   hash -r 2>/dev/null || true
-  if ! _have_curl && ! _have_wget; then
+  if ! _have_curl && ! _have_gnu_wget; then
     _pkg_add "正在安装 curl" curl
     hash -r 2>/dev/null || true
   fi
-  if ! _have_curl && ! _have_wget; then
+  if ! _have_curl && ! _have_gnu_wget; then
     _pkg_add "curl 没装上，改装 wget" wget
     hash -r 2>/dev/null || true
   fi
   rm -f "$_dep_log"
   if _have_curl; then
     info "curl 已装好，继续"
-  elif _have_wget; then
+  elif _have_gnu_wget; then
     info "wget 已装好，继续"
+  elif _have_wget; then
+    warn "curl 没装上，只能用 busybox wget 试试（下不了 https 就需要手动装 curl）"
   else
     die "curl 和 wget 都没装上。请把上面的报错发出来，或手动安装 curl 后再运行。"
   fi

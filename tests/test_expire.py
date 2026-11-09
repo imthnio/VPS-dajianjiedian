@@ -422,7 +422,7 @@ class InstallPromptTest(unittest.TestCase):
         command = lines[0]
         self.assertIn("/tmp/xray-install.sh", command)
         # 终端一行最多收 4096 字节，超过会被截断（粘贴后卡在 > 提示符）。留足余量。
-        self.assertLess(len(command.encode()), 2000)
+        self.assertLess(len(command.encode()), 2400)
         self.assertNotIn("<<", command)
         self.assertIn(
             'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
@@ -520,11 +520,14 @@ class InstallPromptTest(unittest.TestCase):
             # 不然机器上本来就有 curl 时，"没有 curl 先装上" 的用例测不到。
             sysbin = root / "sysbin"
             sysbin.mkdir()
-            for tool in Path("/bin").iterdir():
-                if tool.name in ("curl", "wget", "busybox", "dpkg"):
-                    continue
-                if os.access(tool, os.X_OK) and not tool.is_dir():
-                    (sysbin / tool.name).symlink_to(tool)
+            # /usr/bin 也要：macOS 上 grep / sed / tail 在 /usr/bin，不链进来安装命令就跑不全
+            skip = ("curl", "wget", "busybox", "dpkg", "apt-get", "apk", "yum", "dnf", "pacman", "zypper", "getent", "nslookup")
+            for d in ("/bin", "/usr/bin"):
+                for tool in Path(d).iterdir():
+                    if tool.name in skip or (sysbin / tool.name).exists():
+                        continue
+                    if os.access(tool, os.X_OK) and not tool.is_dir():
+                        (sysbin / tool.name).symlink_to(tool)
             out = root / "install.sh"
             log = root / "log"
             payload_path = root / "payload.sh"
@@ -599,15 +602,39 @@ class InstallPromptTest(unittest.TestCase):
         self.assertNotIn("fail ", logged)
         self.assertIn("wget -O ", logged)
 
-    def test_one_line_uses_busybox_wget_without_package_install(self):
+    def test_one_line_uses_busybox_wget_when_curl_cannot_be_installed(self):
+        # 装不上 curl 时，busybox wget 仍然作为最后一招
         result, logged, _out = self.run_line(
             {"busybox": BUSYBOX_STUB, "grep": GREP_STUB, "apt-get": FAIL_STUB},
             "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("GOT 8443", result.stdout)
-        self.assertNotIn("fail ", logged)
+        self.assertIn("[2/3] 装 curl", result.stdout)
         self.assertIn("busybox wget", logged)
+
+    def test_alpine_busybox_wget_without_ssl_client_installs_curl(self):
+        # 真实 Alpine 精简系统：wget 是 busybox，没有 ssl_client，https 全部失败。
+        # 以前因为“有 wget”就跳过装 curl，五个网址全失败、报错还被藏起来。
+        result, logged, _out = self.run_line(
+            {"wget": BUSYBOX_NO_TLS_WGET, "busybox": BUSYBOX_NO_TLS, "apk": APK_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[2/3] 装 curl", result.stdout)
+        self.assertIn("apk add --no-cache curl", logged)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertNotIn("fail:", result.stdout)
+
+    def test_download_failure_shows_the_real_error(self):
+        result, _logged, out = self.run_line(
+            {"wget": BUSYBOX_NO_TLS_WGET, "busybox": BUSYBOX_NO_TLS, "apk": FAIL_STUB},
+            "#!/bin/sh\nprintf 'GOT ran\\n'\n",
+        )
+        self.assertIn("安装脚本没下载下来", result.stdout)
+        self.assertIn("ssl_client", result.stdout)
+        self.assertFalse(out.exists())
+        self.assertFalse(Path(str(out) + ".err").exists())
 
     def test_one_line_installs_curl_with_apt_then_asks(self):
         result, logged, _out = self.run_line(
@@ -659,6 +686,7 @@ exit 0
 """
 
 WGET_STUB = """#!/bin/sh
+if [ "$1" = "-V" ]; then echo "GNU Wget 1.21.3 built on linux-gnu."; exit 0; fi
 printf 'wget %s\\n' "$*" >> "$LOG"
 cp "$PAYLOAD" "$2"
 exit 0
@@ -675,6 +703,21 @@ if [ "$1" = "wget" ]; then
   exit 0
 fi
 exit 1
+"""
+
+# Alpine 的 busybox wget：没装 ssl_client 时下 https 一律失败；不认 -V
+BUSYBOX_NO_TLS_WGET = """#!/bin/sh
+printf 'bbwget %s\\n' "$*" >> "$LOG"
+case "$1" in -V) echo "wget: unrecognized option: V" >&2; echo "BusyBox v1.36.1 multi-call binary." >&2; exit 1 ;; esac
+echo "wget: can't execute 'ssl_client': No such file or directory" >&2
+echo "wget: error getting response: Connection reset by peer" >&2
+exit 1
+"""
+
+BUSYBOX_NO_TLS = """#!/bin/sh
+if [ "$1" = "--list" ]; then printf 'wget\\n'; exit 0; fi
+shift
+exec wget "$@"
 """
 
 GREP_STUB = """#!/bin/sh
