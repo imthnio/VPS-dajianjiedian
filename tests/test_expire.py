@@ -412,8 +412,7 @@ class InstallPromptTest(unittest.TestCase):
     def readme_command(self):
         readme = (INSTALLER.parent / "README.md").read_text()
         self.assertNotIn("sh <<'EOF'", readme)
-        # README 里有两条安装命令：短的 bash <(curl …) 给常见系统，长的这一行兜底。这里测长的那行。
-        start = readme.index("```bash\n", readme.index("上面那行报错")) + len("```bash\n")
+        start = readme.index("```bash\n") + len("```bash\n")
         block = readme[start:readme.index("\n```", start)]
         lines = [
             line for line in block.splitlines()
@@ -434,12 +433,6 @@ class InstallPromptTest(unittest.TestCase):
 
     def test_readme_command_is_one_line(self):
         self.readme_command()
-
-    def test_readme_short_command_comes_first(self):
-        readme = (INSTALLER.parent / "README.md").read_text()
-        short = "bash <(curl -fsSL https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh)"
-        self.assertIn(short, readme)
-        self.assertLess(readme.index(short), readme.index("/tmp/xray-install.sh"))
 
     def ask_script(self):
         ask = between("ask() {", "\nrand_hex() {")

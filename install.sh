@@ -3934,6 +3934,8 @@ _stop_remove_svc() {
 # _del_node <节点id> [skip_confirm]：删除单个节点（服务+防火墙+配置），其它节点不受影响
 _del_node() {
   _d_id="$1"
+  # 编号为空时 "$NODES_DIR/$_d_id" 就是整个节点目录，后面的 rm -rf 会把所有节点删光
+  case "$_d_id" in ''|*[!0-9]*) echo "节点编号不对：$_d_id"; return 1 ;; esac
   [ -d "$NODES_DIR/$_d_id" ] || { echo "节点 $_d_id 不存在"; return 1; }
   if [ "$2" != "skip_confirm" ]; then
     printf "确定删除节点 %s（%s）吗？删掉后这个节点就不能用了。[y/N]: " "$_d_id" "$(_node_info "$_d_id")"
