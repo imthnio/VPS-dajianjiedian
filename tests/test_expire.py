@@ -510,8 +510,10 @@ class InstallPromptTest(unittest.TestCase):
         self.assertLess(root, tty)
         self.assertLess(tty, menu)
 
-    def run_line(self, tools, payload, stdin="8443\n"):
+    def run_line(self, tools, payload, stdin="8443\n", resolv=None):
         command = self.readme_command()
+        if resolv is not None:
+            command = command.replace("R=/etc/resolv.conf;", f"R={resolv};")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             bindir = root / "bin"
@@ -563,6 +565,8 @@ class InstallPromptTest(unittest.TestCase):
             env["PAYLOAD"] = str(payload_path)
             env["BIN"] = str(bindir)
             env["CURL_BODY"] = str(curl_body)
+            if resolv is not None:
+                env["RESOLV"] = str(resolv)
             result = subprocess.run(
                 ["/bin/sh", "-c", command],
                 input=stdin,

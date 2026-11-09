@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_expire import InstallPromptTest, FAIL_STUB
+from test_expire import InstallPromptTest, FAIL_STUB, CURL_STUB as CURL_OK
 
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
@@ -194,6 +194,79 @@ class DnsFixDhcpcdTest(unittest.TestCase):
             head = Path(str(resolv) + ".head")
             self.assertIn("nameserver 1.1.1.1", head.read_text())
             self.assertEqual(resolv.stat().st_mode & 0o777, 0o644)
+
+
+# 安装命令里换 DNS 那一段。nslookup 假装：resolv.conf 里有 $GOOD 这个 DNS 才解析得出来。
+NSLOOKUP_STUB = """#!/bin/sh
+printf 'nslookup %s\\n' "$*" >> "$LOG"
+[ -n "$GOOD" ] && grep -q "nameserver $GOOD" "$RESOLV"
+"""
+
+
+class BootstrapDnsTest(unittest.TestCase):
+    run_line = InstallPromptTest.run_line
+    readme_command = InstallPromptTest.readme_command
+
+    def run_dns(self, before, good, backup=None, head=None):
+        with tempfile.TemporaryDirectory() as temp:
+            resolv = Path(temp) / "resolv.conf"
+            resolv.write_text(before)
+            bak = Path(str(resolv) + ".xray-node-orig")
+            if backup is not None:
+                bak.write_text(backup)
+            if head is not None:
+                Path(str(resolv) + ".head").write_text(head)
+            old = os.environ.get("GOOD")
+            os.environ["GOOD"] = good
+            try:
+                result, _logged, _out = self.run_line(
+                    {"curl": CURL_OK, "nslookup": NSLOOKUP_STUB},
+                    "#!/bin/sh\nprintf 'GOT ran\\n'\n",
+                    resolv=resolv,
+                )
+            finally:
+                if old is None:
+                    del os.environ["GOOD"]
+                else:
+                    os.environ["GOOD"] = old
+            head_path = Path(str(resolv) + ".head")
+            return (result, resolv.read_text() if resolv.exists() else None,
+                    bak.read_text() if bak.exists() else None,
+                    head_path.read_text() if head_path.exists() else None)
+
+    def test_working_dns_is_left_alone(self):
+        result, now, bak, _h = self.run_dns("nameserver 10.0.0.1\n", "10.0.0.1")
+        self.assertEqual(now, "nameserver 10.0.0.1\n")
+        self.assertIsNone(bak)
+        self.assertIn("GOT ran", result.stdout)
+
+    def test_broken_dns_switches_when_public_dns_works(self):
+        result, now, bak, _h = self.run_dns("nameserver 10.0.0.1\n", "1.1.1.1")
+        self.assertIn("nameserver 1.1.1.1", now)
+        self.assertEqual(bak, "nameserver 10.0.0.1\n")
+        self.assertIn("DNS -> 1.1.1.1", result.stdout)
+
+    def test_public_dns_unreachable_restores_original(self):
+        # DE9929：原来的 DNS 一时解析不了，公共 DNS 根本连不上。以前直接换成 1.1.1.1 不还原，之后全是 bad address
+        result, now, bak, _h = self.run_dns("nameserver 10.0.0.1\n", "none")
+        self.assertEqual(now, "nameserver 10.0.0.1\n")
+        self.assertIsNone(bak)
+        self.assertIn("DNS 已还原", result.stdout)
+
+    def test_rerun_repairs_dns_broken_by_old_command(self):
+        # 旧命令已经把 DNS 换成连不上的 1.1.1.1，备份里是原来的。重新跑新命令应当换回原来的
+        _r, now, bak, head = self.run_dns(
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n", "none",
+            backup="nameserver 10.0.0.1\n",
+            head="nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+        )
+        self.assertEqual(now, "nameserver 10.0.0.1\n")
+        self.assertIsNone(bak)
+        self.assertIsNone(head)
+
+    def test_users_own_head_file_is_kept(self):
+        _r, _now, _bak, head = self.run_dns("nameserver 10.0.0.1\n", "none", head="search lan\n")
+        self.assertEqual(head, "search lan\n")
 
 
 if __name__ == "__main__":
