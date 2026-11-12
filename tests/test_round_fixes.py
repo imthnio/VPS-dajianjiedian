@@ -180,6 +180,47 @@ class ExpireBinsCleanupTest(unittest.TestCase):
     def test_kept_when_a_node_exists(self):
         self.assertEqual(len(self.run_drop(True)), 4)
 
+    def test_other_helper_bins_are_removed_too(self):
+        # 巡检、设备数限制、端口跳跃、回程路由的小程序也是没装节点前就写出来的
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bindir = root / "bin"; bindir.mkdir()
+            nodes = root / "nodes"; nodes.mkdir()
+            for name in ("xray-node-watch", "xray-node-limit", "xray-node-hop", "xray-node-route", "xray", "gl"):
+                (bindir / name).write_text("x")
+            script = between("_drop_expire_bins_if_unused() {", "\narm_expire_watch() {") + "\n_drop_expire_bins_if_unused\n"
+            run_sh(script, dict(os.environ, XRAY_NODE_DIR=str(nodes), XRAY_BIN_DIR=str(bindir)))
+            self.assertEqual(sorted(p.name for p in bindir.iterdir()), ["gl", "xray"])
+
+
+class HelperBinsAtomicWriteTest(unittest.TestCase):
+    """后台每分钟会跑的小程序，重写时先写临时文件再换上去，不能就地覆盖正在跑的脚本。"""
+
+    def test_no_helper_is_overwritten_in_place(self):
+        source = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
+        for name in ("xray-node-hop", "xray-node-expire", "xray-node-run", "xray-node-expire-loop",
+                     "xray-node-route", "xray-node-watch", "xray-node-limit"):
+            # 只看写小程序本身的那一句（<<'XXEOF'），init.d / cron 里同名的服务文件不算
+            self.assertFalse('/' + name + '" <<\'' in source, name)
+            self.assertTrue('/' + name + '.tmp" <<\'' in source, name)
+
+    def test_bins_are_complete_and_no_tmp_left(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bindir = Path(temp) / "bin"
+            script = (
+                between("install_hop_bin() {", "\n# ---------- 回程路由小程序")
+                + between("install_expire_bins() {", "\n# 让系统每分钟自动跑一次到点检查")
+                + "\ninstall_hop_bin && install_expire_bins && echo WROTE\n"
+            )
+            result = run_sh(script, dict(os.environ, XRAY_BIN_DIR=str(bindir)))
+            self.assertIn("WROTE", result.stdout, result.stdout + result.stderr)
+            names = sorted(p.name for p in bindir.iterdir())
+            self.assertEqual(names, ["xray-node-expire", "xray-node-expire-loop", "xray-node-hop", "xray-node-run"])
+            self.assertEqual((bindir / "xray-node-run").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((bindir / "xray-node-hop").stat().st_mode & 0o777, 0o700)
+            for name in names:
+                subprocess.run(["sh", "-n", str(bindir / name)], check=True)
+
 
 class DualLinkHeaderTest(unittest.TestCase):
     def test_ipv6_strip_also_fixes_the_two_line_header(self):

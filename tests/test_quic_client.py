@@ -127,7 +127,10 @@ class ServerSideRemovedTest(unittest.TestCase):
 
     def test_update_mode_runs_the_migration(self):
         source = INSTALLER.read_text()
-        self.assertIn("_hy_fix_existing_ipv6; _fix_existing_json_ipv6; _quic_unblock_all; break ;;", source)
+        # 这几步在“U. 更新模式”那一节里跑（主菜单里跑的话 _apt_do 还没定义）
+        update = source[source.index('\nif [ "$UPDATE_MODE" = "1" ]; then\n'):source.index('step "[更新] 检查已安装的内核版本…"')]
+        for call in ("_hy_migrate_hop_all", "_hy_fix_existing_ipv6", "_fix_existing_json_ipv6", "_quic_unblock_all"):
+            self.assertIn("\n  " + call + "\n", update)
 
 
 class ClientLineTest(unittest.TestCase):

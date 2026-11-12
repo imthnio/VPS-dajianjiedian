@@ -610,6 +610,17 @@ _resolv_restore() {
   fi
 }
 
+# 换 DNS 没成功时，把 /etc/resolv.conf 放回这次动手之前的样子。
+_dfb_undo() {
+  if [ -e "$_dfb_cur" ] || [ -L "$_dfb_cur" ]; then
+    _resolv_restore "$_dfb_cur"
+    [ "$_dfb_new" = "1" ] && rm -f "$_dfb_bak"
+  elif [ "$_dfb_new" = "1" ]; then
+    _resolv_restore "$_dfb_bak"
+  fi
+  return 0
+}
+
 _dns_fix_broken() {
   _dns_broken || return 0
   warn "这台服务器的 DNS 解析不了任何域名（wget 会报 bad address），先换成公共 DNS"
@@ -620,6 +631,14 @@ _dns_fix_broken() {
     _dfb_servers="$DNS64_SERVERS"
   fi
   _dfb_bak=/etc/resolv.conf.xray-node-orig
+  # 这次动手之前的样子先另存一份，换了不管用就原样放回去。
+  # 以前只在“这次新做了备份”时才还原：换过一次 DNS 的机器（备份早就有了）再遇到解析不了，
+  # 文件被改掉、链接被删掉，却不还原。
+  _dfb_cur=/etc/resolv.conf.xray-node-cur
+  rm -f "$_dfb_cur" 2>/dev/null
+  if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+    cp -P /etc/resolv.conf "$_dfb_cur" 2>/dev/null || cp /etc/resolv.conf "$_dfb_cur" 2>/dev/null
+  fi
   _dfb_new=0
   if [ ! -e "$_dfb_bak" ] && [ ! -L "$_dfb_bak" ]; then
     if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
@@ -630,15 +649,16 @@ _dns_fix_broken() {
   # 链接（systemd-resolved 的 stub）先拿掉，写成普通文件，别的程序就不会再改回去
   [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
   if ! { for _ds in $_dfb_servers; do printf 'nameserver %s\n' "$_ds"; done; } > /etc/resolv.conf 2>/dev/null; then
-    [ "$_dfb_new" = "1" ] && _resolv_restore "$_dfb_bak"
+    _dfb_undo
     warn "改不了 /etc/resolv.conf（可能被锁住或只读），请到服务商后台把 DNS 改成 1.1.1.1 / 8.8.8.8 后再运行"
     return 1
   fi
   if _dns_broken; then
-    [ "$_dfb_new" = "1" ] && _resolv_restore "$_dfb_bak"
+    _dfb_undo
     warn "换了公共 DNS 还是解析不了，已换回原来的。请检查服务器能不能上网，或联系服务商"
     return 1
   fi
+  rm -f "$_dfb_cur" 2>/dev/null
   # 脚本开头设了 umask 077，新建的文件只有 root 能读；Hysteria2 用普通用户 xray-node 跑，读不到就没法解析域名。
   chmod 644 /etc/resolv.conf 2>/dev/null
   # Alpine 等系统的 dhcpcd 续租时会重新生成 resolv.conf，商家 DHCP 不给 DNS 时只剩几行注释，
@@ -1309,7 +1329,8 @@ _hy_hop_probe() { # _hy_hop_probe <4|6|46>
 install_hop_bin() { # 写出 /usr/local/bin/xray-node-hop。重复运行只覆盖脚本。
   _hb_dir=${XRAY_BIN_DIR:-/usr/local/bin}
   mkdir -p "$_hb_dir" 2>/dev/null || return 1
-  cat > "$_hb_dir/xray-node-hop" <<'HOPEOF' || return 1
+  # 先写到临时文件再换上去：巡检每分钟会跑它，不能让正在跑的旧脚本读到写了一半的内容
+  cat > "$_hb_dir/xray-node-hop.tmp" <<'HOPEOF' || return 1
 #!/bin/sh
 # 端口跳跃转发：把跳跃端口收到的 UDP 包转给节点的主端口。
 #   xray-node-hop up <编号>     打开转发（节点服务启动前自动调用）
@@ -1537,7 +1558,8 @@ esac
 echo "用法：xray-node-hop up|down|check <节点编号>，或 xray-node-hop probe" >&2
 exit 2
 HOPEOF
-  chmod 700 "$_hb_dir/xray-node-hop" || return 1
+  chmod 700 "$_hb_dir/xray-node-hop.tmp" || return 1
+  mv -f "$_hb_dir/xray-node-hop.tmp" "$_hb_dir/xray-node-hop" || return 1
 }
 
 # ---------- 回程路由小程序 xray-node-route ----------
@@ -2788,7 +2810,8 @@ _choose_node_kind() {
 install_expire_bins() { # 写出到点删除脚本和启动包装。重复运行只覆盖脚本，不动节点。
   _eb_bin=${XRAY_BIN_DIR:-/usr/local/bin}
   mkdir -p "$_eb_bin" 2>/dev/null || return 1
-  cat > "$_eb_bin/xray-node-expire" <<'EXPEOF' || return 1
+  # 都先写到临时文件再换上去：定时器每分钟会跑 xray-node-expire，不能让它读到写了一半的脚本
+  cat > "$_eb_bin/xray-node-expire.tmp" <<'EXPEOF' || return 1
 #!/bin/sh
 # 到点后彻底删除定时节点。没有 expire 文件的永久节点不会被碰。
 NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
@@ -2997,7 +3020,7 @@ if [ -d "$NODES_DIR" ]; then
 fi
 exit 0
 EXPEOF
-  cat > "$_eb_bin/xray-node-run" <<'RUNEOF' || return 1
+  cat > "$_eb_bin/xray-node-run.tmp" <<'RUNEOF' || return 1
 #!/bin/sh
 # 启动一个节点。定时节点如果已经到期，先彻底删掉，不再打开端口。
 _id=$1
@@ -3037,7 +3060,7 @@ case "$_core" in
 esac
 exit 1
 RUNEOF
-  cat > "$_eb_bin/xray-node-expire-loop" <<'LOOPEOF' || return 1
+  cat > "$_eb_bin/xray-node-expire-loop.tmp" <<'LOOPEOF' || return 1
 #!/bin/sh
 _here=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 1
 while true; do
@@ -3045,15 +3068,18 @@ while true; do
   sleep 60
 done
 LOOPEOF
-  chmod 700 "$_eb_bin/xray-node-expire" "$_eb_bin/xray-node-expire-loop" || return 1
+  chmod 700 "$_eb_bin/xray-node-expire.tmp" "$_eb_bin/xray-node-expire-loop.tmp" || return 1
   # xray-node-run 要让普通用户 xray-node 也能执行（Hysteria2 用它启动），里面没有任何秘密。
-  chmod 755 "$_eb_bin/xray-node-run" || return 1
+  chmod 755 "$_eb_bin/xray-node-run.tmp" || return 1
+  for _eb_f in xray-node-expire xray-node-run xray-node-expire-loop; do
+    mv -f "$_eb_bin/$_eb_f.tmp" "$_eb_bin/$_eb_f" || return 1
+  done
 }
 
 # 让系统每分钟自动跑一次到点检查。有 systemd 用它的“定时器”（timer），
 # Alpine 用 OpenRC 服务，都没有就用 cron（Linux 自带的定时任务）。
 # 一个节点都没有时（比如只进来开关 IPv6 就退出、或者第一次安装中途失败），
-# 把开头写出的三个定时小脚本删掉，不在系统里留垃圾。
+# 把开头写出的三个定时小脚本，连同巡检、设备数限制、端口跳跃、回程路由这几个小程序一起删掉，不在系统里留垃圾。
 _drop_expire_bins_if_unused() {
   _de_nodes=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
   for _de_d in "$_de_nodes"/*/; do
@@ -3061,6 +3087,8 @@ _drop_expire_bins_if_unused() {
   done
   _de_bin=${XRAY_BIN_DIR:-/usr/local/bin}
   rm -f "$_de_bin/xray-node-expire" "$_de_bin/xray-node-run" "$_de_bin/xray-node-expire-loop"
+  # 巡检、设备数限制、端口跳跃、回程路由这几个小程序也是开头或装到一半时写出来的，没有节点就都用不上
+  rm -f "$_de_bin/xray-node-watch" "$_de_bin/xray-node-limit" "$_de_bin/xray-node-hop" "$_de_bin/xray-node-route"
 }
 
 arm_expire_watch() { # 有定时节点才挂上巡检；没有就卸掉以前留下的巡检。
@@ -3736,9 +3764,10 @@ for u in "$G" "https://cdn.jsdelivr.net/gh/imthnio/VPS-dajianjiedian@main/instal
   [ -s "$F" ] && [ "$n" -ge 2 ] && break
   n=$((n + 1))
   rm -f "$T"
-  { curl -fsSL --connect-timeout 5 -m 30 -o "$T" "$u" || wget -q -T 10 -t 1 -O "$T" "$u" || busybox wget -q -T 10 -O "$T" "$u"; } 2>"$E"
+  # 下载命令自己报成功才认。中途断开时文件只有半截，开头照样是 #!，运行它会装到一半报语法错误。
   l=
-  [ -s "$T" ] && read -r l < "$T"
+  { curl -fsSL --connect-timeout 5 -m 30 -o "$T" "$u" || wget -q -T 10 -t 1 -O "$T" "$u" || busybox wget -q -T 10 -O "$T" "$u"; } 2>"$E" &&
+    [ -s "$T" ] && read -r l < "$T"
   case "$l" in "#!"*) mv -f "$T" "$F"; chmod 700 "$F"; rm -f "$E"; exec sh "$F" "$@" ;; esac
 done
 rm -f "$T"
@@ -4038,7 +4067,8 @@ _uninstall_all() {
   grep -q 'xray-node-gl' /usr/local/bin/gl 2>/dev/null && rm -f /usr/local/bin/gl
   rm -f /usr/local/bin/xray-node-fw-restore
   rm -f /usr/local/bin/xray-node-expire /usr/local/bin/xray-node-run /usr/local/bin/xray-node-expire-loop
-  rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
+  rm -f /usr/local/bin/xray-node-expire.tmp /usr/local/bin/xray-node-run.tmp /usr/local/bin/xray-node-expire-loop.tmp
+  rm -f /usr/local/bin/xray-node-hop /usr/local/bin/xray-node-hop.tmp /usr/local/bin/xray-node-watch /usr/local/bin/xray-node-watch.tmp
   rm -f /usr/local/bin/xray-node-route /usr/local/bin/xray-node-route.tmp
   rm -f /usr/local/bin/xray-node-limit /usr/local/bin/xray-node-limit.tmp
   rm -rf /run/xray-node-hop /run/xray-node-watch /run/xray-node-route /run/xray-node-limit
@@ -6361,7 +6391,9 @@ if [ "$_NODE_COUNT" -gt 0 ]; then
   printf "  5) 关闭或开启 IPv6（不添加节点。关掉后，这台服务器只通过 IPv4 访问网站和 App）\n"
   ask "请选择" "1" _um
   case "$_um" in
-    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; _hy_migrate_hop_all; _hy_fix_existing_ipv6; _fix_existing_json_ipv6; _quic_unblock_all; break ;;
+    # 选 1 只先记下来。改旧节点的那几步放到下面“U. 更新模式”里跑：它们存防火墙规则时要用 _apt_do，
+    # 那个函数在后面“2. 装依赖”才定义，在这里就跑会报 _apt_do: not found。
+    1) UPDATE_MODE=1; HY_IPV6_FIXED=0; break ;;
     2) _choose_node_kind; _KIND_CHOSEN=1; break ;;
     3) write_helper_cmds; sh /usr/local/bin/shanjiedian; exit 0 ;;
     4|n|N|no|NO) echo "已取消"; exit 0 ;;
@@ -6747,6 +6779,12 @@ _update_one_core() (
 # ---------- U. 更新模式：只升级内核，节点配置原样保留 ----------
 # 重跑一键命令选"1"进到这里：不问问题、不改配置，只把各节点用的内核升到最新版。
 if [ "$UPDATE_MODE" = "1" ]; then
+  # 先把旧节点改成新写法（端口跳跃、同时听 IPv6、去掉服务器端拦 QUIC），再升级内核。
+  # 必须在这里跑，不能放在主菜单里：给 IPv6 放行端口后要存防火墙规则，用到上面才定义的 _apt_do。
+  _hy_migrate_hop_all
+  _hy_fix_existing_ipv6
+  _fix_existing_json_ipv6
+  _quic_unblock_all
   step "[更新] 检查已安装的内核版本…"
   # 收集所有节点用到的内核（去重）
   _u_cores=""

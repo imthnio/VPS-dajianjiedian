@@ -19,6 +19,18 @@ for a in "$@"; do
 done
 printf '#!/bin/sh\\necho NEW-MENU "$@"\\n' > "$out"
 """
+# 下到一半断了：文件开头是 #!，但 curl 报失败
+CURL_PARTIAL = """#!/bin/sh
+out=
+prev=
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out=$a; fi
+  prev=$a
+done
+printf '#!/bin/sh\\necho HALF-MENU\\n' > "$out"
+echo 'curl: (18) transfer closed' >&2
+exit 18
+"""
 CURL_FAIL = "#!/bin/sh\necho 'curl: (28) Connection timed out' >&2\nexit 28\n"
 
 
@@ -67,6 +79,17 @@ class GlTest(unittest.TestCase):
         r = self.run_gl(CURL_FAIL)
         self.assertIn("OLD-MENU", r.stdout, r.stdout + r.stderr)
         self.assertIn("本机保存的版本", r.stdout)
+
+    def test_gl_does_not_run_half_downloaded_script(self):
+        self.write_gl()
+        # 机器上真有 wget 的话它会去连网，这里用假的顶掉
+        for name in ("wget", "busybox"):
+            (self.mock / name).write_text("#!/bin/sh\nexit 4\n")
+            (self.mock / name).chmod(0o755)
+        r = self.run_gl(CURL_PARTIAL)
+        self.assertNotIn("HALF-MENU", r.stdout, r.stdout + r.stderr)
+        self.assertIn("OLD-MENU", r.stdout, r.stdout + r.stderr)
+        self.assertNotIn("HALF-MENU", self.cache.read_text())
 
     def test_gl_without_any_copy_shows_error(self):
         self.write_gl()

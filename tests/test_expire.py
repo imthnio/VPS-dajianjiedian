@@ -1176,9 +1176,31 @@ class InstalledMenuTest(unittest.TestCase):
         for answers in ("\n", "1\n", "  1 \n", "   \n"):
             result = self.run_menu(answers)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            self.assertIn("UPDATED", result.stdout)
             self.assertIn("MODE 1", result.stdout)
             self.assertNotIn("WARN", result.stdout)
+            # 改旧节点的那几步不在菜单里跑（那时 _apt_do 还没定义），留到更新模式里
+            self.assertNotIn("UPDATED", result.stdout)
+
+    def test_update_fixes_run_after_apt_helper_is_defined(self):
+        # _hy_fix_existing_ipv6 / _fix_existing_json_ipv6 给 IPv6 放行端口后要存防火墙规则，
+        # 纯 iptables 的 Debian 上会调 _apt_do。以前它们在主菜单里就跑，那时 _apt_do 还没定义。
+        source = source_text()
+        defined = source.index("\n_pkg_add() {")
+        self.assertLess(source.index("\n_apt_do() {"), defined)
+        self.assertLess(source.index("\n_timeout_cmd() {"), defined)
+        block = source.index('\nif [ "$UPDATE_MODE" = "1" ]; then\n')
+        self.assertLess(defined, block)
+        for call in ("_hy_migrate_hop_all", "_hy_fix_existing_ipv6", "_fix_existing_json_ipv6", "_quic_unblock_all"):
+            pos = source.index("\n  " + call + "\n")
+            self.assertLess(block, pos, call)
+            self.assertLess(pos, source.index('step "[更新] 检查已安装的内核版本…"'), call)
+            # 别处不能再有“定义之前就调用”的地方
+            first = source.index(call + "() {")
+            for other in [i for i in range(len(source)) if source.startswith(call, i)]:
+                line = source[source.rfind("\n", 0, other) + 1:source.index("\n", other)]
+                if other == first or line.lstrip().startswith("#") or "() {" in line:
+                    continue
+                self.assertGreater(other, defined, line)
 
 
 class ChoiceRetryTest(unittest.TestCase):
