@@ -414,15 +414,17 @@ class InstallPromptTest(unittest.TestCase):
         self.assertNotIn("sh <<'EOF'", readme)
         start = readme.index("```bash\n") + len("```bash\n")
         block = readme[start:readme.index("\n```", start)]
-        lines = [
-            line for line in block.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
+        # 代码框里只能有这一行命令，连注释行都不能有：GitHub 的复制按钮会把整个代码框复制走，
+        # 多出来的行粘贴后要么被当成对安装提问的回答，要么掉进 > 提示符。
+        lines = block.splitlines()
         self.assertEqual(len(lines), 1, block)
         command = lines[0]
         self.assertIn("/tmp/xray-install.sh", command)
-        # 终端一行最多收 4096 字节，超过会被截断（粘贴后卡在 > 提示符）。留足余量。
-        self.assertLess(len(command.encode()), 2400)
+        # Alpine 的 busybox ash 一行最多收 2046 个字符（实测 Alpine 3.20，中文算 1 个），
+        # 超出的部分直接丢掉，命令没收尾，粘贴后卡在 > 提示符，看起来就是“运行到一半卡住”。
+        # 以前限制的是 2400 字节，命令长到 2110 个字符时测试照样通过。留足余量。
+        self.assertLess(len(command), 1800)
+        self.assertLess(len(command.encode()), 1900)
         self.assertNotIn("<<", command)
         self.assertIn(
             'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"',
