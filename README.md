@@ -1,6 +1,6 @@
 # 小白一键搭建代理节点
 
-> 想改代码、加功能或排查故障（人或 AI 都一样）：**每次动手前，先读完 [AGENTS.md](AGENTS.md) 和 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。**
+> 想改代码、加功能或排查故障（人或 AI 都一样）：**每次动手前，先读完 [AGENTS.md](AGENTS.md)。**
 
 在你自己的服务器（VPS）上一键安装 Xray 节点，全程中文提问，看不懂就一路回车用默认。
 
