@@ -168,7 +168,8 @@ _hop_taken() {
     for _ht_p in $_ht_list; do
       case "$_ht_p" in ''|*[!0-9-]*) continue ;; esac
       _ht_a=${_ht_p%-*}; _ht_b=${_ht_p#*-}
-      case "$_ht_a$_ht_b" in ''|*[!0-9]*) continue ;; esac
+      case "$_ht_a" in ''|*[!0-9]*) continue ;; esac
+      case "$_ht_b" in ''|*[!0-9]*) continue ;; esac
       if [ "$1" -le "$_ht_b" ] && [ "$2" -ge "$_ht_a" ]; then
         printf '%s' "$_ht_id"
         return 0
@@ -313,6 +314,7 @@ _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
       _vs="$1"
       _vs_n=0
       [ -n "$_vs" ] || return 0
+      case "$_vs" in :*|*:) return 1 ;; esac
       _vs_rest=$_vs
       while [ -n "$_vs_rest" ]; do
         _vs_g=${_vs_rest%%:*}
@@ -500,7 +502,11 @@ _http_save_raw() {
     return $?
   fi
   if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
-    busybox wget -O "$_hs_out" -T 30 "$_hs_url"
+    if [ -n "$_hs_hdr" ]; then
+      busybox wget -O "$_hs_out" -T 30 --header "$_hs_hdr" "$_hs_url"
+    else
+      busybox wget -O "$_hs_out" -T 30 "$_hs_url"
+    fi
     return $?
   fi
   return 127
@@ -536,15 +542,19 @@ _no_ipv4_route() {
 _dns64_on() {
   [ "$_DNS64_ON" = "1" ] && return 0
   _no_ipv4_route || return 1
-  [ -e /etc/resolv.conf.xray-node-bak ] && return 1
+  if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ]; then
+    return 1
+  fi
   if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
-    mv -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null || return 1
+    mv -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null ||
+      cp -P /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null || return 1
   else
     : > /etc/resolv.conf.xray-node-bak.none 2>/dev/null || return 1
   fi
   {
     for _ds in $DNS64_SERVERS; do printf 'nameserver %s\n' "$_ds"; done
   } > /etc/resolv.conf 2>/dev/null || { _DNS64_ON=1; _dns64_off; return 1; }
+  chmod 644 /etc/resolv.conf 2>/dev/null || true
   _DNS64_ON=1
   trap '_dns64_off; exit 130' INT TERM HUP
   warn "直连和镜像都不通，临时换成公共 NAT64/DNS64 再试（下载完马上换回原来的 DNS）"
@@ -554,8 +564,13 @@ _dns64_on() {
 _dns64_off() {
   [ "$_DNS64_ON" = "1" ] || return 0
   if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ]; then
-    rm -f /etc/resolv.conf
-    mv -f /etc/resolv.conf.xray-node-bak /etc/resolv.conf 2>/dev/null
+    if rm -f /etc/resolv.conf 2>/dev/null && mv -f /etc/resolv.conf.xray-node-bak /etc/resolv.conf 2>/dev/null; then
+      :
+    else
+      cat /etc/resolv.conf.xray-node-bak > /etc/resolv.conf 2>/dev/null &&
+        chmod 644 /etc/resolv.conf 2>/dev/null &&
+        rm -f /etc/resolv.conf.xray-node-bak
+    fi
   elif [ -e /etc/resolv.conf.xray-node-bak.none ]; then
     rm -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak.none
   fi
@@ -566,7 +581,7 @@ _dns64_off() {
 
 # 上次脚本被强行关掉、DNS 没来得及换回时，这次开头先换回去。
 _dns64_recover() {
-  if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ]; then
+  if [ -e /etc/resolv.conf.xray-node-bak ] || [ -L /etc/resolv.conf.xray-node-bak ] || [ -e /etc/resolv.conf.xray-node-bak.none ]; then
     _DNS64_ON=1
     _dns64_off
   fi
@@ -866,6 +881,8 @@ wait_for_port() {
 _save_fw_light() {
   cat > /usr/local/bin/xray-node-fw-restore <<'FWEOF' || return 1
 #!/bin/sh
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
 _restore_failed=0
 for _fw in "$NODES_DIR"/*/fw_info; do
@@ -1507,6 +1524,21 @@ _up() {
 }
 
 _check() {
+  _st=""
+  [ -f "$STATE_DIR/$id" ] && _st=$(tr -d '\r\n' < "$STATE_DIR/$id" 2>/dev/null || true)
+  if [ "$_st" = "nft 46" ] && command -v nft >/dev/null 2>&1; then
+    nft list table ip "$TABLE" 2>/dev/null | grep -q "redirect to :$main" &&
+      nft list table ip6 "$TABLE" 2>/dev/null | grep -q "redirect to :$main" && return 0
+    return 1
+  fi
+  if [ "$_st" = "iptables 46" ]; then
+    command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1 || return 1
+    iptables -w -t nat -S PREROUTING 2>/dev/null | grep -q -- "-j ${CHAIN}\$" &&
+      iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -q -- "--to-ports $main" &&
+      ip6tables -w -t nat -S PREROUTING 2>/dev/null | grep -q -- "-j ${CHAIN}\$" &&
+      ip6tables -w -t nat -S "$CHAIN" 2>/dev/null | grep -q -- "--to-ports $main" && return 0
+    return 1
+  fi
   if command -v nft >/dev/null 2>&1; then
     for _f in inet ip ip6; do
       nft list table "$_f" "$TABLE" 2>/dev/null | grep -q "redirect to :$main" && return 0
@@ -1750,8 +1782,12 @@ _sync() {
   _want "$_f"; _w=$?
   if [ "$_w" = "0" ]; then
     if [ "$_cnt" = "1" ] && [ "${_cur#* }" = "$want_table" ]; then
-      [ "$2" = "up" ] && _state_put "$_f" ok "${_cur%% *}" "$want_table" "$want_dev" "$port" "$nat_dev"
-      return 0
+      if [ "$_f" = "6" ]; then _probe=$PROBE6; else _probe=$PROBE4; fi
+      _got=$(_kw dev "$(ip "-$_f" route get "$_probe" ipproto udp sport "$port" 2>/dev/null | head -1)")
+      if [ "$_got" = "$want_dev" ]; then
+        [ "$2" = "up" ] && _state_put "$_f" ok "${_cur%% *}" "$want_table" "$want_dev" "$port" "$nat_dev"
+        return 0
+      fi
     fi
     # 内核太老加不上：记下来，巡检不再每分钟重试
     if [ "$_cnt" = "0" ] && [ "$(_state_get "$_f" | awk '{ print $2 }')" = "old" ]; then return 0; fi
@@ -2566,20 +2602,23 @@ _ipv6_rebind_nodes() {
               _newlisten="0.0.0.0:${_port}"
               [ -n "$_hop" ] && _newlisten="${_newlisten},${_hop}"
               cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
+              [ -f "${_d}hop" ] && cp -a "${_d}hop" "${_d}hop.bak-ipv6off" 2>/dev/null
               if _hy_set_listen "$_cfg" "$_newlisten"; then
                 # 端口跳跃也改成只转发 IPv4
                 [ -f "${_d}hop" ] && sed -i 's/^family=.*/family=4/' "${_d}hop" 2>/dev/null
                 _svc_restart "$_id"
                 if wait_for_port "$_port" udp 15; then
-                  rm -f "${_cfg}.bak-ipv6off"
+                  rm -f "${_cfg}.bak-ipv6off" "${_d}hop.bak-ipv6off"
                   info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
                 else
                   mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+                  [ -f "${_d}hop.bak-ipv6off" ] && mv -f "${_d}hop.bak-ipv6off" "${_d}hop"
                   _svc_restart "$_id"
                   warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
                 fi
               else
                 mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+                rm -f "${_d}hop.bak-ipv6off"
                 warn "节点 ${_id} 的监听地址没改成"
               fi
               ;;
@@ -2689,11 +2728,12 @@ _ipv6_turn_off() {
     return 0
   fi
   # 文件能写，不代表写进去的值会留下来。先试一次；读不回来就不要改节点。
-  # 试写会立刻关掉 IPv6。忽略挂断，把原值写回后再改节点，避免连上的会话一断脚本就停。
+  # 试写会立刻关掉 IPv6，如果用户是用 IPv6 SSH 连上来的，会话随后会断开并收到 SIGHUP。
+  # 整个关闭过程都忽略 HUP，确保改节点、写开机配置、最终关闭、清链接都能做完，再恢复默认处理。
+  trap '' HUP
   if [ -f "$_root/all/disable_ipv6" ]; then
     _iv_old=$(tr -d ' \r\n' 2>/dev/null < "$_root/all/disable_ipv6" || true)
     if [ "$_iv_old" != "1" ]; then
-      trap '' HUP
       if ! _ipv6_apply 1; then
         trap - HUP
         warn "系统不允许修改 IPv6 设置（有些容器被服务商锁住）。IPv6 保持开着，节点也没有改动。"
@@ -2702,7 +2742,6 @@ _ipv6_turn_off() {
       if [ "$_iv_old" = "0" ]; then
         _ipv6_apply 0 || true
       fi
-      trap - HUP
     fi
   fi
   _ipv6_rebind_nodes
@@ -2712,6 +2751,7 @@ _ipv6_turn_off() {
   _root=${XRAY_IPV6_PROC:-/proc/sys/net/ipv6/conf}
   if [ ! -d "$_root" ]; then
     _ipv6_strip_links
+    trap - HUP
     info "这台服务器现在没有 IPv6。已经记下：以后也不使用 IPv6。"
     return 0
   fi
@@ -2722,6 +2762,7 @@ _ipv6_turn_off() {
   else
     warn "系统没有允许马上关闭 IPv6。有些容器会被服务商锁住，脚本改不了。"
   fi
+  trap - HUP
 }
 
 _ipv6_turn_on() {
@@ -2817,6 +2858,8 @@ install_expire_bins() { # 写出到点删除脚本和启动包装。重复运行
   cat > "$_eb_bin/xray-node-expire.tmp" <<'EXPEOF' || return 1
 #!/bin/sh
 # 到点后彻底删除定时节点。没有 expire 文件的永久节点不会被碰。
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
 LOG=${XRAY_EXPIRE_LOG:-/var/log/xray-node-expire.log}
 LOCK=${XRAY_EXPIRE_LOCK:-/run/xray-node-expire.lock}
@@ -2918,8 +2961,12 @@ _stop_inside() {
   rm -f "$WANTS/xray-node@${_x_id}.service" \
     "$WANTS/hysteria-node@${_x_id}.service" \
     "$WANTS/singbox-node@${_x_id}.service" \
-    "$RUNLEVEL/xray-node-${_x_id}" \
-    "$INITD/xray-node-${_x_id}"
+    "$RUNLEVEL/xray-node-${_x_id}"
+  if [ -f "$INITD/xray-node-${_x_id}" ] && command -v rc-service >/dev/null 2>&1; then
+    (sleep 1; rc-service "xray-node-${_x_id}" stop >/dev/null 2>&1 || true; rm -f "$INITD/xray-node-${_x_id}") >/dev/null 2>&1 &
+  else
+    rm -f "$INITD/xray-node-${_x_id}"
+  fi
 }
 
 _delete_node() {
@@ -3014,11 +3061,18 @@ if [ -d "$NODES_DIR" ]; then
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
     if [ -f "$INITD/xray-node-expire" ] && command -v rc-update >/dev/null 2>&1; then
-      rc-service xray-node-expire stop >/dev/null 2>&1 || true
       rc-update del xray-node-expire default >/dev/null 2>&1 || true
+      trap '' TERM
+      rc-service xray-node-expire stop >/dev/null 2>&1 || true
       rm -f "$INITD/xray-node-expire"
     fi
     rm -f "${XRAY_CRON_DIR:-/etc/cron.d}/xray-node-expire"
+    _pidf=${XRAY_EXPIRE_PID:-/run/xray-node-expire.pid}
+    if [ -f "$_pidf" ]; then
+      _oldp=$(tr -d ' \r\n' 2>/dev/null < "$_pidf" || true)
+      case "$_oldp" in ''|*[!0-9]*) ;; *) kill "$_oldp" >/dev/null 2>&1 || true ;; esac
+      rm -f "$_pidf"
+    fi
   fi
 fi
 exit 0
@@ -3186,10 +3240,15 @@ EOF
     rm -f "$_aw_cron/xray-node-expire"
     return 0
   fi
+  _aw_pid=${XRAY_EXPIRE_PID:-/run/xray-node-expire.pid}
   if [ "$_aw_need" != "1" ]; then
+    if [ -f "$_aw_pid" ]; then
+      _aw_old=$(tr -d ' \r\n' 2>/dev/null < "$_aw_pid" || true)
+      case "$_aw_old" in ''|*[!0-9]*) ;; *) kill "$_aw_old" >/dev/null 2>&1 || true ;; esac
+      rm -f "$_aw_pid"
+    fi
     return 0
   fi
-  _aw_pid=${XRAY_EXPIRE_PID:-/run/xray-node-expire.pid}
   if [ -f "$_aw_pid" ]; then
     _aw_old=$(tr -d ' \r\n' 2>/dev/null < "$_aw_pid" || true)
     case "$_aw_old" in
@@ -3796,6 +3855,8 @@ cat > /usr/local/bin/jiedian <<'JDEOF'
 #!/bin/sh
 # 输入 jiedian：每个节点只显示两样，通用链接和 Loon 行
 # 输入 jiedian all：显示每个节点的完整参数（端口、密码、Surge / Clash 配置等）
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
@@ -3850,6 +3911,8 @@ chmod 700 /usr/local/bin/jiedian
 cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
 # 输入 shanjiedian，进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
+PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
@@ -4364,7 +4427,15 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true"
   fi
-  [ "$_si_core" = "hysteria" ] && _hy_perms "$_si_id" "$_si_user"
+  if [ "$_si_core" = "hysteria" ]; then
+    _hy_perms "$_si_id" "$_si_user"
+    if [ "$_si_user" = "xray-node" ]; then
+      for _si_d in /etc/xray-node/nodes/*/; do
+        [ "$(tr -d ' \r\n' 2>/dev/null < "${_si_d}core")" = "hysteria" ] || continue
+        _hy_perms "$(basename "$_si_d")" "$_si_user"
+      done
+    fi
+  fi
   # 包装脚本在到期时直接退出，避免重启后过期节点又把端口打开。
   if [ -x /usr/local/bin/xray-node-run ]; then
     _si_bin=/usr/local/bin/xray-node-run
@@ -4866,6 +4937,9 @@ _hy_acmesh_issue() {
   else
     _ai_mode="--standalone --httpport 80"
   fi
+  if [ "$IPVER" = "6" ] || _v6_listen_ok; then
+    _ai_mode="${_ai_mode} --listen-v6"
+  fi
   info "正在给 ${HY2_DOMAIN} 申请证书（Let's Encrypt），一般半分钟到一分钟…"
   # shellcheck disable=SC2086
   _timeout_cmd 300 "$ACMESH_HOME/acme.sh" --home "$ACMESH_HOME" --issue -d "$HY2_DOMAIN" \
@@ -5206,7 +5280,7 @@ _cq_kv() { # 读 node.txt 里“名字: 值”那一行的值
 # 老节点的 node.txt 里写着“已在服务器上打开”，换成新说明，并补上 Loon / Surge 行。
 _cq_fix_nodetxt() { # _cq_fix_nodetxt <节点目录>
   _cf_nt="$1/node.txt"
-  grep -q '^拦截 QUIC: \|^想在客户端也拦：' "$_cf_nt" 2>/dev/null || return 0
+  grep -qE '^拦截 QUIC: |^想在客户端也拦：' "$_cf_nt" 2>/dev/null || return 0
   (
     CQ_PROTO=""; CQ_NAME=""; CQ_HOST=""; CQ_PORT=""; CQ_UUID=""; CQ_PASS=""
     CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""; CQ_PIN=""
@@ -5541,9 +5615,18 @@ _fix_existing_json_ipv6() {
     _svc_restart "$_jid"
     if wait_for_port "$_jport" "$_jp" 15 && _port_on_v6 "$_jport" "$_jp"; then
       rm -f "${_jcfg}.bak-ipv6"
-      if command -v ip6tables >/dev/null 2>&1 && ! ip6tables -C INPUT -p "$_jp" --dport "$_jport" -j ACCEPT >/dev/null 2>&1; then
-        _fw_allow "$_jport" "$_jp" 6 "${_jd}fw_info" 0
-        [ "$_IPT_ADDED" = "1" ] && _save_fw 6
+      if command -v ip6tables >/dev/null 2>&1; then
+        _jf_pairs=$(awk '$1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") { k = $1 ":" $2; if (!seen[k]++) print k }' "${_jd}fw_info" 2>/dev/null)
+        _jf_saved=0
+        for _jf_item in $_jf_pairs; do
+          _jfp=${_jf_item%:*}
+          _jfpr=${_jf_item#*:}
+          if ! ip6tables -C INPUT -p "$_jfpr" --dport "$_jfp" -j ACCEPT >/dev/null 2>&1; then
+            _fw_allow "$_jfp" "$_jfpr" 6 "${_jd}fw_info" 0
+            [ "$_IPT_ADDED" = "1" ] && _jf_saved=1
+          fi
+        done
+        [ "$_jf_saved" = "1" ] && _save_fw 6
       fi
       info "节点 $_jid（端口 $_jport）已同时听 IPv4 和 IPv6"
     else
@@ -5663,7 +5746,7 @@ _disk_free_mb() { # _disk_free_mb <路径> -> 该路径所在磁盘剩余 MB
 }
 
 _fstype() { # _fstype <挂载点>
-  awk -v m="$1" '$2==m {print $3; exit}' /proc/mounts 2>/dev/null
+  awk -v m="$1" '$2==m {t=$3} END {if (t != "") print t}' /proc/mounts 2>/dev/null
 }
 
 drop_page_cache() {
@@ -5791,21 +5874,23 @@ prepare_low_memory() {
     rm -f "$_swapf"
   fi
   info "正在做 ${_sw}MB 虚拟内存（做完就能装 Hysteria2）…"
-  _made=0
-  if command -v fallocate >/dev/null 2>&1 && fallocate -l "${_sw}M" "$_swapf" 2>/dev/null; then
-    _made=1
-  else
+  _sw_dd() {
     rm -f "$_swapf"
     _i=0
-    _made=1
     while [ "$_i" -lt "$_sw" ]; do
-      if ! dd if=/dev/zero of="$_swapf" bs=1048576 count=1 seek="$_i" conv=notrunc >/dev/null 2>&1; then
-        _made=0
-        break
-      fi
+      dd if=/dev/zero of="$_swapf" bs=1048576 count=1 seek="$_i" conv=notrunc >/dev/null 2>&1 || return 1
       _i=$((_i + 1))
       if [ $((_i % 8)) -eq 0 ]; then sync; fi
     done
+    return 0
+  }
+  _made=0
+  _used_falloc=0
+  if command -v fallocate >/dev/null 2>&1 && fallocate -l "${_sw}M" "$_swapf" 2>/dev/null; then
+    _made=1
+    _used_falloc=1
+  elif _sw_dd; then
+    _made=1
   fi
   if [ "$_made" != "1" ]; then
     rm -f "$_swapf"
@@ -5815,6 +5900,12 @@ prepare_low_memory() {
   chmod 600 "$_swapf" 2>/dev/null
   if mkswap "$_swapf" >/dev/null 2>&1 && swapon "$_swapf" >/dev/null 2>&1; then
     SWAP_OK=1
+  elif [ "$_used_falloc" = "1" ] && _sw_dd && chmod 600 "$_swapf" 2>/dev/null \
+    && mkswap "$_swapf" >/dev/null 2>&1 && swapon "$_swapf" >/dev/null 2>&1; then
+    # XFS / Btrfs 上 fallocate 建出的空洞文件会被 swapon 拒绝，改用 dd 实写清零再试一次
+    SWAP_OK=1
+  fi
+  if [ "$SWAP_OK" = "1" ]; then
     _fstab_append_swap
     info "虚拟内存已开启（${_sw}MB），重启后也会自动挂上"
   else
@@ -6174,7 +6265,7 @@ printf "同一个菜单里可以关闭 IPv6：关掉之后，这台服务器只�
 
 # ---------- 2b. 架构与路径（更新模式也要用，提前确定） ----------
 # 架构就是 CPU 类型：常见服务器是 x86_64（amd64），也有 ARM。下载内核要选对应的版本。
-mkdir -p /usr/local/bin 2>/dev/null  # 极简系统可能连这个目录都没有
+[ -d /usr/local/bin ] || { mkdir -p /usr/local/bin 2>/dev/null && chmod 755 /usr/local /usr/local/bin 2>/dev/null; }  # 极简系统可能连这个目录都没有
 XRAY_BIN="/usr/local/bin/xray"
 SB_BIN="/usr/local/bin/sing-box"
 HY_BIN="/usr/local/bin/hysteria"
@@ -6914,6 +7005,10 @@ if ! SERVER_IP=$(get_ip "$IPVER"); then
   done
   [ -z "$SERVER_IP" ] && die "没有服务器地址装不了，先去商家后台查一下你的服务器 IP 或域名再来"
 fi
+# 用户经常把 IPv6 连方括号一起粘贴。先剥掉再查地区和拼接链接，避免 curl 报 URL globbing 错或链成 [[地址]]。
+case "$SERVER_IP" in
+  \[*\]) SERVER_IP=${SERVER_IP#\[}; SERVER_IP=${SERVER_IP%\]} ;;
+esac
 info "服务器地址：$SERVER_IP"
 # 填的是域名时，查地区要用它解析出来的 IP。解析不出来不影响安装，只是地区写“未知地区”。
 _geo_ip="$SERVER_IP"
@@ -6931,10 +7026,6 @@ if [ -n "$_geo_ip" ] && _cc=$(_geo_cc "$_geo_ip" "$IPVER"); then
 fi
 [ -n "$NODE_REGION" ] || NODE_REGION="未知地区"
 info "服务器地区：$NODE_REGION"
-# 用户经常把 IPv6 连方括号一起粘贴。这里先剥掉，下面再加一层，避免链成 [[地址]]。
-case "$SERVER_IP" in
-  \[*\]) SERVER_IP=${SERVER_IP#\[}; SERVER_IP=${SERVER_IP%\]} ;;
-esac
 # 按实际地址格式决定链接里是否加方括号（IPv6 必须加 []）
 case "$SERVER_IP" in
   *:*) LINK_IP="[$SERVER_IP]" ;;
@@ -7807,7 +7898,7 @@ case "$PROTO" in
     ;;
   vmess)
     _json="{\"v\":\"2\",\"ps\":\"${NODE_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
-    LINK="vmess://$(printf "%s" "$_json" | b64url)"
+    LINK="vmess://$(printf "%s" "$_json" | base64 2>/dev/null | tr -d '\n')"
     ;;
   ss)
     LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
@@ -8065,12 +8156,16 @@ if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
   info "BBR 已经开启，不用动"
 fi
 if [ "$_BBR_ON" = "0" ]; then
-  # 内核本身支持 BBR：直接 sysctl 打开，立即生效、不用重启、不用下载
+  # 内核本身支持 BBR（多数发行版编成 tcp_bbr 模块，先试着加载一次）：直接 sysctl 打开，立即生效
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
+  fi
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
     if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
       mkdir -p /etc/sysctl.d
       printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-xray-node-bbr.conf
+      chmod 644 /etc/sysctl.d/99-xray-node-bbr.conf 2>/dev/null || true
       if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
         _BBR_ON=1
         info "BBR 已自动开启（立即生效，已写入开机配置）"

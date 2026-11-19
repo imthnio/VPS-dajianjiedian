@@ -58,7 +58,7 @@
   1. **命令太长被截断。** Alpine 的登录 shell 是 busybox ash，它的行编辑器一行最多收 **2046 个字符**（实测 Alpine 3.20，busybox 1.36.1；中文算 1 个字符），多出来的直接丢掉。命令尾巴没了，`case … esac`、`for … done` 没收尾，就停在 `>`。2026-11 实际出过：命令 2110 个字符，被截在 `echo "ping $a 通"` 后面。bash（Debian / Ubuntu / CentOS）没有这个上限，所以只有 Alpine 出问题，很容易漏测。
   2. **命令里有 heredoc（`<<`）或没配对的引号。**
 - **证据怎么拿**：服务器上 `awk '{print length($0)}' ~/.ash_history` 看最后几行长度。正好 2046 就是被截断了。`sed -n '$p' ~/.ash_history | tail -c 200` 能看到截在哪。
-- **怎么改**：缩短 README 里的命令。现在是 1747 个字符，测试限制在 1800 以内（`tests/test_expire.py` 的 `readme_command`）。**往命令里加东西之前先数字符**：`grep '^PATH=' README.md | python3 -c 'import sys; print(len(sys.stdin.read().strip()))'`。超了就砍别的，不要去放宽测试里的上限。
+- **怎么改**：缩短 README 里的命令。现在是 1781 个字符，测试限制在 1800 以内（`tests/test_expire.py` 的 `readme_command`）。**往命令里加东西之前先数字符**：`grep '^PATH=' README.md | python3 -c 'import sys; print(len(sys.stdin.read().strip()))'`。超了就砍别的，不要去放宽测试里的上限。
 - **已经用掉的省字办法**：`;` 后面不留空格；`h(){ q command -v $1; }` 代替重复的 `q command -v`；apt 的两次尝试合成函数 `i`；去掉了 zypper（不在支持列表里）和下载全失败后的 ping 诊断（curl / wget 自己的报错已经说明是解析不了、连不上还是超时）。
 - **还要注意**：命令里不能有 Tab 字符（交互 shell 里会触发补全）；`!` 后面要跟空格或在单引号里（bash 交互模式会把 `!词` 当历史展开）。
 
@@ -258,7 +258,13 @@ README 命令的测试方法：`run_line` 把命令原样取出来，把 PATH �
 
 | 现象 | 根本原因 | 修法 | 教训 |
 |---|---|---|---|
-| Alpine 上粘贴命令后“运行到一半卡住”，停在 `>` | 命令 2110 个字符，busybox ash 一行只收 2046 个，尾巴被丢掉。测试限制的是 2400 字节，依据是“终端一行 4096 字节”，这个依据对 busybox ash 不成立 | 命令缩到 1747 个字符，测试改成限制 1800 个字符 | 上限要在真机上量出来，不能照别处的数字推 |
+| Alpine 下载失败只显示 BusyBox `Usage: wget` 盖住 curl 报错；或带 `ssl_client` 的 busybox wget 仍失败 | `curl` 失败后仍无条件跑 `wget -t 2`，而 busybox wget 不认 `-t` | 有 `curl` 时只跑 `curl`；只有 GNU wget 才传 `-t 2` | 兜底命令不能在主命令失败时无条件覆盖报错；GNU 专有选项要先测再传 |
+| 常规 Debian/Ubuntu/Alma/Alpine 报“当前内核不支持 BBR” | 多数发行版把 `tcp_bbr` 编成模块，加载前不在 `tcp_available_congestion_control` 里 | 检查前先 `modprobe tcp_bbr` | 内核能力检查前要考虑可加载模块 |
+| VMess 中文节点链接在严格客户端导入失败 | `vmess://` 用了 URL-safe 去填充的 `b64url`（`-`/`_` 且无 `=`），标准要求标准 Base64 | `vmess://` 改为 `base64 \| tr -d '\n'` | 协议链接编码要按客户端标准（标准 Base64 vs Base64URL） |
+| 老版 Hysteria2 节点在新增第二个 Hysteria2 节点后重启报 `Permission denied` | 共享模板 `hysteria-node@.service` 切成 `User=xray-node`，但 `_svc_install` 只改了新节点目录权限 | `_svc_install` 切 `xray-node` 时同步给全部已有 Hysteria2 节点调 `_hy_perms` | 改共享 systemd 模板的运行用户时，必须同步迁移所有已有实例的权限 |
+| 纯 IPv6 或带 AAAA 记录的域名申请 Hysteria2 正式证书总是 `Connection refused` | `_hy_acmesh_issue` 没传 `--listen-v6`，`acme.sh` 只听 IPv4 | `IPVER=6` 或 `_v6_listen_ok` 时给 `acme.sh` 加 `--listen-v6` | Let's Encrypt 优先连 AAAA，证书申请监听也要双栈 |
+| 用 IPv6 SSH 关 IPv6 时脚本中途被杀，节点改到一半、IPv6 又开着 | `_ipv6_turn_off` 试写完立刻 `trap - HUP`，还没改节点和写开机配置就收到 SSH 断连的 `SIGHUP` | 整个 `_ipv6_turn_off` 期间保持 `trap '' HUP`，结束前再恢复 | 断开当前连接的操作要把 `HUP` 忽略延续到全部收尾完成 |
+| Alpine 上粘贴命令后“运行到一半卡住”，停在 `>` | 命令 2110 个字符，busybox ash 一行只收 2046 个，尾巴被丢掉。测试限制的是 2400 字节，依据是“终端一行 4096 字节”，这个依据对 busybox ash 不成立 | 命令缩到 1781 个字符，测试改成限制 1800 个字符 | 上限要在真机上量出来，不能照别处的数字推 |
 | 同上，或第一个提问收到一行注释 | README 代码框里有 `#` 注释行，GitHub 复制按钮整框复制 | 代码框只留命令 | 代码框里的每一行用户都会粘贴 |
 | 更新内核后重启，IPv6 防火墙规则丢了 | IPv6 规则没存盘 | `_save_fw` 两个地址族都存 | |
 | 下载到一半断开，半截脚本被运行 | 只看了文件第一行是不是 `#!` | curl / wget 返回非零就不算成功 | 判断“成功”要看退出码，不能只看文件长相 |

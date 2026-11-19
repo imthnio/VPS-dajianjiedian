@@ -620,3 +620,106 @@ class AlpineOpenRCTest(unittest.TestCase):
         self.assertNotIn("skip-cert-verify=true", pinned.stdout)
         old = run_sh(fn + "\n" + env + "CQ_PIN=\n_cq_surge_line")
         self.assertIn("skip-cert-verify=true", old.stdout)
+
+    def test_valid_ip_rejects_trailing_and_leading_colon(self):
+        fn = between("_valid_ip() {", "\n# ---------- 下载工具 ----------")
+        for bad in ("2001:db8::1:", ":2001:db8::1", "2001:db8:0:0:0:0:0:1:"):
+            r = run_sh(f"{fn}\n_valid_ip 6 '{bad}'")
+            self.assertNotEqual(r.returncode, 0, bad)
+        for ok in ("2001:db8::1", "::1", "[2001:db8::1]", "2001:db8:0:0:0:0:0:1"):
+            r = run_sh(f"{fn}\n_valid_ip 6 '{ok}'")
+            self.assertEqual(r.returncode, 0, ok)
+
+    def test_hop_taken_ignores_malformed_single_sided_range(self):
+        fn = between("_hop_taken() {", "\n# 随机挑一个没人用的端口当默认值")
+        with tempfile.TemporaryDirectory() as d:
+            n1 = os.path.join(d, "1")
+            os.makedirs(n1)
+            with open(os.path.join(n1, "hop"), "w") as f:
+                f.write("main=20000\nports=20001-,-20002,30000-30010\n")
+            r = run_sh(f'{fn}\nXRAY_NODES_DIR="{d}"\n_hop_taken 25000 25000')
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertEqual(r.stderr, "")
+            hit = run_sh(f'{fn}\nXRAY_NODES_DIR="{d}"\n_hop_taken 30005 30005')
+            self.assertEqual(hit.returncode, 0)
+            self.assertEqual(hit.stdout, "1")
+
+    def test_vmess_link_uses_standard_base64(self):
+        import base64, json
+        sec = between('# ---------- 13. 生成节点链接 ----------', '# ---------- 14. 保存 + jiedian 命令 ----------')
+        start = sec.index('  vmess)\n')
+        block = sec[start:sec.index('\n  ss)', start)]
+        r = run_sh(
+            'NODE_NAME="未知地区Vmess"\nSERVER_IP="1.2.3.4"\nLINK_PORT="443"\nUUID="11111111-2222-3333-4444-555555555555"\nWS_PATH="/abc"\n'
+            + 'case vmess in\n' + block + '\nesac\nprintf "%s" "$LINK"'
+        )
+        self.assertTrue(r.stdout.startswith("vmess://"), r.stdout)
+        payload = r.stdout[len("vmess://"):]
+        self.assertNotIn("-", payload)
+        self.assertNotIn("_", payload)
+        decoded = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
+        self.assertEqual(decoded["ps"], "未知地区Vmess")
+
+    def test_fstype_returns_last_mount_entry(self):
+        fn = between("_fstype() {", "\n# 64MB / 128MB")
+        with tempfile.TemporaryDirectory() as d:
+            mounts = os.path.join(d, "mounts")
+            with open(mounts, "w") as f:
+                f.write("rootfs / rootfs rw 0 0\ntmpfs / tmpfs rw 0 0\n")
+            patched = fn.replace("/proc/mounts", mounts)
+            self.assertEqual(run_sh(patched + "\n_fstype /").stdout.strip(), "tmpfs")
+            with open(mounts, "w") as f:
+                f.write("tmpfs / tmpfs rw 0 0\n/dev/vda1 / ext4 rw 0 0\n")
+            self.assertEqual(run_sh(patched + "\n_fstype /").stdout.strip(), "ext4")
+
+    def test_audit_regression_invariants(self):
+        source = INSTALLER.read_text()
+        # BBR 先 modprobe tcp_bbr 再查 tcp_available_congestion_control
+        bbr_block = between("# ---------- 14b. BBR 加速", "# ---------- 15. 显示结果")
+        self.assertIn("modprobe tcp_bbr", bbr_block)
+        self.assertLess(bbr_block.index("modprobe tcp_bbr"), bbr_block.index("sysctl -w net.ipv4.tcp_congestion_control=bbr"))
+        # _cq_fix_nodetxt 用 POSIX grep -qE 而非 GNU BRE \|
+        cq_block = between("_cq_fix_nodetxt() {", "\n_cq_strip_xray() {")
+        self.assertIn("grep -qE '^拦截 QUIC: |^想在客户端也拦：'", cq_block)
+        # _hy_acmesh_issue 支持 --listen-v6
+        acme_block = between("_hy_acmesh_issue() {", "\n# ---------- 阻止 QUIC")
+        self.assertIn("--listen-v6", acme_block)
+        # _svc_install 切换 xray-node 时给所有已有 Hysteria2 节点同步权限
+        svc_block = between("_svc_install() {", "\n_svc_restart() {")
+        self.assertIn('for _si_d in /etc/xray-node/nodes/*/; do', svc_block)
+        # _ipv6_turn_off 整个过程都忽略 HUP
+        iv_block = between("_ipv6_turn_off() {", "\n_ipv6_turn_on() {")
+        self.assertLess(iv_block.index("trap '' HUP"), iv_block.index("_ipv6_rebind_nodes"))
+        self.assertGreater(iv_block.rindex("trap - HUP"), iv_block.index("_ipv6_strip_links"))
+        # _ipv6_rebind_nodes 回滚时还原 hop 文件
+        rb_block = between("_ipv6_rebind_nodes() {", "\n_ipv6_persist() {")
+        self.assertIn('hop.bak-ipv6off', rb_block)
+        # 后台脚本与快捷命令都补齐 PATH（追加在后面不覆盖测试 stub）
+        for marker in ("xray-node-fw-restore <<'FWEOF'", "xray-node-expire.tmp\" <<'EXPEOF'",
+                       "jiedian <<'JDEOF'", "shanjiedian <<'XZEOF'"):
+            pos = source.index(marker)
+            self.assertIn('PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"', source[pos:pos + 350], marker)
+        # IPv6 方括号剥离在 _geo_cc 之前
+        ip_block = between("# ---------- 3. 问：IPv4 还是 IPv6", "# ---------- 4. 问：协议")
+        self.assertLess(ip_block.index("SERVER_IP=${SERVER_IP#\\[}"), ip_block.index("_geo_cc"))
+        # _dns64_on 写 resolv.conf 后恢复 644，_dns64_recover 也处理 .none
+        dns64_block = between("_dns64_on() {", "\n# ---------- DNS 坏了")
+        self.assertIn("chmod 644 /etc/resolv.conf", dns64_block)
+        self.assertIn("resolv.conf.xray-node-bak.none", between("_dns64_recover() {", "\n# ---------- DNS 坏了"))
+        # prepare_low_memory 在 fallocate 被 swapon 拒绝时回退到 dd
+        low_block = between("prepare_low_memory() {", "\n# ---------- 下载三个内核")
+        self.assertIn("_used_falloc", low_block)
+        self.assertIn("_sw_dd", low_block)
+        # OpenRC 到点自拆：先 rc-update del 再 trap '' TERM 再 stop；兜底循环也会清 PID
+        exp_block = between("if [ -d \"$NODES_DIR\" ]; then", "\nexit 0\nEXPEOF")
+        self.assertLess(exp_block.index("rc-update del xray-node-expire"), exp_block.index("rc-service xray-node-expire stop"))
+        self.assertIn("trap '' TERM", exp_block)
+        self.assertIn("XRAY_EXPIRE_PID", exp_block)
+
+    def test_readme_command_no_t2_for_busybox_and_keeps_curl_error(self):
+        readme = (INSTALLER.parent / "README.md").read_text()
+        start = readme.index("```bash\n") + len("```bash\n")
+        cmd = readme[start:readme.index("\n```", start)].strip()
+        self.assertIn('if h curl;then curl -fsSL', cmd)
+        self.assertNotIn('-T 15 -t 2', cmd)
+        self.assertIn('-T 15 $T $u', cmd)
