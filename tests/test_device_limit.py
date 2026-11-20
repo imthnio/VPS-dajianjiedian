@@ -129,6 +129,12 @@ class LimitBinTest(unittest.TestCase):
     def test_udp_counts_replied_conntrack_entries_including_port_hopping(self):
         self.node("1", "443 udp 0 0 1 4\n443 tcp 0 0 1 4\n", limit=10, core="hysteria")
         self.tcp("04030201")  # Hysteria2 的 TCP 是伪装网站，不算设备
+        (self.bin / "ip").write_text(
+            "#!/bin/sh\n"
+            "echo '2: eth0    inet 10.0.0.1/24 scope global eth0'\n"
+            "echo '2: eth0    inet6 2001:db8::1/64 scope global'\n"
+        )
+        (self.bin / "ip").chmod(0o755)
         (self.proc / "nf_conntrack").write_text(
             "ipv4     2 udp      17 170 src=9.9.9.9 dst=10.0.0.1 sport=5000 dport=30000 "
             "src=10.0.0.1 dst=9.9.9.9 sport=443 dport=5000 [ASSURED] mark=0 use=2\n"
@@ -138,6 +144,11 @@ class LimitBinTest(unittest.TestCase):
             "src=2001:db8::1 dst=2001:db8:aa:bb:1::2 sport=443 dport=1 [ASSURED] mark=0 use=2\n"
             "ipv4     2 tcp      6 100 ESTABLISHED src=7.7.7.7 dst=10.0.0.1 sport=1 dport=443 "
             "src=10.0.0.1 dst=7.7.7.7 sport=443 dport=1 [ASSURED] mark=0 use=2\n"
+            # 服务器自己往外连别人的 UDP 443（如 QUIC 出站），回包 sport 也是 443，不能把本机自己算成客户端设备
+            "ipv4     2 udp      17 120 src=10.0.0.1 dst=1.1.1.1 sport=51234 dport=443 "
+            "src=1.1.1.1 dst=10.0.0.1 sport=443 dport=51234 [ASSURED] mark=0 use=2\n"
+            "ipv6     10 udp      17 120 src=2001:db8::1 dst=2606:4700:4700::1111 sport=51234 dport=443 "
+            "src=2606:4700:4700::1111 dst=2001:db8::1 sport=443 dport=51234 [ASSURED] mark=0 use=2\n"
         )
         self.run_limit("tick")
         self.assertEqual(self.online(), ["2001:db8:aa:bb::/64", "9.9.9.9"])

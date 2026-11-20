@@ -349,7 +349,10 @@ os.write(fd, b'\x03')
 
 | 现象 | 根本原因 | 修法 | 教训 |
 |---|---|---|---|
-| Alpine 下载失败只显示 BusyBox `Usage: wget` 盖住 curl 报错；或带 `ssl_client` 的 busybox wget 仍失败 | `curl` 失败后仍无条件跑 `wget -t 2`，而 busybox wget 不认 `-t` | 有 `curl` 时只跑 `curl`；只有 GNU wget 才传 `-t 2` | 兜底命令不能在主命令失败时无条件覆盖报错；GNU 专有选项要先测再传 |
+| UDP 443 节点开启 1 台设备限制后，正常用户在访问 QUIC 站点时自己被挤掉 | 服务器自己往外连 UDP 443 时，`nf_conntrack` 的回包 `sport=443`，`_seen` 把服务器本机 IP 当成第二台客户端设备 | `_seen` 先读本机网卡地址，排除 `src` 为本机地址的出站连接 | 解析 `nf_conntrack` 时必须区分客户端入站和本机同端口出站 |
+| Hysteria2 填域名、不开混淆且节点端口选 443（或 80）时，证书到期后续期失败 | `HY_TCP_MASQ=1` 让 Hysteria2 长期占用 TCP `$PORT`，与 `acme.sh` 续期临时监听端口冲突 | `$PORT` 等于 `acme.sh` 验证端口（80 或 443）时不开启 `HY_TCP_MASQ` | 节点 TCP 伪装监听不能占用 ACME 独立验证端口 |
+| 关闭 IPv6 后，以 `xray-node` 普通用户运行的 Hysteria2 读不到 `/etc/gai.conf` | 脚本开头 `umask 077`，新建 `/etc/gai.conf`（及 cron 文件）权限为 `0600` | `_ipv6_gai`、`_ipv6_sysctl_block`、`_ipv6_persist` 和 `/etc/cron.d/*` 写完显式 `chmod 644` | `umask 077` 下写给系统或非 root 进程读的文件必须显式 `chmod 644` |
+| Alpine 下载失败只显示 BusyBox `Usage: wget` 盖住 curl 报错；或带 `ssl_client` 的 busybox wget 仍失败 | `curl` 失败后仍无条件跑 `wget -t 2`（`gl` 里是 `wget -t 1`），而 busybox wget 不认 `-t` | 有 `curl` 时只跑 `curl`；只有 GNU wget 才传 `-t`（README 命令和 `_write_gl_cmd` 同步） | 兜底命令不能在主命令失败时无条件覆盖报错；GNU 专有选项要先测再传 |
 | 常规 Debian/Ubuntu/Alma/Alpine 报“当前内核不支持 BBR” | 多数发行版把 `tcp_bbr` 编成模块，加载前不在 `tcp_available_congestion_control` 里 | 检查前先 `modprobe tcp_bbr` | 内核能力检查前要考虑可加载模块 |
 | VMess 中文节点链接在严格客户端导入失败 | `vmess://` 用了 URL-safe 去填充的 `b64url`（`-`/`_` 且无 `=`），标准要求标准 Base64 | `vmess://` 改为 `base64 \| tr -d '\n'` | 协议链接编码要按客户端标准（标准 Base64 vs Base64URL） |
 | 老版 Hysteria2 节点在新增第二个 Hysteria2 节点后重启报 `Permission denied` | 共享模板 `hysteria-node@.service` 切成 `User=xray-node`，但 `_svc_install` 只改了新节点目录权限 | `_svc_install` 切 `xray-node` 时同步给全部已有 Hysteria2 节点调 `_hy_perms` | 改共享 systemd 模板的运行用户时，必须同步迁移所有已有实例的权限 |

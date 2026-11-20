@@ -400,7 +400,7 @@ class Hy2DomainTest(unittest.TestCase):
         return result.stdout.strip().splitlines()[-1], result.stdout
 
     def test_no_domain_uses_default_self_signed(self):
-        self.assertEqual(self.run_ask("\n")[0], "D= T= H=www.samsung.com")
+        self.assertEqual(self.run_ask("\n")[0], "D= T= H=deb.debian.org")
 
     def test_domain_always_tries_acme_without_dns_precheck(self):
         # 不管解析到哪（CDN、NAT），都直接去申请；URL 形式也认
@@ -415,9 +415,10 @@ class Hy2DomainTest(unittest.TestCase):
         self.assertIn("WARN 这台机器的 TCP 80 和 443 都被别的程序占着", out)
 
     def test_not_a_domain(self):
-        last, out = self.run_ask("abc\n")
-        self.assertEqual(last, "D= T= H=www.samsung.com")
-        self.assertIn("不像域名", out)
+        for bad in ("abc\n", "1.2.3.4\n", "-bad.com\n", "bad-.com\n"):
+            last, out = self.run_ask(bad)
+            self.assertEqual(last, "D= T= H=deb.debian.org", bad)
+            self.assertIn("不像域名", out, bad)
 
     def test_self_signed_cert_and_sni_follow_domain(self):
         source = INSTALLER.read_text()
@@ -678,9 +679,17 @@ class AlpineOpenRCTest(unittest.TestCase):
         bbr_block = between("# ---------- 14b. BBR 加速", "# ---------- 15. 显示结果")
         self.assertIn("modprobe tcp_bbr", bbr_block)
         self.assertLess(bbr_block.index("modprobe tcp_bbr"), bbr_block.index("sysctl -w net.ipv4.tcp_congestion_control=bbr"))
-        # _cq_fix_nodetxt 用 POSIX grep -qE 而非 GNU BRE \|
+        # _cq_fix_nodetxt 和 _apt_do 用 POSIX grep -E 而非 GNU BRE \|
         cq_block = between("_cq_fix_nodetxt() {", "\n_cq_strip_xray() {")
         self.assertIn("grep -qE '^拦截 QUIC: |^想在客户端也拦：'", cq_block)
+        apt_block = between("_apt_do() {", "\n# _dep_fail")
+        self.assertIn('grep -qiE "could not get lock|unable to lock|waiting for.*lock"', apt_block)
+        # _ipv6_gai 在 umask 077 下新建的 gai.conf 必须设为 644，让普通用户 xray-node 也能读
+        gai_block = between("_ipv6_gai() {", "\n_ipv6_boot_unit() {")
+        self.assertIn('chmod 644 "$_gai"', gai_block)
+        # Hysteria2 的 TCP 伪装网站不能抢占 acme.sh 续期要用的端口（80 或 443）
+        hy_cfg_block = between("# ---------- 官方 Hysteria2 配置 ----------", "# ---------- sing-box 配置")
+        self.assertIn('[ "$PORT" != "$_hy_acme_p" ]', hy_cfg_block)
         # _hy_acmesh_issue 支持 --listen-v6
         acme_block = between("_hy_acmesh_issue() {", "\n# ---------- 阻止 QUIC")
         self.assertIn("--listen-v6", acme_block)

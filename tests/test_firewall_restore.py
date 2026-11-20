@@ -252,7 +252,7 @@ class HysteriaLinkTest(unittest.TestCase):
             )
             for _ in range(2):
                 subprocess.run(
-                    ["sh", "-c", "install_expire_bins() { :; }\narm_expire_watch() { :; }\n" + function + "\nwrite_helper_cmds"],
+                    ["sh", "-c", "_write_gl_cmd() { :; }\ninstall_expire_bins() { :; }\narm_expire_watch() { :; }\narm_node_watch() { :; }\narm_device_limit() { :; }\n" + function + "\nwrite_helper_cmds"],
                     check=True,
                 )
             updated = info.read_text().strip()

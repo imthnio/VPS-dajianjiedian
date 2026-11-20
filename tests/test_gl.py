@@ -94,9 +94,43 @@ class GlTest(unittest.TestCase):
     def test_gl_without_any_copy_shows_error(self):
         self.write_gl()
         self.cache.unlink()
+        # 即使机器上有 busybox wget（不认 -t），有 curl 时也只跑 curl，不能用 wget 报错盖住 curl 的真实报错
+        for name in ("wget", "busybox"):
+            (self.mock / name).write_text("#!/bin/sh\necho 'BusyBox: unrecognized option: t' >&2\nexit 1\n")
+            (self.mock / name).chmod(0o755)
         r = self.run_gl(CURL_FAIL)
         self.assertEqual(r.returncode, 1)
         self.assertIn("Connection timed out", r.stdout)
+        self.assertNotIn("unrecognized option", r.stdout)
+
+    def test_gl_busybox_wget_without_curl_does_not_pass_t1(self):
+        self.write_gl()
+        self.cache.unlink()
+        # 模拟没有 curl、只有 busybox wget（带 -V 不输出 GNU Wget，且传 -t 就报错）
+        (self.mock / "wget").write_text(
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do\n"
+            "  [ \"$a\" = \"-V\" ] && { echo 'BusyBox v1.36.1'; exit 0; }\n"
+            "  [ \"$a\" = \"-t\" ] && { echo 'wget: unrecognized option: t' >&2; exit 1; }\n"
+            "done\n"
+            "out=; prev=\n"
+            "for a in \"$@\"; do [ \"$prev\" = \"-O\" ] && out=$a; prev=$a; done\n"
+            "printf '#!/bin/sh\\necho BB-WGET-OK\\n' > \"$out\"\n"
+        )
+        (self.mock / "wget").chmod(0o755)
+        # 用一个没有 curl 的 PATH
+        for tool in ("sh", "dirname", "mkdir", "rm", "mv", "chmod", "head", "grep", "tail", "sed"):
+            p = subprocess.run(["sh", "-c", f"command -v {tool}"], capture_output=True, text=True).stdout.strip()
+            if p and not (self.mock / tool).exists():
+                (self.mock / tool).symlink_to(p)
+        env = dict(self.env)
+        gl_text = (self.bin / "gl").read_text().replace(
+            'PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+            f'PATH="{self.mock}"',
+        )
+        (self.bin / "gl").write_text(gl_text)
+        r = subprocess.run(["/bin/sh", str(self.bin / "gl")], env=env, encoding="utf-8", errors="replace", capture_output=True, timeout=20)
+        self.assertIn("BB-WGET-OK", r.stdout, r.stdout + r.stderr)
 
     def test_foreign_gl_is_not_overwritten(self):
         (self.bin / "gl").write_text("#!/bin/sh\necho someone-else\n")

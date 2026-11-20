@@ -390,11 +390,15 @@ _http_body() { # _http_body [-4|-6] URL -> 正文
     return $?
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -qO- -T 20 $_hb_flag "$_hb_url"
+    if [ -n "$_hb_flag" ]; then
+      wget -qO- -T 20 $_hb_flag "$_hb_url" || wget -qO- -T 20 "$_hb_url"
+    else
+      wget -qO- -T 20 "$_hb_url"
+    fi
     return $?
   fi
   if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
-    busybox wget -qO- -T 20 $_hb_flag "$_hb_url"
+    busybox wget -qO- -T 20 "$_hb_url"
     return $?
   fi
   return 127
@@ -1159,6 +1163,8 @@ _geo_cc() { # _geo_cc <公网 IP> <4|6> -> 两位国家代码
       _gc_out=$(curl -fsSL --max-time 6 --connect-timeout 4 "$_gc_f" -A "curl/8" "$_gc_u" 2>/dev/null)
     elif command -v wget >/dev/null 2>&1; then
       _gc_out=$(wget -qO- -T 6 "$_gc_u" 2>/dev/null)
+    elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx wget; then
+      _gc_out=$(busybox wget -qO- -T 6 "$_gc_u" 2>/dev/null)
     fi
     _gc=$(printf '%s' "$_gc_out" | tr ',{}' '\n\n\n' | awk '
       /"country_code"/ { sub(/.*"country_code"[[:space:]]*:[[:space:]]*"/, ""); sub(/".*/, ""); print; exit }
@@ -2363,6 +2369,7 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root $SELF tick
 EOF
+    chmod 644 "$CRON_DIR/xray-node-watch" 2>/dev/null || true
     return 0
   fi
   # 什么服务管理器都没有：后台循环。已经在跑就不再开第二个。
@@ -2502,6 +2509,7 @@ _ipv6_sysctl_block() { # off|on：改 sysctl.conf 里的标记段，开机时还
       "# xray-node-ipv6 end" >> "$_tmp" || { rm -f "$_tmp"; return 1; }
   fi
   cat "$_tmp" > "$_sc" || { rm -f "$_tmp"; return 1; }
+  chmod 644 "$_sc" 2>/dev/null || true
   rm -f "$_tmp"
 }
 
@@ -2526,6 +2534,8 @@ _ipv6_gai() { # off|on：让程序查地址时先用 IPv4。关掉 IPv6 时写�
     printf '%s\n' "precedence ::ffff:0:0/96  100  # xray-node-ipv6" >> "$_tmp" || { rm -f "$_tmp"; return 1; }
   fi
   cat "$_tmp" > "$_gai" || { rm -f "$_tmp"; return 1; }
+  # 脚本开头设了 umask 077，新建的 /etc/gai.conf 必须让普通用户（如 xray-node）也能读
+  chmod 644 "$_gai" 2>/dev/null || true
   rm -f "$_tmp"
 }
 
@@ -2671,6 +2681,7 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
+    chmod 644 "$_conf" 2>/dev/null || true
   else
     rm -f "$_conf"
   fi
@@ -3234,6 +3245,7 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root ${_aw_expire}
 EOF
+      chmod 644 "$_aw_cron/xray-node-expire" 2>/dev/null || true
       return 0
     fi
     rm -f "$_aw_cron/xray-node-expire"
@@ -3352,6 +3364,9 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
     done
     # UDP 没有“连接”，要看防火墙的连接跟踪表（端口跳跃转发过来的也在里面）
     if grep -q ' udp$' "$1"; then
+      if command -v ip >/dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); if (a[1] != "") print "L", a[1] }'
+      fi
       if [ -r "$PROC_NET/nf_conntrack" ]; then
         sed 's/^/U /' "$PROC_NET/nf_conntrack"
       elif command -v conntrack >/dev/null 2>&1; then
@@ -3387,6 +3402,7 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
       n = split(ports, P, " ")
       for (i = 1; i < n; i += 2) want[P[i + 1] " " P[i]] = 1
     }
+    $1 == "L" { loc[tolower($2)] = 1; next }
     # /proc/net/tcp：本机地址:端口、对方地址:端口、状态（01 = 已连上），都是十六进制
     $1 == "T" {
       if ($5 != "01") next
@@ -3408,6 +3424,7 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
       next
     }
     # 连接跟踪：第一个 src= 是客户端；第二个 sport= 是服务器回包用的端口，也就是节点主端口
+    # 排除本机自己往外连同号 UDP 端口（比如节点本身用 UDP 443，服务器又往外连别人的 UDP 443）
     $1 == "U" {
       u = 0; for (i = 2; i <= 5; i++) if ($i == "udp") u = 1
       if (!u) next
@@ -3417,7 +3434,7 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
         if (src == "" && $i ~ /^src=/) src = substr($i, 5)
         if ($i ~ /^sport=/) { sp++; if (sp == 2) rs = substr($i, 7) }
       }
-      if (rs != "" && (("udp " rs) in want)) text(src)
+      if (rs != "" && (("udp " rs) in want) && !(tolower(src) in loc)) text(src)
     }'
 }
 
@@ -3741,6 +3758,7 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root $SELF ensure
 EOF
+    chmod 644 "$CRON_DIR/xray-node-limit" 2>/dev/null || true
     _ensure
     return 0
   fi
@@ -3819,15 +3837,26 @@ E="$F.err"
 G=${XRAY_GL_URL:-https://raw.githubusercontent.com/imthnio/VPS-dajianjiedian/main/install.sh}
 mkdir -p "$(dirname "$F")" 2>/dev/null
 echo "正在获取最新的脚本…（连不上会用本机保存的那份）"
+W=wget
+command -v wget >/dev/null 2>&1 || W="busybox wget"
+R=
+if ! command -v curl >/dev/null 2>&1; then
+  wget -V 2>&1 | grep -q "GNU Wget" && R="-t 1"
+fi
 n=0
-for u in "$G" "https://cdn.jsdelivr.net/gh/imthnio/VPS-dajianjiedian@main/install.sh" "https://v6.gh-proxy.org/$G" "https://gh.llkk.cc/$G"; do
+for u in "$G" "https://cdn.jsdelivr.net/gh/imthnio/VPS-dajianjiedian@main/install.sh" "https://v6.gh-proxy.org/$G" "https://gh.llkk.cc/$G" "https://ghproxy.net/$G"; do
   # 本机已经有一份时只试两个网址，别让人干等
   [ -s "$F" ] && [ "$n" -ge 2 ] && break
   n=$((n + 1))
   rm -f "$T"
   # 下载命令自己报成功才认。中途断开时文件只有半截，开头照样是 #!，运行它会装到一半报语法错误。
+  # 有 curl 时只跑 curl（不退回 wget 覆盖报错）；只有 GNU wget 才传 -t 1（busybox wget 不认 -t）。
   l=
-  { curl -fsSL --connect-timeout 5 -m 30 -o "$T" "$u" || wget -q -T 10 -t 1 -O "$T" "$u" || busybox wget -q -T 10 -O "$T" "$u"; } 2>"$E" &&
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 -m 30 -o "$T" "$u"
+  else
+    $W -q -T 10 $R -O "$T" "$u"
+  fi 2>"$E" &&
     [ -s "$T" ] && read -r l < "$T"
   case "$l" in "#!"*) mv -f "$T" "$F"; chmod 700 "$F"; rm -f "$E"; exec sh "$F" "$@" ;; esac
 done
@@ -4817,9 +4846,9 @@ _hy_ask_bw() {
 # 不在这里预先判断解析对不对、是不是 NAT：猜错了会把能申请的域名挡掉（比如开了 CDN 小云朵，
 # 用 80 端口照样能申请）。直接去申请，申请不下来再自动改用自签证书。
 # 自签证书也签给你的域名：客户端 SNI 填你的域名，证书指纹锁定照样能用。
-# 没填域名就用自签证书 + www.samsung.com。
+# 没填域名就用自签证书 + deb.debian.org。
 _hy_ask_domain() {
-  HY2_DOMAIN=""; HY2_ACME_TYPE=""; HY2_CERT_HOST="www.samsung.com"
+  HY2_DOMAIN=""; HY2_ACME_TYPE=""; HY2_CERT_HOST="deb.debian.org"
   printf "\n有没有解析到这台服务器的域名？\n"
   printf "有的话填上，自动给它申请正规证书；没有就直接回车，用自签证书加证书指纹，一样安全。\n"
   ask "你的域名（没有就回车）" "" _hy_dom
@@ -4831,8 +4860,13 @@ _hy_ask_domain() {
     return 0
   fi
   case "$_hy_dom" in
-    *[!a-z0-9.-]*|.*|*..*|*.*.*.*.*.*.*.*.*) _hy_dom_bad=1 ;;
-    *.*) _hy_dom_bad=0 ;;
+    *[!a-z0-9.-]*|.*|-*|*-|*..*|*.-*|*-.*|*.*.*.*.*.*.*.*.*) _hy_dom_bad=1 ;;
+    *.*)
+      case "${_hy_dom##*.}" in
+        *[a-z]*) _hy_dom_bad=0 ;;
+        *) _hy_dom_bad=1 ;;
+      esac
+      ;;
     *) _hy_dom_bad=1 ;;
   esac
   if [ "$_hy_dom_bad" = "1" ]; then
@@ -4921,14 +4955,22 @@ _hy_acmesh_in_use() { # 别的节点在用这个域名的 acme.sh 证书吗
 # 申请成功：证书和私钥复制到节点目录，返回 0。失败返回 1，节点目录里还是自签证书。
 _hy_acmesh_issue() {
   _hy_acmesh_get || { warn "acme.sh 没下载下来"; return 1; }
-  # acme.sh 自己临时开个小网站给 Let's Encrypt 验证，要 socat 或 python
-  if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
-    && ! command -v python >/dev/null 2>&1; then
-    _pkg_add "正在安装 socat（申请证书时用）" socat
+  # acme.sh 自己临时开个小网站给 Let's Encrypt 验证：80 端口用 socat 或 python，443 端口（--alpn）和签发密钥用 openssl
+  if ! command -v openssl >/dev/null 2>&1; then
+    _pkg_add "正在安装 openssl（申请证书时用）" openssl
   fi
-  if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
-    && ! command -v python >/dev/null 2>&1; then
-    warn "socat 没装上，申请不了证书"
+  if [ "$HY2_ACME_TYPE" != "tls" ]; then
+    if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
+      && ! command -v python >/dev/null 2>&1; then
+      _pkg_add "正在安装 socat（申请证书时用）" socat
+    fi
+    if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
+      && ! command -v python >/dev/null 2>&1; then
+      warn "socat 没装上，申请不了证书"
+      return 1
+    fi
+  elif ! command -v openssl >/dev/null 2>&1; then
+    warn "openssl 没装上，申请不了证书"
     return 1
   fi
   if [ "$HY2_ACME_TYPE" = "tls" ]; then
@@ -5001,7 +5043,7 @@ obfs:
     _hy_masq="masquerade:
   type: proxy
   proxy:
-    url: https://www.samsung.com/
+    url: https://deb.debian.org/
     rewriteHost: true"
     # 有正规证书时，同一个端口的 TCP 也开一个 HTTPS 网站：真网站都是 TCP 和 UDP 一起开的。
     if [ -n "$HY2_DOMAIN" ] && [ "$HY_TCP_MASQ" = "1" ]; then
@@ -6594,7 +6636,7 @@ _apt_do() {
       _timeout_cmd 120 dpkg --configure -a >"$_dep_log" 2>&1 || true
       continue
     fi
-    if grep -qi "could not get lock\|unable to lock\|waiting for.*lock" "$_dep_log" 2>/dev/null; then
+    if grep -qiE "could not get lock|unable to lock|waiting for.*lock" "$_dep_log" 2>/dev/null; then
       _an=$((_an + 1))
       printf "系统自动更新正占着软件源，20 秒后重试（%s/10）…\n" "$_an"
       sleep 20
@@ -7152,7 +7194,7 @@ HY_HOP_PORTS=""
 HY2_USE_OBFS=1
 HY2_DOMAIN=""
 HY2_ACME_TYPE=""
-HY2_CERT_HOST="www.samsung.com"
+HY2_CERT_HOST="deb.debian.org"
 HY2_PUBPIN=""
 HY2_BW_DOWN=""
 HY2_BW_UP=""
@@ -7180,6 +7222,15 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   printf "  9) www.lovelive-anime.jp（日本动画官网，小众）\n"
   printf " 10) academy.nvidia.com（英伟达学院，备选用）\n"
   printf " 11) lol.secure.dyn.riotcdn.net（游戏补丁 CDN，备选用）\n"
+  printf " 12) dl-cdn.alpinelinux.org（Alpine 软件源 CDN）\n"
+  printf " 13) deb.debian.org（Debian 软件源）\n"
+  printf " 14) crates.io（Rust 包仓库）\n"
+  printf " 15) pypi.org（Python 包仓库）\n"
+  printf " 16) rubygems.org（Ruby 包仓库）\n"
+  printf " 17) addons.mozilla.org（火狐扩展商店）\n"
+  printf " 18) formulae.brew.sh（Homebrew 软件列表）\n"
+  printf " 19) static.rust-lang.org（Rust 官方下载站）\n"
+  printf " 20) cpan.org（Perl 包仓库）\n"
   printf "不知道选哪个就回车用默认 1。\n"
   while true; do
     ask "请选择" "1" _dm
@@ -7195,6 +7246,15 @@ if [ "$NEED_REALITY" -eq 1 ]; then
       9)  REALITY_DOMAIN="www.lovelive-anime.jp"; break ;;
       10) REALITY_DOMAIN="academy.nvidia.com"; break ;;
       11) REALITY_DOMAIN="lol.secure.dyn.riotcdn.net"; break ;;
+      12) REALITY_DOMAIN="dl-cdn.alpinelinux.org"; break ;;
+      13) REALITY_DOMAIN="deb.debian.org"; break ;;
+      14) REALITY_DOMAIN="crates.io"; break ;;
+      15) REALITY_DOMAIN="pypi.org"; break ;;
+      16) REALITY_DOMAIN="rubygems.org"; break ;;
+      17) REALITY_DOMAIN="addons.mozilla.org"; break ;;
+      18) REALITY_DOMAIN="formulae.brew.sh"; break ;;
+      19) REALITY_DOMAIN="static.rust-lang.org"; break ;;
+      20) REALITY_DOMAIN="cpan.org"; break ;;
       *) warn "没有这个选项，请重新选择" ;;
     esac
   done
@@ -7543,7 +7603,8 @@ quic:
   maxIncomingStreams: 16"
 fi
 HY_TCP_MASQ=0
-if [ -n "$HY2_DOMAIN" ] && [ "$HY2_USE_OBFS" != "1" ] && ! port_in_use "$PORT" tcp; then
+if [ "$HY2_ACME_TYPE" = "tls" ]; then _hy_acme_p=443; else _hy_acme_p=80; fi
+if [ -n "$HY2_DOMAIN" ] && [ "$HY2_USE_OBFS" != "1" ] && [ "$PORT" != "$_hy_acme_p" ] && ! port_in_use "$PORT" tcp; then
   HY_TCP_MASQ=1
 fi
 _hy_write_config

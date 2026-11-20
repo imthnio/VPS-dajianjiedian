@@ -1247,11 +1247,24 @@ class ChoiceRetryTest(unittest.TestCase):
     def test_domain_unknown_is_asked_again(self):
         block = between('  while true; do\n    ask "请选择" "1" _dm', '\n  info "伪装域名：')
         trailer = "\nprintf 'DOMAIN %s\\n' \"$REALITY_DOMAIN\"\n"
-        bad = self.run_choice(block, "12\n3\n", trailer)
+        bad = self.run_choice(block, "21\n3\n", trailer)
         self.assertIn("WARN 没有这个选项，请重新选择", bad)
         self.assertIn("DOMAIN www.apple.com", bad)
         self.assertIn("DOMAIN www.samsung.com", self.run_choice(block, "\n", trailer))
         self.assertIn("DOMAIN www.samsung.com", self.run_choice(block, "1\n", trailer))
+        expected = [
+            (12, "dl-cdn.alpinelinux.org"),
+            (13, "deb.debian.org"),
+            (14, "crates.io"),
+            (15, "pypi.org"),
+            (16, "rubygems.org"),
+            (17, "addons.mozilla.org"),
+            (18, "formulae.brew.sh"),
+            (19, "static.rust-lang.org"),
+            (20, "cpan.org"),
+        ]
+        for idx, dom in expected:
+            self.assertIn(f"DOMAIN {dom}", self.run_choice(block, f"{idx}\n", trailer))
 
 
 class SyntaxTest(unittest.TestCase):
