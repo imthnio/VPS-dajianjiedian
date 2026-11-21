@@ -26,9 +26,13 @@
 # ---------------- 名词小词典（看不懂下面的注释先看这里） ----------------
 # 节点：你自己的一台“翻墙服务器入口”。手机/电脑上的客户端连上它，再由它替你上网。
 # 协议：客户端和服务器之间“说话的方式”，比如 VLESS、VMess、Trojan、Shadowsocks、
-#       AnyTLS、Hysteria2、TUIC。不同协议伪装方式、速度、兼容性不一样。
-# 内核：真正干活的程序。本脚本按协议自动选：Xray、sing-box 或官方 hysteria。
+#       AnyTLS、Hysteria2、TUIC、Snell v4、Snell v5。不同协议伪装方式、速度、兼容性不一样。
+# 内核：真正干活的程序。本脚本按协议自动选：Xray、sing-box、官方 hysteria 或官方 snell-server。
 #       脚本只负责下载它、写好配置、让它开机自己跑起来。
+# Snell：Surge 团队开发的轻量加密代理协议，主打低延迟和高吞吐（官方程序依赖 glibc，
+#       Debian / Ubuntu / CentOS / Arch 原生支持，Alpine / musl 通常跑不起来）。
+#       Snell v4 走 TCP（UDP 也经 TCP 转发）；Snell v5 增加 QUIC 代理模式，需要同时放行 TCP 和 UDP，
+#       且 v5 服务端向下兼容 v4 客户端。PSK 是客户端和服务器共用的预共享密钥。
 # REALITY：一种伪装技术。别人探测你的服务器时，看到的是一个真实大网站
 #       （比如 www.samsung.com）的正常 HTTPS 握手，所以不需要自己买域名和证书。
 # UUID / 密码：节点的“钥匙”。随机生成，谁拿到链接谁就能用，不要乱发给别人。
@@ -62,8 +66,9 @@
 # WireGuard 落地（wg-luodi）：另一个脚本 VPS-WireGuard-luodi。装了它以后，你指定的端口上的节点
 #   上网时用 WireGuard 落地机的 IP，其它端口照旧用服务器自己的 IP。本脚本只在节点启动前叫它一声
 #   （wg-luodi hook），没装就什么都不做。
-# 双栈监听：节点同时收 IPv4 和 IPv6 客户端。Xray / sing-box 写 listen "::"，Hysteria2 写 listen ":端口"。
-#   只写 0.0.0.0 的话，Hysteria2 只收 IPv4，客户端填服务器的 IPv6 地址就连不上。
+# 双栈监听：节点同时收 IPv4 和 IPv6 客户端。Xray / sing-box 写 listen "::"，Hysteria2 写 listen ":端口"，
+#   Snell 写 listen = ::0:端口（配 ipv6 = true）。
+#   只写 0.0.0.0 的话，节点只收 IPv4，客户端填服务器的 IPv6 地址就连不上。
 #   机器上没有 IPv6、IPv6 被关掉、或者系统设成 [::] 只收 IPv6（bindv6only=1）时，照旧只听 0.0.0.0。
 # 内网 IPv6（fd 开头，比如 fd66::5）：NAT 小鸡常见。外网 IPv6 是服务商转发进来的，进来时落在这个内网地址上，
 #   所以节点也要听 IPv6 才收得到；但分享链接里不能写这个内网地址（外面连不到它）。
@@ -627,6 +632,7 @@ _resolv_restore() {
     mv -f "$1" /etc/resolv.conf 2>/dev/null
   elif [ -e "$1" ]; then
     cat "$1" > /etc/resolv.conf 2>/dev/null
+    chmod 644 /etc/resolv.conf 2>/dev/null || true
     rm -f "$1"
   fi
 }
@@ -843,15 +849,15 @@ wait_for_port() {
   while [ "$_wtry" -lt "$_wtimeout" ]; do
     if command -v ss >/dev/null 2>&1; then
       if [ "$_wproto" = "udp" ]; then
-        ss -uln 2>/dev/null | grep -q ":${_wp} " && return 0
+        ss -uln 2>/dev/null | grep -Eq ":${_wp}[[:space:]]" && return 0
       else
-        ss -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
+        ss -ltn 2>/dev/null | grep -Eq ":${_wp}[[:space:]]" && return 0
       fi
     elif command -v netstat >/dev/null 2>&1; then
       if [ "$_wproto" = "udp" ]; then
-        netstat -uln 2>/dev/null | grep -q ":${_wp} " && return 0
+        netstat -uln 2>/dev/null | grep -Eq ":${_wp}[[:space:]]" && return 0
       else
-        netstat -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
+        netstat -ltn 2>/dev/null | grep -Eq ":${_wp}[[:space:]]" && return 0
       fi
     else
       # 极简系统可能没有 ss/netstat；从内核套接字表检查，不能把“无法检查”当作成功。
@@ -918,6 +924,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 FWEOF
+    chmod 644 /etc/systemd/system/xray-node-fw.service 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable xray-node-fw.service >/dev/null 2>&1 || return 1
     rm -f /etc/xray-node/rules.v4 /etc/xray-node/rules.v6
@@ -989,6 +996,10 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
     fi
     unset DEBIAN_FRONTEND
     return 0
+  fi
+  if { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; } \
+    || { command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; }; then
+    _save_fw_light && return 0
   fi
   warn "这台机器只有纯 iptables 且无法自动存盘：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
 }
@@ -1645,34 +1656,47 @@ _kw() { # _kw <关键字> <一行 ip 输出>：打印关键字后面的那个词
   printf '%s\n' "$2" | awk -v k="$1" '{ for (i = 1; i < NF; i++) if ($i == k) { print $(i + 1); exit } }'
 }
 
-_is_udp_node() { # 只有 UDP 节点才需要：Hysteria2、TUIC、Shadowsocks
+_is_udp_node() { # 只有 UDP 节点才需要：Hysteria2、TUIC、Shadowsocks、Snell v5（QUIC 代理模式用 UDP）
   _d="$NODES_DIR/$id"
   core=$(tr -d ' \r\n' 2>/dev/null < "$_d/core")
   case "$core" in
     hysteria) [ -f "$_d/config.yaml" ] ;;
     sing-box) grep -q '"type": *"tuic"' "$_d/config.json" 2>/dev/null ;;
     xray) grep -q '"protocol": *"shadowsocks"' "$_d/config.json" 2>/dev/null ;;
+    snell-v5) [ -f "$_d/config.conf" ] ;;
     *) return 1 ;;
   esac
 }
 
 _listen() { # 打印配置里的监听地址（去掉引号）
-  if [ "$core" = "hysteria" ]; then
-    sed -n 's/^listen:[[:space:]]*//p' "$NODES_DIR/$id/config.yaml" 2>/dev/null | head -1 | tr -d "\"' \r"
-  else
-    sed -n 's/.*"listen":[[:space:]]*"\([^"]*\)".*/\1/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1
-  fi
+  case "$core" in
+    hysteria)
+      sed -n 's/^listen:[[:space:]]*//p' "$NODES_DIR/$id/config.yaml" 2>/dev/null | head -1 | tr -d "\"' \r"
+      ;;
+    snell-v4|snell-v5)
+      sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*//p' "$NODES_DIR/$id/config.conf" 2>/dev/null | head -1 | tr -d ' \r'
+      ;;
+    *)
+      sed -n 's/.*"listen":[[:space:]]*"\([^"]*\)".*/\1/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1
+      ;;
+  esac
 }
 
 _load() { # 读出 UDP 主端口 port 和要管的地址族 fams
   port=$(awk '$2 == "udp" && $1 ~ /^[0-9]+$/ { print $1; exit }' "$NODES_DIR/$id/fw_info" 2>/dev/null)
   _ll=$(_listen)
   if [ -z "$port" ]; then
-    if [ "$core" = "hysteria" ]; then
-      _lp=${_ll%%,*}; port=${_lp##*:}
-    else
-      port=$(sed -n 's/.*"\(listen_\)\{0,1\}port":[[:space:]]*\([0-9][0-9]*\).*/\2/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1)
-    fi
+    case "$core" in
+      hysteria)
+        _lp=${_ll%%,*}; port=${_lp##*:}
+        ;;
+      snell-v4|snell-v5)
+        port=${_ll##*:}
+        ;;
+      *)
+        port=$(sed -n 's/.*"\(listen_\)\{0,1\}port":[[:space:]]*\([0-9][0-9]*\).*/\2/p' "$NODES_DIR/$id/config.json" 2>/dev/null | head -1)
+        ;;
+    esac
   fi
   case "$port" in ''|*[!0-9]*) return 1 ;; esac
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
@@ -1978,6 +2002,8 @@ _active() {
     case "$(tr -d ' \r\n' 2>/dev/null < "$NODES_DIR/$1/core")" in
       sing-box) systemctl is-active --quiet "singbox-node@$1" ;;
       xray) systemctl is-active --quiet "xray-node@$1" ;;
+      snell-v4) systemctl is-active --quiet "snell-v4-node@$1" ;;
+      snell-v5) systemctl is-active --quiet "snell-v5-node@$1" ;;
       *) systemctl is-active --quiet "hysteria-node@$1" ;;
     esac
     return
@@ -1990,6 +2016,7 @@ _active() {
     case "$_ap" in "/proc/$$/"*) continue ;; esac
     tr '\000' ' ' 2>/dev/null < "$_ap" | grep -qF "$NODES_DIR/$1/config.yaml" && return 0
     tr '\000' ' ' 2>/dev/null < "$_ap" | grep -qF "$NODES_DIR/$1/config.json" && return 0
+    tr '\000' ' ' 2>/dev/null < "$_ap" | grep -qF "$NODES_DIR/$1/config.conf" && return 0
   done
   return 1
 }
@@ -2148,10 +2175,14 @@ _acme_need() { # 返回 0 = 现在需要打开（还没拿到证书，或者快�
 _acmesh_deploy() { # _acmesh_deploy <节点目录> <域名>
   _ad_src="$ACMESH_HOME/${2}_ecc"
   [ -s "$_ad_src/fullchain.cer" ] && [ -s "$_ad_src/${2}.key" ] || return 1
-  cat "$_ad_src/${2}.key" > "$1/key.pem.new" && cat "$_ad_src/fullchain.cer" > "$1/cert.pem.new" || return 1
+  # 写私钥前先收紧 umask，防止默认 022 下 key.pem.new 短暂对其他用户可读
+  ( umask 077; cat "$_ad_src/${2}.key" > "$1/key.pem.new" && cat "$_ad_src/fullchain.cer" > "$1/cert.pem.new" ) || return 1
   for _ad_f in key cert; do
-    chmod 640 "$1/$_ad_f.pem.new" 2>/dev/null
-    chgrp xray-node "$1/$_ad_f.pem.new" 2>/dev/null
+    if chgrp xray-node "$1/$_ad_f.pem.new" 2>/dev/null; then
+      chmod 640 "$1/$_ad_f.pem.new" 2>/dev/null
+    else
+      chmod 600 "$1/$_ad_f.pem.new" 2>/dev/null
+    fi
     mv -f "$1/$_ad_f.pem.new" "$1/$_ad_f.pem" || return 1
   done
 }
@@ -2263,6 +2294,7 @@ AccuracySec=5s
 [Install]
 WantedBy=timers.target
 EOF
+  chmod 644 "$SD_DIR/xray-node-watch.service" "$SD_DIR/xray-node-watch.timer" 2>/dev/null || true
   _units=$(_fw_units_present)
   _units=${_units% }
   if [ -n "$_units" ]; then
@@ -2283,6 +2315,7 @@ ExecReload=$SELF tick --now
 [Install]
 WantedBy=multi-user.target ${_units}
 EOF
+    chmod 644 "$SD_DIR/xray-node-watch-fw.service" 2>/dev/null || true
   elif [ -f "$SD_DIR/xray-node-watch-fw.service" ]; then
     # 防火墙服务被卸掉了：钩子也撤掉，连同开机自启的链接
     systemctl disable --now xray-node-watch-fw.service >/dev/null 2>&1 || true
@@ -2557,6 +2590,7 @@ ExecStart=/bin/sh -c 'for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do [ -f "
 [Install]
 WantedBy=sysinit.target
 EOF
+      chmod 644 "$_unit" 2>/dev/null || true
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl enable xray-node-ipv6.service >/dev/null 2>&1 || true
     else
@@ -2614,7 +2648,11 @@ _ipv6_rebind_nodes() {
               [ -f "${_d}hop" ] && cp -a "${_d}hop" "${_d}hop.bak-ipv6off" 2>/dev/null
               if _hy_set_listen "$_cfg" "$_newlisten"; then
                 # 端口跳跃也改成只转发 IPv4
-                [ -f "${_d}hop" ] && sed -i 's/^family=.*/family=4/' "${_d}hop" 2>/dev/null
+                if [ -f "${_d}hop" ]; then
+                  sed 's/^family=.*/family=4/' "${_d}hop" > "${_d}hop.tmp" 2>/dev/null \
+                    && mv -f "${_d}hop.tmp" "${_d}hop" 2>/dev/null \
+                    && chmod 600 "${_d}hop" 2>/dev/null || rm -f "${_d}hop.tmp"
+                fi
                 _svc_restart "$_id"
                 if wait_for_port "$_port" udp 15; then
                   rm -f "${_cfg}.bak-ipv6off" "${_d}hop.bak-ipv6off"
@@ -2667,6 +2705,44 @@ _ipv6_rebind_nodes() {
           ;;
       esac
     fi
+    if [ -f "${_d}config.conf" ] && grep -Eq '^[[:space:]]*(listen[[:space:]]*=[[:space:]]*(::0|\[::\]):|ipv6[[:space:]]*=[[:space:]]*true)' "${_d}config.conf" 2>/dev/null; then
+      _cfg="${_d}config.conf"
+      _port=$(tr -d '\r' < "$_cfg" 2>/dev/null | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -1)
+      cp -a "$_cfg" "${_cfg}.bak-ipv6off" || continue
+      awk '
+        { sub(/\r$/, "") }
+        /^[[:space:]]*listen[[:space:]]*=/ {
+          sub(/::0:/, "0.0.0.0:")
+          sub(/\[::\]:/, "0.0.0.0:")
+        }
+        /^[[:space:]]*ipv6[[:space:]]*=/ {
+          $0 = "ipv6 = false"
+        }
+        { print }
+      ' "${_cfg}.bak-ipv6off" > "$_cfg" || {
+        mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+        warn "节点 ${_id} 的监听地址没改成"
+        continue
+      }
+      chmod 600 "$_cfg" 2>/dev/null || true
+      _svc_restart "$_id"
+      case "$_port" in
+        ''|*[!0-9]*)
+          rm -f "${_cfg}.bak-ipv6off"
+          info "节点 ${_id} 已改为只听 IPv4"
+          ;;
+        *)
+          if wait_for_port "$_port" tcp 15; then
+            rm -f "${_cfg}.bak-ipv6off"
+            info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
+          else
+            mv -f "${_cfg}.bak-ipv6off" "$_cfg"
+            _svc_restart "$_id"
+            warn "节点 ${_id} 改成只听 IPv4 后没起来，已改回原来的配置"
+          fi
+          ;;
+      esac
+    fi
   done
 }
 
@@ -2703,7 +2779,8 @@ _ipv6_strip_links() {
       /^IPv6 地址:/ { next }
       /^IPv6 端口:/ { next }
       /^hysteria2:\/\/.*@\[/ { next }
-      / = Hysteria2,/ {
+      /^snell:\/\/.*@\[/ { next }
+      / = (Hysteria2|Snell|snell),/ {
         n = split($0, a, ",")
         if (n >= 2 && a[2] ~ /:/) next
       }
@@ -2948,6 +3025,8 @@ _stop_outside() {
     case "$_x_core" in
       sing-box) _x_unit="singbox-node@${_x_id}" ;;
       hysteria) _x_unit="hysteria-node@${_x_id}" ;;
+      snell-v4) _x_unit="snell-v4-node@${_x_id}" ;;
+      snell-v5) _x_unit="snell-v5-node@${_x_id}" ;;
       *) _x_unit="xray-node@${_x_id}" ;;
     esac
     systemctl stop "$_x_unit" >/dev/null 2>&1 || true
@@ -2961,6 +3040,7 @@ _stop_outside() {
   fi
   pkill -f "$NODES_DIR/${_x_id}/config.json" >/dev/null 2>&1 || true
   pkill -f "$NODES_DIR/${_x_id}/config.yaml" >/dev/null 2>&1 || true
+  pkill -f "$NODES_DIR/${_x_id}/config.conf" >/dev/null 2>&1 || true
   sleep 1
 }
 
@@ -2971,6 +3051,8 @@ _stop_inside() {
   rm -f "$WANTS/xray-node@${_x_id}.service" \
     "$WANTS/hysteria-node@${_x_id}.service" \
     "$WANTS/singbox-node@${_x_id}.service" \
+    "$WANTS/snell-v4-node@${_x_id}.service" \
+    "$WANTS/snell-v5-node@${_x_id}.service" \
     "$RUNLEVEL/xray-node-${_x_id}"
   if [ -f "$INITD/xray-node-${_x_id}" ] && command -v rc-service >/dev/null 2>&1; then
     (sleep 1; rc-service "xray-node-${_x_id}" stop >/dev/null 2>&1 || true; rm -f "$INITD/xray-node-${_x_id}") >/dev/null 2>&1 &
@@ -3120,9 +3202,13 @@ _core=$(tr -d ' \r\n' < "$_dir/core")
 _xray=${XRAY_BIN_PATH:-/usr/local/bin/xray}
 _sb=${SB_BIN_PATH:-/usr/local/bin/sing-box}
 _hy=${HY_BIN_PATH:-/usr/local/bin/hysteria}
+_sn4=${SNELL4_BIN_PATH:-/usr/local/bin/snell-server-v4}
+_sn5=${SNELL5_BIN_PATH:-/usr/local/bin/snell-server-v5}
 case "$_core" in
   hysteria) exec "$_hy" server -c "$_dir/config.yaml" ;;
   sing-box) exec "$_sb" run -c "$_dir/config.json" ;;
+  snell-v4) exec "$_sn4" -c "$_dir/config.conf" ;;
+  snell-v5) exec "$_sn5" -c "$_dir/config.conf" ;;
   *) exec "$_xray" -config "$_dir/config.json" ;;
 esac
 exit 1
@@ -3196,6 +3282,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+      chmod 644 "$_aw_sd/xray-node-expire.service" "$_aw_sd/xray-node-expire.timer" 2>/dev/null || true
       systemctl daemon-reload >/dev/null 2>&1 || true
       if systemctl enable --now xray-node-expire.timer >/dev/null 2>&1; then
         if [ "$_aw_was" != "enabled" ]; then
@@ -3398,11 +3485,24 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
       for (i = 1; i <= nr; i++) g[8 - nr + i] = hx(R[i])
       v6(g[1], g[2], g[3], g[4])
     }
+    function norm(a,  k, l, r, nl, nr, i, g, L, R) {
+      a = tolower(a)
+      if (index(a, ":") == 0) return a
+      if (index(a, ".")) { sub(/.*:/, "", a); return a }
+      k = index(a, "::")
+      if (k) { l = substr(a, 1, k - 1); r = substr(a, k + 2) } else { l = a; r = "" }
+      nl = (l == "") ? 0 : split(l, L, ":")
+      nr = (r == "") ? 0 : split(r, R, ":")
+      for (i = 1; i <= 8; i++) g[i] = 0
+      for (i = 1; i <= nl; i++) g[i] = hx(L[i])
+      for (i = 1; i <= nr; i++) g[8 - nr + i] = hx(R[i])
+      return sprintf("%x:%x:%x:%x:%x:%x:%x:%x", g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8])
+    }
     BEGIN {
       n = split(ports, P, " ")
       for (i = 1; i < n; i += 2) want[P[i + 1] " " P[i]] = 1
     }
-    $1 == "L" { loc[tolower($2)] = 1; next }
+    $1 == "L" { loc[norm($2)] = 1; next }
     # /proc/net/tcp：本机地址:端口、对方地址:端口、状态（01 = 已连上），都是十六进制
     $1 == "T" {
       if ($5 != "01") next
@@ -3434,7 +3534,7 @@ _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址�
         if (src == "" && $i ~ /^src=/) src = substr($i, 5)
         if ($i ~ /^sport=/) { sp++; if (sp == 2) rs = substr($i, 7) }
       }
-      if (rs != "" && (("udp " rs) in want) && !(tolower(src) in loc)) text(src)
+      if (rs != "" && (("udp " rs) in want) && !(norm(src) in loc)) text(src)
     }'
 }
 
@@ -3725,6 +3825,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    chmod 644 "$SD_DIR/xray-node-limit.service" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now xray-node-limit.service >/dev/null 2>&1 && return 0
   fi
@@ -3904,9 +4005,10 @@ for _d in /etc/xray-node/nodes/*/; do
   _name=$(sed -n 's/^节点名: //p' "${_d}node.txt" | head -n 1 | tr -d '\r')
   [ -n "$_name" ] || _name=$(head -n 1 "${_d}name" 2>/dev/null | tr -d '\r')
   # 第一条分享链接就是主链接
-  _link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic)://' "${_d}node.txt" | tr -d '\r')
+  _link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell)://' "${_d}node.txt" | tr -d '\r')
   # Loon 行：“名字 = 协议,”，协议名首字母大写（Surge 行是小写，不会认错）
-  _loon=$(grep -m1 -E '^[^ ].* = (VLESS|Trojan|VMess|Shadowsocks|AnyTLS|Hysteria2),' "${_d}node.txt" | tr -d '\r')
+  _loon=$(grep -m1 -E '^[^ ].* = (VLESS|Trojan|VMess|Shadowsocks|AnyTLS|Hysteria2|Snell),' "${_d}node.txt" | tr -d '\r')
+  _surge=$(grep -m1 -E '^[^ ].* = snell,' "${_d}node.txt" | tr -d '\r')
   # 去掉“（1天后…）”：那是装的时候算的，过后就不对了
   _exp=$(sed -n 's/^失效时间: //p' "${_d}node.txt" | head -n 1 | tr -d '\r' | sed 's/（.*//')
   printf "\n${G}${B}==================== 节点 %s：%s ====================${N}\n" "$_id" "$_name"
@@ -3925,6 +4027,10 @@ for _d in /etc/xray-node/nodes/*/; do
       tuic://*) printf "Loon 不支持 TUIC，请用上面的通用链接。\n" ;;
       *) printf "这个节点是旧版脚本装的，没有现成的 Loon 行。请用上面的通用链接，或输入 jiedian all 看参数在 Loon 里手动添加。\n" ;;
     esac
+  fi
+  if [ -n "$_surge" ]; then
+    printf "\n${C}${B}【3】Surge 节点${N}（Surge 的 [Proxy] 下面，复制整行粘贴）\n\n"
+    printf "${Y}%s${N}\n" "$_surge"
   fi
 done
 if [ "$_n" = "0" ]; then
@@ -4032,6 +4138,8 @@ _stop_remove_svc() {
     case "$_x_core" in
       sing-box) _x_unit="singbox-node@${_x_id}" ;;
       hysteria) _x_unit="hysteria-node@${_x_id}" ;;
+      snell-v4) _x_unit="snell-v4-node@${_x_id}" ;;
+      snell-v5) _x_unit="snell-v5-node@${_x_id}" ;;
       *) _x_unit="xray-node@${_x_id}" ;;
     esac
     systemctl stop "$_x_unit" >/dev/null 2>&1
@@ -4047,6 +4155,7 @@ _stop_remove_svc() {
   # 兜底：按该节点的配置文件路径精确杀进程，不碰其它节点的进程
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.json" >/dev/null 2>&1
   pkill -f "/etc/xray-node/nodes/${_x_id}/config.yaml" >/dev/null 2>&1
+  pkill -f "/etc/xray-node/nodes/${_x_id}/config.conf" >/dev/null 2>&1
   # 拆掉端口跳跃的转发规则（没开跳跃时什么都不做）
   [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_x_id" >/dev/null 2>&1
   # 拆掉回程路由规则（没加过时什么都不做）
@@ -4112,7 +4221,8 @@ _uninstall_all() {
     rm -f /run/xray-node-expire.pid
   fi
   rm -f /etc/systemd/system/xray-node@.service /etc/systemd/system/singbox-node@.service \
-    /etc/systemd/system/hysteria-node@.service /etc/systemd/system/xray-node-fw.service \
+    /etc/systemd/system/hysteria-node@.service /etc/systemd/system/snell-v4-node@.service \
+    /etc/systemd/system/snell-v5-node@.service /etc/systemd/system/xray-node-fw.service \
     /etc/systemd/system/xray-node-expire.service /etc/systemd/system/xray-node-expire.timer
   rm -f /etc/init.d/xray-node-fw /etc/init.d/xray-node-expire /etc/sysctl.d/99-xray-node-overcommit.conf
   rm -f /etc/cron.d/xray-node-expire
@@ -4144,7 +4254,7 @@ _uninstall_all() {
   if [ -f /etc/xray-node/our_bins ]; then
     while read -r _b; do
       case "$_b" in
-        xray|sing-box|hysteria) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
+        xray|sing-box|hysteria|snell-server-v4|snell-server-v5) rm -f "/usr/local/bin/$_b" && echo "已删除脚本安装的 $_b" ;;
       esac
     done < /etc/xray-node/our_bins
   fi
@@ -4429,12 +4539,18 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
       fi
       ;;
     sing-box) _si_bin="$SB_BIN"; _si_args="run -c $_si_cfg"; _si_tpl=/etc/systemd/system/singbox-node@.service; _si_unit="singbox-node@${_si_id}" ;;
+    snell-v4) _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.conf; _si_bin="$SNELL4_BIN"; _si_args="-c $_si_cfg"; _si_tpl=/etc/systemd/system/snell-v4-node@.service; _si_unit="snell-v4-node@${_si_id}" ;;
+    snell-v5) _si_cfg=/etc/xray-node/nodes/"$_si_id"/config.conf; _si_bin="$SNELL5_BIN"; _si_args="-c $_si_cfg"; _si_tpl=/etc/systemd/system/snell-v5-node@.service; _si_unit="snell-v5-node@${_si_id}" ;;
     *)        _si_bin="$XRAY_BIN"; _si_args="-config $_si_cfg"; _si_tpl=/etc/systemd/system/xray-node@.service; _si_unit="xray-node@${_si_id}" ;;
   esac
   # 小内存机器上 Xray / sing-box 也让 Go 勤快点回收内存，少占一些，不容易被系统杀掉
-  if [ "$LOW_MEM" = "1" ] && [ "$_si_core" != "hysteria" ]; then
-    _si_unit_env="Environment=GOGC=30"
-    _si_openrc_env="export GOGC=30"
+  if [ "$LOW_MEM" = "1" ]; then
+    case "$_si_core" in
+      xray|sing-box)
+        _si_unit_env="Environment=GOGC=30"
+        _si_openrc_env="export GOGC=30"
+        ;;
+    esac
   fi
   SVC_UNIT="$_si_unit"
   _si_svc="xray-node-${_si_id}"
@@ -4476,6 +4592,8 @@ NoNewPrivileges=true"
     case "$_si_core" in
       hysteria) _si_tpl_bin="$HY_BIN"; _si_tpl_args="server -c /etc/xray-node/nodes/%i/config.yaml"; _si_tpl_desc="Hysteria2 node %i" ;;
       sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
+      snell-v4) _si_tpl_bin="$SNELL4_BIN"; _si_tpl_args="-c /etc/xray-node/nodes/%i/config.conf"; _si_tpl_desc="Snell v4 node %i" ;;
+      snell-v5) _si_tpl_bin="$SNELL5_BIN"; _si_tpl_args="-c /etc/xray-node/nodes/%i/config.conf"; _si_tpl_desc="Snell v5 node %i" ;;
       *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
     esac
     if [ -x /usr/local/bin/xray-node-run ]; then
@@ -4512,6 +4630,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    chmod 644 "$_si_tpl" 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable "$_si_unit" >/dev/null 2>&1
     systemctl restart "$_si_unit" >/dev/null 2>&1
@@ -4677,11 +4796,36 @@ _hy_hop_busy() { # _hy_hop_busy <起> <止> -> 打印第一个已被占用的 UD
     port_in_use "$1" udp && { printf '%s' "$1"; return 0; }
     return 1
   fi
-  command -v ss >/dev/null 2>&1 || return 1
-  ss -uln 2>/dev/null | awk -v a="$1" -v b="$2" '
-    NR > 1 { n = split($4, x, ":"); p = x[n] + 0; if (p >= a && p <= b) { print p; found = 1; exit } }
-    END { exit !found }
-  '
+  if command -v ss >/dev/null 2>&1; then
+    ss -uln 2>/dev/null | awk -v a="$1" -v b="$2" '
+      NR > 1 { n = split($4, x, ":"); p = x[n] + 0; if (p >= a && p <= b) { print p; found = 1; exit } }
+      END { exit !found }
+    '
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -uln 2>/dev/null | awk -v a="$1" -v b="$2" '
+      /^udp/ { n = split($4, x, ":"); p = x[n] + 0; if (p >= a && p <= b) { print p; found = 1; exit } }
+      END { exit !found }
+    '
+    return $?
+  fi
+  for _hb_f in /proc/net/udp /proc/net/udp6; do
+    [ -r "$_hb_f" ] || continue
+    awk -v a="$1" -v b="$2" '
+      function hx(s,  i, n) {
+        n = 0; s = tolower(s)
+        for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+        return n
+      }
+      NR > 1 && toupper($4) == "07" {
+        split($2, x, ":"); p = hx(x[2])
+        if (p >= a && p <= b) { print p; found = 1; exit }
+      }
+      END { exit !found }
+    ' "$_hb_f" && return 0
+  done
+  return 1
 }
 
 _hy_collect_hop_ports() {
@@ -4920,6 +5064,38 @@ _reality_ask_fp() {
   done
 }
 
+# Snell 混淆选项：v4 / v5 只支持关闭（off）或 HTTP 混淆（http），不支持 tls 混淆。
+_snell_ask_obfs() {
+  SNELL_OBFS="off"
+  SNELL_OBFS_HOST=""
+  printf "\n要不要打开 Snell 的 HTTP 混淆（obfs=http）？\n"
+  printf "  1) 不打开（默认，推荐：性能最好，所有支持 Snell 的客户端都兼容）\n"
+  printf "  2) 打开 HTTP 混淆（obfs=http，把握手伪装成普通 HTTP 请求）\n"
+  printf "看不懂就回车，默认不打开。\n"
+  while true; do
+    ask "请选择" "1" _sn_obfs_c
+    case "$_sn_obfs_c" in
+      1) SNELL_OBFS="off"; info "Snell 混淆：不打开"; return 0 ;;
+      2)
+        SNELL_OBFS="http"
+        while true; do
+          ask "HTTP 混淆伪装域名（obfs-host，写进客户端配置）" "www.bing.com" _sn_obfs_h
+          _sn_obfs_h=$(printf '%s' "$_sn_obfs_h" | tr 'A-Z' 'a-z')
+          _sn_obfs_h=${_sn_obfs_h#http://}; _sn_obfs_h=${_sn_obfs_h#https://}; _sn_obfs_h=${_sn_obfs_h%%/*}; _sn_obfs_h=${_sn_obfs_h%.}
+          if _valid_host "$_sn_obfs_h"; then
+            SNELL_OBFS_HOST="$_sn_obfs_h"
+            break
+          fi
+          warn "「${_sn_obfs_h}」不像域名，请重新输入（直接回车用 www.bing.com）"
+        done
+        info "Snell 混淆：HTTP（obfs-host=${SNELL_OBFS_HOST}）"
+        return 0
+        ;;
+      *) warn "没有这个选项，请重新选择" ;;
+    esac
+  done
+}
+
 # ---------- Hysteria2 正规证书：acme.sh ----------
 # 不用 Hysteria2 自带的申请：它每次续期都换一把新私钥，客户端的「公钥锁定」续期后就对不上了。
 # acme.sh 第一次申请时生成私钥，以后续期（--renew）一直用这一把，公钥指纹不变。
@@ -5138,7 +5314,9 @@ _hy_read_listen() { # _hy_read_listen <config.yaml>：打印 listen 的值（去
 
 _hop_set_family() { # _hop_set_family <节点目录> <4|6|46>：改端口跳跃要管哪种地址
   [ -f "$1/hop" ] || return 0
-  sed -i "s/^family=.*/family=$2/" "$1/hop" 2>/dev/null
+  sed "s/^family=.*/family=$2/" "$1/hop" > "$1/hop.tmp" 2>/dev/null \
+    && mv -f "$1/hop.tmp" "$1/hop" 2>/dev/null \
+    && chmod 600 "$1/hop" 2>/dev/null || rm -f "$1/hop.tmp"
 }
 
 # 以前的端口跳跃把所有端口都写在 listen 里（:主端口,跳跃端口…），Hysteria2 会去听最小的那个。
@@ -5231,6 +5409,18 @@ _cq_loon_line() { # 打印 Loon 节点行（官方格式：节点名 = 协议,�
       printf '%s = AnyTLS,%s,%s,"%s",sni=%s,public-key="%s",short-id=%s,udp=true,block-quic=true\n' \
         "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$CQ_SNI" "$CQ_PBK" "$CQ_SID"
       ;;
+    snell4|snell5)
+      _cq_ok "$CQ_PASS" || return 0
+      _cq_sv=4; [ "$CQ_PROTO" = "snell5" ] && _cq_sv=5
+      _cq_so=""
+      if [ "${CQ_OBFS:-}" = "http" ]; then
+        _cq_oh="${CQ_OBFS_HOST:-www.bing.com}"
+        _cq_ok "$_cq_oh" || return 0
+        _cq_so=",obfs=http,obfs-host=${_cq_oh}"
+      fi
+      printf '%s = Snell,%s,%s,"%s",version=%s%s,udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$_cq_sv" "$_cq_so"
+      ;;
   esac
   return 0
 }
@@ -5258,6 +5448,18 @@ _cq_surge_line() { # 打印 Surge 节点行。Surge 不支持 VLESS 和 REALITY�
       esac
       printf '%s = tuic-v5, %s, %s, uuid=%s, password=%s, alpn=h3, sni=www.samsung.com, %s, block-quic=on\n' \
         "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_UUID" "$CQ_PASS" "$_cq_tls"
+      ;;
+    snell4|snell5)
+      _cq_ok "$CQ_PASS" || return 0
+      _cq_sv=4; [ "$CQ_PROTO" = "snell5" ] && _cq_sv=5
+      _cq_so=""
+      if [ "${CQ_OBFS:-}" = "http" ]; then
+        _cq_oh="${CQ_OBFS_HOST:-www.bing.com}"
+        _cq_ok "$_cq_oh" || return 0
+        _cq_so=", obfs=http, obfs-host=${_cq_oh}"
+      fi
+      printf '%s = snell, %s, %s, psk=%s, version=%s, reuse=true%s, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$_cq_sv" "$_cq_so"
       ;;
   esac
   return 0
@@ -5288,7 +5490,7 @@ _cq_section() { # 打印 node.txt 里“拦截 QUIC”这一段
 _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.txt 读出 CQ_ 变量
   _cq_nt="$1/node.txt"
   [ -f "$_cq_nt" ] || return 1
-  _cq_link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic)://' "$_cq_nt" 2>/dev/null | tr -d '\r')
+  _cq_link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell)://' "$_cq_nt" 2>/dev/null | tr -d '\r')
   case "$_cq_link" in
     vless://*) CQ_PROTO=vless ;;
     trojan://*) CQ_PROTO=trojan ;;
@@ -5297,6 +5499,12 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
     anytls://*) CQ_PROTO=anytls ;;
     hysteria2://*) CQ_PROTO=hy2 ;;
     tuic://*) CQ_PROTO=tuic ;;
+    snell://*)
+      case "$_cq_link" in
+        *'version=5'*) CQ_PROTO=snell5 ;;
+        *) CQ_PROTO=snell4 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
   CQ_NAME=$(_cq_kv "节点名")
@@ -5306,11 +5514,14 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
   CQ_PORT=$(_cq_kv "端口")
   CQ_UUID=$(_cq_kv "UUID")
   CQ_PASS=$(_cq_kv "密码")
+  [ -n "$CQ_PASS" ] || CQ_PASS=$(_cq_kv "PSK（密钥）")
   CQ_SNI=$(_cq_kv "伪装域名")
   CQ_PATH=$(_cq_kv "WS 路径")
   CQ_PIN=$(_cq_kv "证书指纹")
   CQ_PBK=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
   CQ_SID=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]sid=\([^&#]*\).*/\1/p')
+  CQ_OBFS=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]obfs=\([^&#]*\).*/\1/p')
+  CQ_OBFS_HOST=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]obfs-host=\([^&#]*\).*/\1/p')
   return 0
 }
 
@@ -5485,6 +5696,8 @@ _route_refresh_all() {
       case "$(tr -d ' \r\n' 2>/dev/null < "${_rr_d}core")" in
         sing-box) _rr_unit=/etc/systemd/system/singbox-node@.service ;;
         hysteria) _rr_unit=/etc/systemd/system/hysteria-node@.service ;;
+        snell-v4) _rr_unit=/etc/systemd/system/snell-v4-node@.service ;;
+        snell-v5) _rr_unit=/etc/systemd/system/snell-v5-node@.service ;;
         *) _rr_unit=/etc/systemd/system/xray-node@.service ;;
       esac
     else
@@ -5678,6 +5891,53 @@ _fix_existing_json_ipv6() {
   done
 }
 
+# Snell 节点同理：更新时若机器能听 IPv6 且节点还在只听 0.0.0.0，改成 ::0 + ipv6 = true（失败就回滚）。
+_fix_existing_snell_ipv6() {
+  _v6_listen_ok || return 0
+  for _sd in /etc/xray-node/nodes/*/; do
+    _scfg="${_sd}config.conf"
+    [ -f "$_scfg" ] && [ -f "${_sd}fw_info" ] || continue
+    grep -Eq '^[[:space:]]*listen[[:space:]]*=[[:space:]]*0\.0\.0\.0:[0-9]+' "$_scfg" 2>/dev/null || continue
+    _sport=$(tr -d '\r' < "$_scfg" 2>/dev/null | sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*0\.0\.0\.0:\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -1)
+    case "$_sport" in ''|*[!0-9]*) continue ;; esac
+    _port_on_v6 "$_sport" tcp && continue
+    _sid=$(basename "$_sd")
+    cp -a "$_scfg" "${_scfg}.bak-ipv6" || { warn "节点 $_sid 无法备份配置，跳过 IPv6"; continue; }
+    if ! awk -v p="$_sport" '
+      { sub(/\r$/, "") }
+      /^[[:space:]]*listen[[:space:]]*=/ { print "listen = ::0:" p; next }
+      /^[[:space:]]*ipv6[[:space:]]*=/ { print "ipv6 = true"; has6 = 1; next }
+      { print }
+      END { if (!has6) print "ipv6 = true" }
+    ' "${_scfg}.bak-ipv6" > "$_scfg"; then
+      mv -f "${_scfg}.bak-ipv6" "$_scfg"; warn "节点 $_sid 没能改成同时听 IPv6"; continue
+    fi
+    chmod 600 "$_scfg" 2>/dev/null || true
+    _svc_restart "$_sid"
+    if wait_for_port "$_sport" tcp 15 && _port_on_v6 "$_sport" tcp; then
+      rm -f "${_scfg}.bak-ipv6"
+      if command -v ip6tables >/dev/null 2>&1; then
+        _sf_pairs=$(awk '$1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") { k = $1 ":" $2; if (!seen[k]++) print k }' "${_sd}fw_info" 2>/dev/null)
+        _sf_saved=0
+        for _sf_item in $_sf_pairs; do
+          _sfp=${_sf_item%:*}
+          _sfpr=${_sf_item#*:}
+          if ! ip6tables -C INPUT -p "$_sfpr" --dport "$_sfp" -j ACCEPT >/dev/null 2>&1; then
+            _fw_allow "$_sfp" "$_sfpr" 6 "${_sd}fw_info" 0
+            [ "$_IPT_ADDED" = "1" ] && _sf_saved=1
+          fi
+        done
+        [ "$_sf_saved" = "1" ] && _save_fw 6
+      fi
+      info "节点 $_sid（端口 $_sport）已同时听 IPv4 和 IPv6"
+    else
+      mv -f "${_scfg}.bak-ipv6" "$_scfg"
+      _svc_restart "$_sid"
+      warn "节点 $_sid 改成同时听 IPv6 后端口没起来，已改回原来的配置"
+    fi
+  done
+}
+
 # ---------- 更新内核时用的小工具：读端口、比版本号 ----------
 _node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
   read -r _np_port _np_proto _np_rest 2>/dev/null < /etc/xray-node/nodes/"$1"/fw_info
@@ -5801,7 +6061,8 @@ drop_page_cache() {
 # 上次安装失败会把几十 MB 的安装包留在临时目录。1GB 硬盘上这些残留会让下一次装直接写满。
 recover_disk_space() {
   rm -rf /var/tmp/xray-node-dl "$HOME/xray-node-dl" /tmp/xray-node-dl 2>/dev/null
-  rm -f /usr/local/bin/sing-box.new /usr/local/bin/xray.new /usr/local/bin/hysteria.new 2>/dev/null
+  rm -f /usr/local/bin/sing-box.new /usr/local/bin/xray.new /usr/local/bin/hysteria.new \
+    /usr/local/bin/snell-server-v4.new /usr/local/bin/snell-server-v5.new 2>/dev/null
   _rdf=$(_disk_free_mb /)
   if [ "$LOW_MEM" = "1" ] || { [ -n "$_rdf" ] && [ "$_rdf" -lt 200 ]; }; then
     rm -f /var/cache/apt/archives/*.deb 2>/dev/null
@@ -5872,6 +6133,7 @@ prepare_low_memory() {
         || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
         mkdir -p /etc/sysctl.d 2>/dev/null
         printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null
+        chmod 644 /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null || true
         info "已放开内存申请限制（小内存机器需要这一步）"
       fi
     fi
@@ -6259,6 +6521,171 @@ _dl_singbox_inner() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使�
   fi
 }
 
+# ---------- 下载 Snell 内核（v4 / v5） ----------
+# 官方 snell-server 发布在 dl.nssurge.com，压缩包仅约 1.2MB，小内存机器也能跑。
+# 注意：官方程序依赖 glibc，Alpine（musl）系统通常跑不起来；下载后会试运行检查。
+SNELL4_FALLBACK="4.1.1"
+SNELL5_FALLBACK="5.0.1"
+SNELL_KB_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
+SNELL_KB_HTML_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
+
+_snell_arch() {
+  case "$MACH" in
+    amd64) printf '%s' amd64 ;;
+    arm64) printf '%s' aarch64 ;;
+    armv7) printf '%s' armv7l ;;
+    *) return 1 ;;
+  esac
+}
+
+# 官方 4.1.1 / 5.0.1 安装包的 SHA256 校验值（dl.nssurge.com 不单独提供 hashes 文件）。
+_snell_expect_sum() { # _snell_expect_sum <版本号> <snell架构>
+  case "$1:$2" in
+    4.1.1:amd64)   printf '%s' cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b ;;
+    4.1.1:aarch64) printf '%s' 38d4cdc03dcdb3608af8594df83e1795265167fafc5d802f815148908902d758 ;;
+    4.1.1:armv7l)  printf '%s' d00b98ed803be4039f0f0630b810932cd3d3d87ee3e6ed224106fdc63347d8e6 ;;
+    5.0.1:amd64)   printf '%s' 9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539 ;;
+    5.0.1:aarch64) printf '%s' 2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf ;;
+    5.0.1:armv7l)  printf '%s' 14489f3e857569c8835dd3598b7ea6bca5371d4290ac7cf0f6c8dfb3381c1fb2 ;;
+    *) return 1 ;;
+  esac
+}
+
+_snell_local_ver() { # _snell_local_ver <二进制> -> 版本号（不带 v）
+  "$1" --v </dev/null 2>&1 | awk '
+    {
+      if (match($0, /v[0-9]+\.[0-9]+\.[0-9]+/)) {
+        print substr($0, RSTART + 1, RLENGTH - 1)
+        exit
+      }
+    }
+  '
+}
+
+_snell_bin_ok() { # _snell_bin_ok <二进制>：试运行 --v，确认不是缺 glibc/架构不符/崩溃
+  _sbo_out=$("$1" --v </dev/null 2>&1)
+  _sbo_rc=$?
+  _SNELL_LAST_ERR="$_sbo_out"
+  _SNELL_LAST_RC="$_sbo_rc"
+  if [ "$_sbo_rc" -eq 126 ] || [ "$_sbo_rc" -eq 127 ] || [ "$_sbo_rc" -ge 128 ]; then
+    return 1
+  fi
+  if printf '%s' "$_sbo_out" | grep -qiE 'not found|GLIBC_|libc\.so|ld-linux|Exec format error|cannot execute'; then
+    return 1
+  fi
+  if [ "$_sbo_rc" -eq 0 ] || printf '%s' "$_sbo_out" | grep -qi 'snell'; then
+    return 0
+  fi
+  return 1
+}
+
+_latest_snell_ver() { # _latest_snell_ver <4|5> -> 最新正式版版本号（不带 v）
+  _lsv_maj="$1"
+  if [ "$_lsv_maj" = "5" ]; then _lsv_fb="$SNELL5_FALLBACK"; else _lsv_fb="$SNELL4_FALLBACK"; fi
+  _lsv_body=$(_http_body "$SNELL_KB_URL" 2>/dev/null) || _lsv_body=""
+  [ -n "$_lsv_body" ] || _lsv_body=$(_http_body "$SNELL_KB_HTML_URL" 2>/dev/null) || _lsv_body=""
+  if [ -n "$_lsv_body" ]; then
+    _lsv_found=$(printf '%s\n' "$_lsv_body" | awk -v maj="$_lsv_maj" -v fb="$_lsv_fb" '
+      function gt(a, b,  na, nb, n, i, x, y) {
+        na = split(a, x, "."); nb = split(b, y, ".")
+        n = na > nb ? na : nb
+        for (i = 1; i <= n; i++) {
+          if ((x[i] + 0) > (y[i] + 0)) return 1
+          if ((x[i] + 0) < (y[i] + 0)) return 0
+        }
+        return 0
+      }
+      BEGIN { best = fb; pat = "snell-server-v" maj "\\.[0-9]+\\.[0-9]+-" }
+      {
+        s = $0
+        while (match(s, pat)) {
+          v = substr(s, RSTART + 14, RLENGTH - 15)
+          if (gt(v, best)) best = v
+          s = substr(s, RSTART + RLENGTH)
+        }
+      }
+      END { print best }
+    ')
+    case "$_lsv_found" in ''|*[!0-9.]*) ;; *) printf '%s' "$_lsv_found"; return 0 ;; esac
+  fi
+  printf '%s' "$_lsv_fb"
+}
+
+# dl.nssurge.com 只有 IPv4 地址；纯 IPv6 机器先试直连（可能已有 DNS64），不通再临时开 NAT64/DNS64。
+_snell_prepare() {
+  [ "$_DNS64_ON" = "1" ] && return 0
+  _no_ipv4_route || return 0
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSI --connect-timeout 8 --max-time 12 "https://dl.nssurge.com/snell/snell-server-v${SNELL4_FALLBACK}-linux-amd64.zip" >/dev/null 2>&1 && return 0
+  elif command -v getent >/dev/null 2>&1; then
+    getent ahostsv6 dl.nssurge.com >/dev/null 2>&1 && return 0
+  fi
+  _dns64_on || return 0
+  return 0
+}
+
+_dl_snell_inner() { # _dl_snell_inner <4|5>
+  _sn_maj="$1"
+  if [ "$_sn_maj" = "5" ]; then
+    _sn_bin="$SNELL5_BIN"; _sn_our="snell-server-v5"
+  else
+    _sn_maj="4"; _sn_bin="$SNELL4_BIN"; _sn_our="snell-server-v4"
+  fi
+  step "[下载] 获取 Snell v${_sn_maj} 内核…"
+  _sn_arch=$(_snell_arch) || die "这个 CPU 架构没有对应的 Snell 程序：$(uname -m)"
+  if [ "$FORCE_DL" != "1" ] && [ -x "$_sn_bin" ] && _snell_bin_ok "$_sn_bin"; then
+    _sn_have=$(_snell_local_ver "$_sn_bin")
+    info "Snell v${_sn_maj} 已存在，直接用现有的：v${_sn_have:-${_sn_maj}}"
+    return 0
+  fi
+  _ensure_unzip
+  DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
+  _sn_ver=$(_latest_snell_ver "$_sn_maj")
+  _sn_zip="$DL_DIR/snell-v${_sn_maj}.zip"
+  _sn_url="https://dl.nssurge.com/snell/snell-server-v${_sn_ver}-linux-${_sn_arch}.zip"
+  rm -f "$_sn_zip"
+  info "尝试下载：${_sn_url}"
+  if ! _http_save "$_sn_url" "$_sn_zip" || [ ! -s "$_sn_zip" ]; then
+    rm -f "$_sn_zip"
+    if _no_ipv4_route; then
+      die "Snell v${_sn_maj} 下载失败：这台机器没有 IPv4，而 dl.nssurge.com 只有 IPv4 地址，临时 NAT64 也没连上。请先加 IPv4 出口（WARP）或换用其它协议。"
+    fi
+    die "Snell v${_sn_maj} 下载失败：无法连接 dl.nssurge.com，请稍后重跑脚本试试。"
+  fi
+  if _sn_want=$(_snell_expect_sum "$_sn_ver" "$_sn_arch"); then
+    _sn_got_sum=$(_sha256_of "$_sn_zip")
+    if [ -n "$_sn_got_sum" ] && [ "$_sn_got_sum" != "$_sn_want" ]; then
+      rm -f "$_sn_zip"
+      die "下载的 snell-server-v${_sn_ver}-linux-${_sn_arch}.zip SHA256 校验没通过，已删除，不安装。"
+    fi
+    [ -n "$_sn_got_sum" ] && info "SHA256 校验通过：snell-server-v${_sn_ver}-linux-${_sn_arch}.zip"
+  fi
+  unzip -t -q "$_sn_zip" >/dev/null 2>&1 || { rm -f "$_sn_zip"; die "下载的 Snell 安装包已损坏，请重跑脚本重新下载"; }
+  rm -rf "$DL_DIR/snell-dl" && mkdir -p "$DL_DIR/snell-dl"
+  rm -f "${_sn_bin}.new"
+  _pace_start
+  unzip -o -q "$_sn_zip" -d "$DL_DIR/snell-dl" snell-server || { _pace_stop; rm -rf "$DL_DIR"; die "Snell 解压失败"; }
+  [ -s "$DL_DIR/snell-dl/snell-server" ] || { _pace_stop; rm -rf "$DL_DIR"; die "解压后没找到 snell-server 文件"; }
+  install -m 0755 "$DL_DIR/snell-dl/snell-server" "${_sn_bin}.new" || { _pace_stop; rm -rf "$DL_DIR"; rm -f "${_sn_bin}.new"; die "安装 Snell 失败"; }
+  _pace_stop
+  rm -rf "$DL_DIR"
+  drop_page_cache
+  if ! _snell_bin_ok "${_sn_bin}.new"; then
+    rm -f "${_sn_bin}.new"
+    if [ -f /etc/alpine-release ] || printf '%s' "${_SNELL_LAST_ERR:-}" | grep -qiE 'not found|GLIBC_|libc\.so|ld-linux'; then
+      die "下载的 Snell v${_sn_maj} 跑不起来（退出码 ${_SNELL_LAST_RC:-未知}）：官方 Snell 程序依赖 glibc，Alpine（musl）或老版 glibc 系统无法直接运行。请换 Debian / Ubuntu / CentOS / Arch，或改选 VLESS / Hysteria2 / AnyTLS / TUIC 等协议。系统说：$(printf '%s' "${_SNELL_LAST_ERR:-}" | tr '\n' ' ' | cut -c1-300)"
+    fi
+    die "下载的 Snell v${_sn_maj} 内核跑不起来（退出码 ${_SNELL_LAST_RC:-未知}）。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "${_SNELL_LAST_ERR:-}" | tr '\n' ' ' | cut -c1-300)"
+  fi
+  mv -f "${_sn_bin}.new" "$_sn_bin"
+  _dns64_off
+  mark_our_bin "$_sn_our"
+  _sn_have=$(_snell_local_ver "$_sn_bin")
+  info "Snell v${_sn_maj} 安装成功：v${_sn_have:-$_sn_ver}"
+}
+
+dl_snell() { _snell_prepare; _dl_snell_inner "$1"; _dl_rc=$?; _dns64_off; return "$_dl_rc"; }
+
 # ---------- 1. 必须是 root ----------
 # 装软件、写系统配置、改防火墙都要管理员（root）权限，普通用户做不了。
 if [ "$(id -u)" -ne 0 ]; then
@@ -6282,7 +6709,8 @@ _dns_fix_broken || true
 for _sec_dir in /etc/xray-node /etc/xray-node/nodes /etc/xray-node/nodes/*/; do
   [ -d "$_sec_dir" ] && chmod 700 "$_sec_dir"
 done
-for _sec_file in /etc/xray-node/nodes/*/config.json /etc/xray-node/nodes/*/node.txt \
+for _sec_file in /etc/xray-node/nodes/*/config.json /etc/xray-node/nodes/*/config.yaml \
+  /etc/xray-node/nodes/*/config.conf /etc/xray-node/nodes/*/node.txt \
   /etc/xray-node/nodes/*/fw_info /etc/xray-node/nodes/*/core \
   /etc/xray-node/nodes/*/key.pem /etc/xray-node/nodes/*/cert.pem \
   /etc/xray-node/nodes/*/expire \
@@ -6310,6 +6738,8 @@ printf "同一个菜单里可以关闭 IPv6：关掉之后，这台服务器只�
 XRAY_BIN="/usr/local/bin/xray"
 SB_BIN="/usr/local/bin/sing-box"
 HY_BIN="/usr/local/bin/hysteria"
+SNELL4_BIN="/usr/local/bin/snell-server-v4"
+SNELL5_BIN="/usr/local/bin/snell-server-v5"
 LOW_MEM=0
 SWAP_OK=0
 MEM_MB=""
@@ -6339,8 +6769,10 @@ _drop_partial_node() {
     case "$_dp_core" in
       sing-box) _dp_units="singbox-node@${_dp_id}" ;;
       hysteria) _dp_units="hysteria-node@${_dp_id}" ;;
+      snell-v4) _dp_units="snell-v4-node@${_dp_id}" ;;
+      snell-v5) _dp_units="snell-v5-node@${_dp_id}" ;;
       xray) _dp_units="xray-node@${_dp_id}" ;;
-      *) _dp_units="xray-node@${_dp_id} singbox-node@${_dp_id} hysteria-node@${_dp_id}" ;;
+      *) _dp_units="xray-node@${_dp_id} singbox-node@${_dp_id} hysteria-node@${_dp_id} snell-v4-node@${_dp_id} snell-v5-node@${_dp_id}" ;;
     esac
     for _dp_unit in $_dp_units; do
       systemctl stop "$_dp_unit" >/dev/null 2>&1
@@ -6355,11 +6787,15 @@ _drop_partial_node() {
   fi
   pkill -f "${_dp_dir%/}/config.json" >/dev/null 2>&1
   pkill -f "${_dp_dir%/}/config.yaml" >/dev/null 2>&1
+  pkill -f "${_dp_dir%/}/config.conf" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_dp_id" >/dev/null 2>&1
   [ -x /usr/local/bin/xray-node-route ] && /usr/local/bin/xray-node-route down "$_dp_id" >/dev/null 2>&1
   # 装到一半为这个节点放行的防火墙端口（证书用的 fw_acme、节点自己的 fw_info）也撤掉
   _dp_watch="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-watch"
   _dp_d="${_dp_dir%/}"
+  if [ ! -x "$_dp_watch" ] && { [ -f "$_dp_d/fw_info" ] || [ -f "$_dp_d/fw_acme" ]; }; then
+    install_watch_bin >/dev/null 2>&1 || true
+  fi
   if [ -x "$_dp_watch" ]; then
     if [ -f "$_dp_d/fw_acme" ] && [ "$(cat "$_dp_d/fw_acme.state" 2>/dev/null)" != "closed" ]; then
       "$_dp_watch" undo "$_dp_d/fw_acme" >/dev/null 2>&1
@@ -6761,39 +7197,47 @@ _ver_stable() { # _ver_stable <版本号>：正式版（只有数字和点，比
   return 0
 }
 
-# _update_one_core <xray|sing-box|hysteria>：有更新的正式版就升级，并重启用这个内核的节点；
+# _update_one_core <xray|sing-box|hysteria|snell-v4|snell-v5>：有更新的正式版就升级，并重启用这个内核的节点；
 # 新版跑不起来自动回滚。整个函数在子 shell 里跑，里面 die 只退出这个函数，返回非零。
 _update_one_core() (
   _ucore="$1"
-  if [ "$_ucore" = "xray" ]; then
-    _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN"
-  elif [ "$_ucore" = "hysteria" ]; then
-    _u_repo="apernet/hysteria"; _u_bin="$HY_BIN"
-  else
-    _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN"
-  fi
+  _u_our="$_ucore"
+  _u_snell_maj=""
+  case "$_ucore" in
+    xray)     _u_repo="XTLS/Xray-core"; _u_bin="$XRAY_BIN" ;;
+    hysteria) _u_repo="apernet/hysteria"; _u_bin="$HY_BIN" ;;
+    snell-v4) _u_repo=""; _u_bin="$SNELL4_BIN"; _u_our="snell-server-v4"; _u_snell_maj="4" ;;
+    snell-v5) _u_repo=""; _u_bin="$SNELL5_BIN"; _u_our="snell-server-v5"; _u_snell_maj="5" ;;
+    *)        _u_repo="SagerNet/sing-box"; _u_bin="$SB_BIN" ;;
+  esac
   # 首次安装时会复用机器上已有的内核；那可能属于其他服务，不能覆盖升级。
-  if ! grep -qx "$_ucore" /etc/xray-node/our_bins 2>/dev/null; then
+  if ! grep -qx "$_u_our" /etc/xray-node/our_bins 2>/dev/null; then
     warn "$_ucore 是机器上原有的内核，跳过升级，避免影响其他服务"
     exit 0
   fi
   _u_inst=""
   if [ -x "$_u_bin" ]; then
-    if [ "$_ucore" = "hysteria" ]; then
-      _u_inst=$(_hysteria_local_ver "$_u_bin")
-    else
-      _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)")
-    fi
+    case "$_ucore" in
+      hysteria) _u_inst=$(_hysteria_local_ver "$_u_bin") ;;
+      snell-v4|snell-v5) _u_inst=$(_snell_local_ver "$_u_bin") ;;
+      *) _u_inst=$(_ver_num "$("$_u_bin" version 2>/dev/null | head -1)") ;;
+    esac
   fi
-  _gh_prepare
-  if [ "$_ucore" = "hysteria" ]; then
-    _u_latest=$(_latest_hysteria_ver) || _u_latest=""
+  if [ -n "$_u_snell_maj" ]; then
+    _snell_prepare
+    _u_latest=$(_latest_snell_ver "$_u_snell_maj") || _u_latest=""
+    _dns64_off
   else
-    _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+    _gh_prepare
+    if [ "$_ucore" = "hysteria" ]; then
+      _u_latest=$(_latest_hysteria_ver) || _u_latest=""
+    else
+      _u_latest=$(_latest_tag "$_u_repo") || _u_latest=""
+    fi
+    _dns64_off
   fi
-  _dns64_off
   if [ -z "$_u_latest" ]; then
-    warn "连不上 api.github.com，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
+    warn "连不上更新源，$_ucore 检查更新失败，跳过（节点不受影响，继续正常使用）。"
     exit 0
   fi
   # 只升级到正式版：最新发布是 beta / rc 这类测试版就不动
@@ -6804,10 +7248,14 @@ _update_one_core() (
   if [ -n "$_u_inst" ]; then
     # 装的是测试版（比如 1.13.0-beta.2）时，同号的正式版 1.13.0 也算更新
     _u_inst_pre=0
-    if [ "$_ucore" != "hysteria" ] && [ -x "$_u_bin" ]; then
-      _u_inst_full=$("$_u_bin" version 2>/dev/null | head -1 | sed 's/^[^0-9]*//; s/[[:space:]].*//')
-      [ "$_u_inst_full" = "$_u_inst" ] || _u_inst_pre=1
-    fi
+    case "$_ucore" in
+      xray|sing-box)
+        if [ -x "$_u_bin" ]; then
+          _u_inst_full=$("$_u_bin" version 2>/dev/null | head -1 | sed 's/^[^0-9]*//; s/[[:space:]].*//')
+          [ "$_u_inst_full" = "$_u_inst" ] || _u_inst_pre=1
+        fi
+        ;;
+    esac
     if ! _ver_gt "$_u_latest" "$_u_inst" && ! { [ "$_u_inst_pre" = "1" ] && [ "$_u_inst" = "$_u_latest" ]; }; then
       if [ "$_u_inst_pre" = "1" ]; then
         info "$_ucore 现在装的是测试版 v${_u_inst_full}，比最新正式版 v${_u_latest} 还新，不动它。"
@@ -6842,10 +7290,13 @@ _update_one_core() (
   # 这时把备份删掉，免得每次失败都在 /usr/local/bin 留一个几十 MB 的备份。
   if ! (
     FORCE_DL=1
-    if [ "$_ucore" = "xray" ]; then dl_xray
-    elif [ "$_ucore" = "hysteria" ]; then dl_hysteria
-    else dl_singbox
-    fi
+    case "$_ucore" in
+      xray)     dl_xray ;;
+      hysteria) dl_hysteria ;;
+      snell-v4) dl_snell 4 ;;
+      snell-v5) dl_snell 5 ;;
+      *)        dl_singbox ;;
+    esac
   ); then
     [ -z "$_u_backup" ] || rm -f "$_u_backup"
     die "$_ucore 新版本没装上（上面有原因），旧内核没动，节点照常使用"
@@ -6919,6 +7370,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
   _hy_migrate_hop_all
   _hy_fix_existing_ipv6
   _fix_existing_json_ipv6
+  _fix_existing_snell_ipv6
   _quic_unblock_all
   step "[更新] 检查已安装的内核版本…"
   # 收集所有节点用到的内核（去重）
@@ -6927,7 +7379,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     [ -f "${_ud}core" ] || continue
     _uc=$(tr -d ' \r\n' 2>/dev/null < "${_ud}core")
     case "$_uc" in
-      xray|sing-box|hysteria)
+      xray|sing-box|hysteria|snell-v4|snell-v5)
         case " $_u_cores " in *" $_uc "*) ;; *) _u_cores="$_u_cores $_uc" ;; esac
         ;;
     esac
@@ -7074,7 +7526,7 @@ case "$SERVER_IP" in
 esac
 
 # ---------- 4. 问：协议 ----------
-# 7 种协议任选一种。看不懂就用默认 1（VLESS + REALITY + Vision），目前最不容易被识别。
+# 9 种协议任选一种。看不懂就用默认 1（VLESS + REALITY + Vision），目前最不容易被识别。
 step "[2/4] 选一个协议"
 printf "  1) VLESS + REALITY + Vision（推荐，最难被识别）\n"
 printf "  2) VMess + WebSocket（兼容性好，老客户端也支持）\n"
@@ -7083,6 +7535,8 @@ printf "  4) Shadowsocks（最简单，速度不错）\n"
 printf "  5) AnyTLS + REALITY（新协议，表现不错）\n"
 printf "  6) Hysteria2（UDP，速度快，弱网表现好。可以选混淆和端口跳跃）\n"
 printf "  7) TUIC（UDP，低延迟）\n"
+printf "  8) Snell v4（Surge 生态轻量协议，低延迟高吞吐；支持 Surge / Loon / Clash Meta / 小火箭）\n"
+printf "  9) Snell v5（Surge 生态新版，含 QUIC 代理模式，兼容 v4 客户端；需同时放行 TCP 和 UDP）\n"
 while true; do
   ask "请选择" "1" _proto
   case "$_proto" in
@@ -7093,6 +7547,8 @@ while true; do
     5) PROTO="anytls"; break ;;
     6) PROTO="hy2"; break ;;
     7) PROTO="tuic"; break ;;
+    8) PROTO="snell4"; break ;;
+    9) PROTO="snell5"; break ;;
     *) warn "没有这个选项，请重新选择" ;;
   esac
 done
@@ -7104,14 +7560,23 @@ case "$PROTO" in
   anytls) PROTO_NAME="AnyTLS + REALITY"; _nm_proto="AnyTLS" ;;
   hy2)    PROTO_NAME="Hysteria2"; _nm_proto="Hysteria2" ;;
   tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
+  snell4) PROTO_NAME="Snell v4"; _nm_proto="Snell4" ;;
+  snell5) PROTO_NAME="Snell v5"; _nm_proto="Snell5" ;;
 esac
+if [ "$PROTO" = "snell4" ] || [ "$PROTO" = "snell5" ]; then
+  if [ -f /etc/alpine-release ]; then
+    warn "检测到这是 Alpine 系统（musl）：官方 Snell 程序依赖 glibc，大概率跑不起来（Debian / Ubuntu / CentOS / Arch 原生支持）。如果没装过 glibc 兼容环境，下载试运行后会停止，届时可改选 1-7 中的协议。"
+  fi
+fi
 # 创建节点前先问名字
 _ask_node_name "$_nm_proto"
-# 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。
+# 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。Snell v4 / v5 用官方 snell-server。
 # Hysteria2 用官方 hysteria：sing-box 1.14 解压后约 80MB，64MB 内存的 NAT 会在下载或启动时被撑死。
 case "$PROTO" in
   hy2) CORE="hysteria" ;;
   anytls|tuic) CORE="sing-box" ;;
+  snell4) CORE="snell-v4" ;;
+  snell5) CORE="snell-v5" ;;
   *) CORE="xray" ;;
 esac
 # 内存很小的机器上已经有节点了：每个节点都要占二三十 MB，再加一个可能把旧节点挤掉
@@ -7126,7 +7591,7 @@ fi
 step "[3/4] 节点用哪个端口？"
 case "$PROTO" in
   hy2|tuic) _PORT_PROTO=udp ;;
-  ss) _PORT_PROTO=both ;;
+  ss|snell5) _PORT_PROTO=both ;;
   *) _PORT_PROTO=tcp ;;
 esac
 _DEF_PORT=$(rand_port "$_PORT_PROTO") || die "找不到空闲端口，请检查这台机器的端口占用情况"
@@ -7198,11 +7663,15 @@ HY2_CERT_HOST="deb.debian.org"
 HY2_PUBPIN=""
 HY2_BW_DOWN=""
 HY2_BW_UP=""
+SNELL_OBFS="off"
+SNELL_OBFS_HOST=""
 if [ "$PROTO" = "hy2" ]; then
   _hy_ask_hop
   _hy_ask_obfs
   _hy_ask_domain
   _hy_ask_bw
+elif [ "$PROTO" = "snell4" ] || [ "$PROTO" = "snell5" ]; then
+  _snell_ask_obfs
 fi
 
 # ---------- 6. REALITY 伪装域名 ----------
@@ -7275,6 +7744,8 @@ HY2_PASS=$(rand_hex 32)
 HY2_OBFS=$(rand_hex 32)
 TUIC_PASS=$(rand_hex 16)
 TUIC_PIN=""
+# Snell PSK：32 位随机字符（官方向导默认 32 位，纯字母数字避免引号/转义问题）
+SNELL_PSK=$(rand_hex 16)
 if command -v openssl >/dev/null 2>&1; then
   SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
 else
@@ -7286,14 +7757,14 @@ WS_PATH="/$(rand_hex 16)"  # 16 字节随机路径，防止被轻易探测
 info "账号密码已随机生成（装完会显示在链接里，完整参数平时输入 jiedian all 能看）"
 
 # ---------- 8. 下载内核 ----------
-# 1-4 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria。已经有能用的就不重复下载。
-if [ "$CORE" = "xray" ]; then
-  dl_xray
-elif [ "$CORE" = "hysteria" ]; then
-  dl_hysteria
-else
-  dl_singbox
-fi
+# 1-4 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria，8 和 9 用官方 snell-server。已经有能用的就不重复下载。
+case "$CORE" in
+  xray)     dl_xray ;;
+  hysteria) dl_hysteria ;;
+  snell-v4) dl_snell 4 ;;
+  snell-v5) dl_snell 5 ;;
+  *)        dl_singbox ;;
+esac
 
 # ---------- 9. REALITY 密钥对 ----------
 # REALITY 用一对密钥：私钥只留在服务器上，公钥（pbk）写进分享链接给客户端。shortId（sid）是额外的随机短编号。
@@ -7618,7 +8089,7 @@ if [ -n "$HY_HOP_PORTS" ]; then
 fi
 info "配置文件已写入"
 
-else
+elif [ "$CORE" = "sing-box" ]; then
 # ---------- sing-box 配置（AnyTLS / TUIC） ----------
 SB_CONF="$NODE_DIR/config.json"
 # 机器能听 IPv6 就写 ::（双栈：IPv4、IPv6 客户端都能连），不能就照旧只听 IPv4
@@ -7678,6 +8149,32 @@ esac
 _sb_test=$("$SB_BIN" check -c "$SB_CONF" 2>&1) \
   || die "配置文件校验没通过。$(printf '%s' "$_sb_test" | tr '\n' ' ' | cut -c1-300)"
 info "配置文件校验通过"
+
+else
+# ---------- Snell 配置（v4 / v5） ----------
+SNELL_CONF="$NODE_DIR/config.conf"
+case "$SNELL_PSK" in
+  *[!0-9a-f]*|"") die "随机 PSK 生成失败，没有装上节点" ;;
+esac
+[ "${#SNELL_PSK}" -eq 32 ] || die "随机 PSK 生成失败，没有装上节点"
+if [ "$IPVER" = "6" ] || _v6_listen_ok; then
+  SNELL_LISTEN="::0"
+  SNELL_IPV6="true"
+else
+  SNELL_LISTEN="0.0.0.0"
+  SNELL_IPV6="false"
+fi
+{
+  printf '[snell-server]\n'
+  printf 'listen = %s:%s\n' "$SNELL_LISTEN" "$PORT"
+  printf 'psk = %s\n' "$SNELL_PSK"
+  printf 'ipv6 = %s\n' "$SNELL_IPV6"
+  if [ "$SNELL_OBFS" = "http" ]; then
+    printf 'obfs = http\n'
+  fi
+} > "$SNELL_CONF"
+chmod 600 "$SNELL_CONF" 2>/dev/null
+info "Snell 配置文件已写入"
 fi
 
 # ---------- 11. 开机自启（每个节点独立服务，互不干扰） ----------
@@ -7757,20 +8254,21 @@ if [ "$_svc_listen_ok" = "1" ]; then
   elif command -v rc-service >/dev/null 2>&1; then
     rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
   else
-    if [ "$CORE" = "hysteria" ]; then
-      _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.yaml"
-    else
-      _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.json"
-    fi
+    case "$CORE" in
+      hysteria) _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.yaml" ;;
+      snell-v4|snell-v5) _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.conf" ;;
+      *) _svc_cfg_pat="/etc/xray-node/nodes/${NODE_ID}/config.json" ;;
+    esac
     if command -v pgrep >/dev/null 2>&1; then
       pgrep -f "$_svc_cfg_pat" >/dev/null 2>&1 || _svc_listen_ok=0
     fi
   fi
 fi
 # 端口在听，并且这个节点自己的服务还在，才算起来了。
-_svc_recheck() { # _svc_recheck [等几秒]
+_svc_recheck() { # _svc_recheck [等几秒] [协议]
   _svc_listen_ok=1
-  if ! wait_for_port "$PORT" udp "${1:-15}"; then
+  _sr_proto="${2:-udp}"
+  if ! wait_for_port "$PORT" "$_sr_proto" "${1:-15}"; then
     _svc_listen_ok=0
     return
   fi
@@ -7779,7 +8277,12 @@ _svc_recheck() { # _svc_recheck [等几秒]
   elif command -v rc-service >/dev/null 2>&1; then
     rc-service "xray-node-${NODE_ID}" status >/dev/null 2>&1 || _svc_listen_ok=0
   elif command -v pgrep >/dev/null 2>&1; then
-    pgrep -f "/etc/xray-node/nodes/${NODE_ID}/config.yaml" >/dev/null 2>&1 || _svc_listen_ok=0
+    case "$CORE" in
+      hysteria) _sr_pat="/etc/xray-node/nodes/${NODE_ID}/config.yaml" ;;
+      snell-v4|snell-v5) _sr_pat="/etc/xray-node/nodes/${NODE_ID}/config.conf" ;;
+      *) _sr_pat="/etc/xray-node/nodes/${NODE_ID}/config.json" ;;
+    esac
+    pgrep -f "$_sr_pat" >/dev/null 2>&1 || _svc_listen_ok=0
   fi
 }
 # 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
@@ -7795,10 +8298,28 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$P
   if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
   HY_EXTRA_IP=""
   if _hy_set_listen "$NODE_DIR/config.yaml" "$HY_LISTEN"; then
-    [ -f "$NODE_DIR/hop" ] && sed -i "s/^family=.*/family=${IPVER}/" "$NODE_DIR/hop" 2>/dev/null
+    _hop_set_family "$NODE_DIR" "$IPVER"
     _svc_restart "$NODE_ID"
     _svc_recheck
   fi
+fi
+if [ "$_svc_listen_ok" != "1" ] && { [ "$PROTO" = "snell4" ] || [ "$PROTO" = "snell5" ]; } \
+  && [ "$SNELL_LISTEN" = "::0" ] && [ "$IPVER" = "4" ]; then
+  warn "Snell 同时听 IPv4 和 IPv6 没成功，改回只听 IPv4 再试一次"
+  SNELL_LISTEN="0.0.0.0"
+  SNELL_IPV6="false"
+  {
+    printf '[snell-server]\n'
+    printf 'listen = %s:%s\n' "$SNELL_LISTEN" "$PORT"
+    printf 'psk = %s\n' "$SNELL_PSK"
+    printf 'ipv6 = %s\n' "$SNELL_IPV6"
+    if [ "$SNELL_OBFS" = "http" ]; then
+      printf 'obfs = http\n'
+    fi
+  } > "$SNELL_CONF"
+  chmod 600 "$SNELL_CONF" 2>/dev/null
+  _svc_restart "$NODE_ID"
+  _svc_recheck 15 tcp
 fi
 # 端口跳跃：不靠“从本机连跳跃端口”来验（本机发给自己的包根本不经过 PREROUTING，永远测不通），
 # 而是看转发规则是不是真的写进了系统。服务启动时已经自动打开过一次。
@@ -7830,12 +8351,20 @@ if [ "$_svc_listen_ok" = "1" ] && [ "$PROTO" = "hy2" ] && [ -n "$HY_HOP_PORTS" ]
       HY_HOP_V4=0
       warn "IPv4 上做不了端口转发，端口跳跃只在 IPv6 上生效（IPv4 那行链接只用主端口）"
     fi
-    [ "$_hop_fam" != "$_hop_want" ] && sed -i "s/^family=.*/family=${_hop_fam}/" "$NODE_DIR/hop" 2>/dev/null
+    [ "$_hop_fam" != "$_hop_want" ] && _hop_set_family "$NODE_DIR" "$_hop_fam"
     info "端口跳跃已打开（${_hop_state}）。服务每次启动都会自动打开，停掉时自动拆掉，重启服务器后也在。"
   fi
 fi
 if [ "$_svc_listen_ok" = "1" ]; then
-  info "端口 $PORT 已在监听，服务真正跑起来了"
+  if [ "$PROTO" = "snell5" ]; then
+    if wait_for_port "$PORT" udp 3; then
+      info "端口 $PORT/TCP 和 $PORT/UDP 已在监听，Snell v5（含 QUIC 代理模式）已启动"
+    else
+      info "端口 $PORT/TCP 已在监听，Snell v5 服务已启动（UDP 未监听，常规代理和 v4 兼容可正常使用）"
+    fi
+  else
+    info "端口 $PORT 已在监听，服务真正跑起来了"
+  fi
 else
   echo "-------- 服务最后的日志 --------"
   if [ -n "$SVC_UNIT" ] && command -v journalctl >/dev/null 2>&1; then
@@ -7850,27 +8379,46 @@ fi
 # ---------- 12. 放行端口 ----------
 # 在这台服务器的防火墙上放行节点端口；云服务器的“安全组”要你自己在控制台放行。
 step "[网络] 放行端口…"
-# 各协议要放行的端口类型：ss 的 network 配的是 tcp,udp，两个都得放；
-# hy2/tuic 走 UDP；其余走 TCP
+# 各协议要放行的端口类型：ss 和 Snell v5（含 QUIC 代理模式）需要 TCP 和 UDP；
+# hy2/tuic 走 UDP；其余（含 Snell v4）走 TCP
 _FW_PROTOS="tcp"
 case "$PROTO" in
   hy2|tuic) _FW_PROTOS="udp" ;;
-  ss) _FW_PROTOS="tcp udp" ;;
+  ss|snell5) _FW_PROTOS="tcp udp" ;;
 esac
 # 逐个协议放行，并记到该节点的 fw_info 里给 shanjiedian 用：
 # 只删我们亲手加的规则，用户机器上本来就有的不碰。
 # 新节点编号不会重用，不可能有旧规则残留，无需清理。
 : > "$NODE_DIR/fw_info"
-# Hysteria2 两种地址都听时，IPv4 和 IPv6 的防火墙要分别放行。
+# 双栈监听的节点（同时收 IPv4 和 IPv6），IPv4 和 IPv6 的防火墙要分别放行。
 # 端口跳跃的跳跃端口不用在本机防火墙放行：nat 转发发生在防火墙检查之前，
 # 防火墙看到的已经是主端口。云服务器的安全组在机器外面，那里还是要放行跳跃端口。
 _FW_FAMILIES="$IPVER"
-if [ "$PROTO" = "hy2" ]; then
-  case "$HY_LISTEN" in
-    ":$PORT"|":$PORT,$HY_HOP_PORTS")
-      if [ "$IPVER" = "6" ]; then _FW_FAMILIES="6 4"; else _FW_FAMILIES="4 6"; fi
-      ;;
-  esac
+_fw_dual=0
+case "$CORE" in
+  hysteria)
+    case "$HY_LISTEN" in
+      ":$PORT"|":$PORT,$HY_HOP_PORTS") _fw_dual=1 ;;
+    esac
+    ;;
+  xray)
+    if [ "${XRAY_LISTEN:-}" = "::" ]; then
+      if [ "$IPVER" = "4" ] || _hy_local_ipv4 >/dev/null 2>&1; then _fw_dual=1; fi
+    fi
+    ;;
+  sing-box)
+    if [ "${SB_LISTEN:-}" = "::" ]; then
+      if [ "$IPVER" = "4" ] || _hy_local_ipv4 >/dev/null 2>&1; then _fw_dual=1; fi
+    fi
+    ;;
+  snell-v4|snell-v5)
+    if [ "${SNELL_LISTEN:-}" = "::0" ]; then
+      if [ "$IPVER" = "4" ] || _hy_local_ipv4 >/dev/null 2>&1; then _fw_dual=1; fi
+    fi
+    ;;
+esac
+if [ "$_fw_dual" = "1" ]; then
+  if [ "$IPVER" = "6" ]; then _FW_FAMILIES="6 4"; else _FW_FAMILIES="4 6"; fi
 fi
 _FW_PORT_LIST=$PORT
 _FW_SAVE4=0
@@ -7935,7 +8483,15 @@ if [ "$PROTO" = "hy2" ]; then
   fi
   warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 ${_hy_cloud}"
 else
-  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $PORT 端口"
+  case "$_FW_PROTOS" in
+    "tcp udp") _fw_pname="TCP 和 UDP" ;;
+    udp) _fw_pname="UDP" ;;
+    *) _fw_pname="TCP" ;;
+  esac
+  _fw_cmsg="${_fw_pname} ${LINK_PORT} 端口"
+  [ "$LINK_PORT" != "$PORT" ] && _fw_cmsg="${_fw_cmsg}（本机监听端口 ${PORT}）"
+  [ "$_fw_dual" = "1" ] && _fw_cmsg="${_fw_cmsg}（IPv4 和 IPv6 都要放）"
+  warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 ${_fw_cmsg}"
 fi
 
 # ---------- 13. 生成节点链接 ----------
@@ -7944,6 +8500,7 @@ step "[完成] 生成你的节点…"
 LINK_EXTRA=""
 LINK_HY_OFFICIAL=""
 LOON_LINE=""
+SURGE_LINE=""
 _hy_mport_x=""
 # 名字在选完协议后已经问过了（NODE_NAME）
 printf '%s\n' "$NODE_NAME" > "$NODE_DIR/name"
@@ -8007,6 +8564,21 @@ case "$PROTO" in
   tuic)
     LINK="tuic://${UUID}:${TUIC_PASS}@${LINK_IP}:${LINK_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.samsung.com&allow_insecure=1#${NAME_ENC}"
     ;;
+  snell4|snell5)
+    SNELL_VER=4; [ "$PROTO" = "snell5" ] && SNELL_VER=5
+    _sn_q="version=${SNELL_VER}&reuse=true"
+    _sn_obfs_s=""
+    if [ "$SNELL_OBFS" = "http" ]; then
+      _sn_q="${_sn_q}&obfs=http&obfs-host=${SNELL_OBFS_HOST}"
+      _sn_obfs_s=", obfs=http, obfs-host=${SNELL_OBFS_HOST}"
+    fi
+    LINK="snell://${SNELL_PSK}@${LINK_IP}:${LINK_PORT}?${_sn_q}#${NAME_ENC}"
+    if [ "$SNELL_VER" = "5" ]; then
+      SURGE_LINE="${NODE_NAME} = snell, ${SERVER_IP}, ${LINK_PORT}, psk=${SNELL_PSK}, version=5, reuse=true${_sn_obfs_s}"
+    else
+      SURGE_LINE="${NODE_NAME} = snell, ${SERVER_IP}, ${LINK_PORT}, psk=${SNELL_PSK}, version=4, reuse=true${_sn_obfs_s}, block-quic=on"
+    fi
+    ;;
 esac
 
 # ---------- 14. 保存 + jiedian 命令 ----------
@@ -8052,6 +8624,10 @@ fi
     anytls)      printf "密码: %s\n" "$ANYTLS_PASS" ;;
     hy2)         printf "密码: %s\n" "$HY2_PASS" ;;
     tuic)        printf "UUID: %s\n" "$UUID"; printf "密码: %s\n" "$TUIC_PASS" ;;
+    snell4|snell5)
+      printf "PSK（密钥）: %s\n" "$SNELL_PSK"
+      printf "协议版本: v%s\n" "$SNELL_VER"
+      ;;
   esac
   case "$PROTO" in
     vless|trojan|anytls) printf "伪装域名: %s\n" "$REALITY_DOMAIN" ;;
@@ -8168,16 +8744,42 @@ fi
         printf "Surge 用下面那一行导入，已经锁定证书指纹。其它客户端如果有「证书指纹 / 证书锁定」，填上面的值再关掉「跳过证书验证」，别人就冒充不了服务器。\n"
       fi
       ;;
+    snell4|snell5)
+      printf "支持客户端: Surge、Loon、mihomo / Clash Meta / Clash Verge / Stash、小火箭 Shadowrocket（v2rayN 不支持 Snell）\n"
+      if [ "$SNELL_OBFS" = "http" ]; then
+        printf "混淆: http（obfs-host: %s）\n" "$SNELL_OBFS_HOST"
+      else
+        printf "混淆: 不开启\n"
+      fi
+      if [ "$SNELL_VER" = "5" ]; then
+        printf "Surge 节点配置（启用 v5 QUIC 代理模式，贴到 [Proxy] 下面）:\n%s\n" "$SURGE_LINE"
+        printf "说明: Snell v5 服务端向下兼容 v4 客户端（老客户端可把 version=5 改成 version=4）；需要同时放行端口 %s 的 TCP 和 UDP。\n" "$LINK_PORT"
+        printf "如果走 QUIC 容易断，改用下面「拦截 QUIC」里带 block-quic=on 的 Surge 行。\n"
+      else
+        printf "Surge 节点配置（贴到 [Proxy] 下面，已写好 block-quic=on）:\n%s\n" "$SURGE_LINE"
+      fi
+      printf "mihomo / Clash Meta / Stash 配置（贴到 proxies: 下面）:\n"
+      printf "  - name: \"%s\"\n    type: snell\n    server: %s\n    port: %s\n    psk: %s\n    version: %s\n    udp: true\n    reuse: true\n" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$SNELL_PSK" "$SNELL_VER"
+      if [ "$SNELL_OBFS" = "http" ]; then
+        printf "    obfs-opts:\n      mode: http\n      host: %s\n" "$SNELL_OBFS_HOST"
+      fi
+      ;;
   esac
   # 拦截 QUIC 是客户端的开关：给 Loon / Surge 各拼一行已经打开它的节点配置，再说明别的 App 怎么开
   CQ_PROTO="$PROTO"; CQ_NAME="$NODE_NAME"; CQ_HOST="$SERVER_IP"; CQ_PORT="$LINK_PORT"
   CQ_UUID="${UUID:-}"; CQ_SNI="${REALITY_DOMAIN:-}"; CQ_PBK="${REALITY_PUB:-}"; CQ_SID="${REALITY_SID:-}"
-  CQ_PATH="${WS_PATH:-}"; CQ_PASS=""
+  CQ_PATH="${WS_PATH:-}"; CQ_PASS=""; CQ_OBFS=""; CQ_OBFS_HOST=""
   case "$PROTO" in
     trojan) CQ_PASS="$TROJAN_PASS" ;;
     ss)     CQ_PASS="$SS_PASS" ;;
     anytls) CQ_PASS="$ANYTLS_PASS" ;;
     tuic)   CQ_PASS="$TUIC_PASS" ;;
+    snell4|snell5)
+      CQ_PASS="$SNELL_PSK"
+      CQ_OBFS="$SNELL_OBFS"
+      CQ_OBFS_HOST="$SNELL_OBFS_HOST"
+      ;;
   esac
   CQ_PIN=""
   [ "$PROTO" = "tuic" ] && CQ_PIN="${TUIC_PIN:-}"
@@ -8248,6 +8850,10 @@ if [ -n "$LOON_LINE" ]; then
   printf "${YELLOW}%s${NC}\n" "$LOON_LINE"
 else
   printf "Loon 不支持 %s，请用上面的通用链接。\n" "$PROTO_NAME"
+fi
+if [ -n "$SURGE_LINE" ]; then
+  printf "\n${CYAN}${BOLD}【3】Surge 节点${NC}（Surge 的 [Proxy] 下面，复制整行粘贴）\n\n"
+  printf "${YELLOW}%s${NC}\n" "$SURGE_LINE"
 fi
 printf "\n${GREEN}${BOLD}==============================================================${NC}\n"
 if [ "$NODE_KIND" = "timed" ]; then

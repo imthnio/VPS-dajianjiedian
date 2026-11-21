@@ -40,8 +40,8 @@
 | 路径 | 内容 |
 |---|---|
 | `/etc/xray-node/nodes/<编号>/` | 一个节点一个目录，互不影响 |
-| `…/config.json` 或 `config.yaml` | 内核配置（Xray、sing-box 用 json；官方 Hysteria2 用 yaml） |
-| `…/core` | 这个节点用哪个内核：`xray` / `sing-box` / `hysteria` |
+| `…/config.json`、`config.yaml` 或 `config.conf` | 内核配置（Xray、sing-box 用 json；官方 Hysteria2 用 yaml；Snell v4/v5 用 conf） |
+| `…/core` | 这个节点用哪个内核：`xray` / `sing-box` / `hysteria` / `snell-v4` / `snell-v5` |
 | `…/node.txt` | 给用户看的全部参数和链接，`jiedian all` 显示的就是它 |
 | `…/name`、`…/link_port` | 节点名；NAT 小鸡的公网映射端口 |
 | `…/fw_info` | 这个节点放行了哪些端口（第一行是“端口 协议”），删节点时照着撤销 |
@@ -51,14 +51,14 @@
 | `/etc/xray-node/install.sh` | 上次运行的脚本副本，`gl` 断网时用 |
 | `/etc/xray-node/our_bins` | 哪些内核是本脚本装的（卸载时只删这些） |
 | `/etc/xray-node/rules.v4`、`rules.v6` | 存盘的防火墙规则 |
-| `/usr/local/bin/xray`、`sing-box`、`hysteria` | 三个内核 |
+| `/usr/local/bin/xray`、`sing-box`、`hysteria`、`snell-server-v4`、`snell-server-v5` | 各协议对应的内核 |
 | `/usr/local/bin/jiedian`、`shanjiedian`、`gl` | 三个快捷命令（`gl` 打开主菜单，先取最新 `install.sh`，取不到用 `/etc/xray-node/install.sh`） |
 | `/usr/local/bin/xray-node-watch` | 每分钟巡检：补端口跳跃规则、回程路由、证书续期时开关 80/443 |
 | `/usr/local/bin/xray-node-hop`、`-route`、`-limit`、`-expire`、`-fw-restore`、`-run` | 端口跳跃、回程路由、设备限制、到点删除、开机恢复防火墙、启动包装 |
 | `/var/log/xray-node-watch.log`、`-limit.log`、`-expire.log` | 后台小程序的日志 |
 | `/etc/resolv.conf.xray-node-orig` | 换 DNS 之前的备份（没换过就没有） |
 
-- 服务名：systemd 是 `xray-node@<编号>`、`hysteria-node@<编号>`、`singbox-node@<编号>` 模板实例；Alpine（OpenRC）是 `xray-node-<编号>`，用 `rc-status` 看。
+- 服务名：systemd 是 `xray-node@<编号>`、`hysteria-node@<编号>`、`singbox-node@<编号>`、`snell-v4-node@<编号>`、`snell-v5-node@<编号>` 模板实例；Alpine（OpenRC）是 `xray-node-<编号>`，用 `rc-status` 看。
 - **所有后台小程序都是 `install.sh` 里用 heredoc 写出来的**（`install_hop_bin`、`install_route_bin`、`install_watch_bin`、`install_expire_bins`、`install_limit_bin`、`write_helper_cmds`、`_write_gl_cmd`）。改它们要改 `install.sh` 里的这些函数，不是改机器上的文件；用户重跑一次脚本就会被覆盖成新的。
 
 ---
@@ -155,6 +155,7 @@ cd tests && python3 -m unittest discover
 | `tests/test_quic_client.py` | Loon / Surge 节点行、阻止 QUIC |
 | `tests/test_gl.py` | `gl` 命令 |
 | `tests/test_wgluodi.py` | 和 WireGuard 落地脚本的配合 |
+| `tests/test_snell.py` | Snell v4 / v5 下载、校验、配置、客户端行、生命周期与全面检查修复回归 |
 | `tests/test_round_fixes.py` | 历次全面检查修掉的零散问题 |
 
 ---
@@ -186,7 +187,7 @@ cd tests && python3 -m unittest discover
 | `[3/4] 节点用哪个端口？`、公网映射端口 | `5. 问：端口`（`rand_port`、`port_in_use`） |
 | `[4/4] REALITY 伪装成哪个网站？`、指纹 | `6. REALITY 伪装域名`（`_reality_ask_fp`） |
 | `[生成] 随机生成账号和密码…` | `7. 随机生成 UUID / 密码` |
-| `[下载] 获取 Xray 内核…` | `8. 下载内核`（`dl_xray` / `dl_singbox` / `dl_hysteria`，下载走 `_gh_get`、校验走 `_verify_dl`） |
+| `[下载] 获取 Xray 内核…` | `8. 下载内核`（`dl_xray` / `dl_singbox` / `dl_hysteria` / `dl_snell`，GitHub 下载走 `_gh_get`、校验走 `_verify_dl`，Snell 走 `dl.nssurge.com` + 内置 SHA256） |
 | `[密钥] 生成 REALITY 密钥…` | `9. REALITY 密钥对` |
 | `[检查] 验证伪装域名从这台 VPS 是否可用…` | `9c. REALITY 伪装域名可用性检查` |
 | `[配置] 写入配置…` | `10. 写配置文件`（Hysteria2、sing-box 各有单独一节） |
@@ -250,8 +251,9 @@ cd tests && python3 -m unittest discover
 
 ### 7.7 `[下载] 获取 … 内核…` 卡住或失败
 
-- 章节 `下载三个内核` 和 `下载工具` 两节。顺序：GitHub API 查最新版 → 下载 → SHA256 校验（`_gh_expect_sum`、`_verify_dl`）→ 解压 → 运行一次 `version` 确认能用。
-- GitHub 连不上：`_gh_get` 自动换镜像；只有 IPv6 的机器临时开 DNS64（`_dns64_on` / `_dns64_off`，脚本中途被杀掉时下次启动由 `_dns64_recover` 还原）。
+- 章节 `下载三个内核`、`下载 Snell 内核（v4 / v5）` 和 `下载工具` 三节。顺序：查最新版 → 下载 → SHA256 校验（`_gh_expect_sum` / `_snell_expect_sum`、`_verify_dl`）→ 解压 → 试运行确认能用。
+- GitHub 连不上：`_gh_get` 自动换镜像；只有 IPv6 的机器临时开 DNS64（`_dns64_on` / `_dns64_off`，脚本中途被杀掉时下次启动由 `_dns64_recover` 还原）。`dl.nssurge.com` 也只有 IPv4，纯 IPv6 机器由 `_snell_prepare` 临时开 DNS64。
+- 官方 `snell-server` 依赖 glibc，Alpine（musl）原生跑不起来；`_snell_bin_ok` 试运行失败时会直接给出中文说明。
 - 小内存机器（64MB / 128MB）：`小内存机器的特殊处理` 一节。`prepare_low_memory` 会加 swap、清缓存；解压用 `_unpack_drip` 边解边写盘，不把整个文件读进内存。sing-box 解压后约 80MB，64MB 的机器装不下，会明说。测试在 `tests/test_lowmem.py`。
 - 被 OOM 杀掉的表现是进程突然消失、没有报错。用 `dmesg | tail`、容器里看 `/sys/fs/cgroup/memory.events` 的 `oom_kill`。
 
@@ -349,6 +351,10 @@ os.write(fd, b'\x03')
 
 | 现象 | 根本原因 | 修法 | 教训 |
 |---|---|---|---|
+| IPv6 机器上 UDP 443 节点开启 1 台设备限制后，服务器本机发起 IPv6 QUIC 出站仍可能把用户挤掉 | `/proc/net/nf_conntrack` 记录展开的 8 段 IPv6（如 `2001:0db8:0000:...`），`ip -o addr show` 输出压缩 IPv6（`2001:db8::1`），直接字符串比对失配 | `xray-node-limit` 的 `_seen` 增加 `norm()` 把 IPv6 统一展开成规范 8 段后再存入/比对 `loc` | 比对内核表和 `ip` 输出的 IPv6 地址必须先规范化，不能直接字符串相等 |
+| 双栈机器新装 Xray / sing-box / Snell 节点在纯 iptables 防火墙上 IPv6 连不上 | 新装时节点已监听 `::` / `::0`，但第 12 节 `_FW_FAMILIES` 只对 Hysteria2 放行双栈，其它协议漏加 `ip6tables` 规则 | 第 12 节按实际双栈监听状态统一设置 `_FW_FAMILIES`（`4 6` / `6 4`），并在安全组提示标明 TCP/UDP 与映射端口 | 监听双栈就必须同步放行 IPv4/IPv6 两个地址族的防火墙 |
+| 换 DNS 失败还原后 `/etc/resolv.conf` 变成 `0600`；systemd 单元文件与 `99-xray-node-overcommit.conf` 权限为 `0600`；acme.sh 续期部署私钥时短时 `0644` | 主脚本 `umask 077` 下新建/还原的系统文件未显式 `chmod 644`；`xray-node-watch` 在默认 `umask 022` 下先写私钥再 `chmod` | `_resolv_restore`、overcommit sysctl 配置及所有生成的 systemd unit/timer 显式 `chmod 644`；`_acmesh_deploy` 在子 shell `umask 077` 下写私钥再按组设 `640`/`600` | `umask 077` 写系统文件必 `chmod 644`，非 `umask 077` 的后台脚本写私钥必先收紧 `umask` |
+| 全新机器装到第 12 节放行端口后在写 `node.txt` 前失败，已放行的防火墙规则未撤销；无 `ss` 机器上端口跳跃范围跳过占用检查；非 Debian/Alpine 纯 iptables 重启丢规则 | `_drop_partial_node` 依赖尚未安装的 `xray-node-watch`；`_hy_hop_busy` 无 `ss` 直接放行；`_save_fw` 对非 apt/Alpine 系统未回退 `_save_fw_light` | `_drop_partial_node` 缺 `xray-node-watch` 时先写出再撤销；`_hy_hop_busy` 补充 `netstat` 与 `/proc/net/udp*` 回退；`_save_fw` 在 systemd/OpenRC 上回退 `_save_fw_light` | 清理、检测、持久化路径都要考虑工具缺失和非 Debian 发行版 |
 | UDP 443 节点开启 1 台设备限制后，正常用户在访问 QUIC 站点时自己被挤掉 | 服务器自己往外连 UDP 443 时，`nf_conntrack` 的回包 `sport=443`，`_seen` 把服务器本机 IP 当成第二台客户端设备 | `_seen` 先读本机网卡地址，排除 `src` 为本机地址的出站连接 | 解析 `nf_conntrack` 时必须区分客户端入站和本机同端口出站 |
 | Hysteria2 填域名、不开混淆且节点端口选 443（或 80）时，证书到期后续期失败 | `HY_TCP_MASQ=1` 让 Hysteria2 长期占用 TCP `$PORT`，与 `acme.sh` 续期临时监听端口冲突 | `$PORT` 等于 `acme.sh` 验证端口（80 或 443）时不开启 `HY_TCP_MASQ` | 节点 TCP 伪装监听不能占用 ACME 独立验证端口 |
 | 关闭 IPv6 后，以 `xray-node` 普通用户运行的 Hysteria2 读不到 `/etc/gai.conf` | 脚本开头 `umask 077`，新建 `/etc/gai.conf`（及 cron 文件）权限为 `0600` | `_ipv6_gai`、`_ipv6_sysctl_block`、`_ipv6_persist` 和 `/etc/cron.d/*` 写完显式 `chmod 644` | `umask 077` 下写给系统或非 root 进程读的文件必须显式 `chmod 644` |

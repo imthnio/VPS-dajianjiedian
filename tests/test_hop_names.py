@@ -203,7 +203,7 @@ class QuicBlockTest(unittest.TestCase):
 class ShortNodeNameTest(unittest.TestCase):
     def test_names_are_region_plus_short_protocol(self):
         s = (Path(__file__).resolve().parent.parent / "install.sh").read_text(encoding="utf-8")
-        for w in ("Vless", "Trojan", "Vmess", "Shadowsocks", "AnyTLS", "Hysteria2", "TUIC"):
+        for w in ("Vless", "Trojan", "Vmess", "Shadowsocks", "AnyTLS", "Hysteria2", "TUIC", "Snell4", "Snell5"):
             self.assertIn(f'_nm_proto="{w}"', s)
         self.assertNotIn('_nm_proto="Vless-Reality"', s)
         self.assertNotIn("-Reality\"", s)
