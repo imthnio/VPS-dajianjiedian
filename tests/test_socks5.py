@@ -238,6 +238,115 @@ class AuditFixesRegressionTest(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
             self.assertIn("LIGHT_FALLBACK", res.stdout)
 
+    def test_save_fw_updates_apt_and_retries_when_first_install_fails(self):
+        body = between("_save_fw() {", "\n# _fw_allow ")
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for name in ("iptables-save", "apt-get"):
+                stub = bindir / name
+                stub.write_text("#!/bin/sh\nexit 0\n")
+                stub.chmod(0o755)
+            calls = Path(tmp) / "calls"
+            script = (
+                "LOW_MEM=0\n_pkg_updated=0\nwarn() { echo \"WARN $1\"; }\ninfo() { echo \"INFO $1\"; }\n"
+                f"_apt_do() {{\n"
+                f"  echo \"$*\" >> '{calls}'\n"
+                f"  case \"$*\" in\n"
+                f"    *update*) return 0 ;;\n"
+                f"    *iptables-persistent*)\n"
+                f"      grep -q update '{calls}' 2>/dev/null && return 0\n"
+                f"      return 1 ;;\n"
+                f"  esac\n"
+                f"}}\n"
+                "_save_fw_light() { echo LIGHT_FALLBACK; return 0; }\n"
+                + body + "\n_save_fw 4\n"
+            )
+            env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+            if any(Path(d, n).exists() for d in ("/usr/bin", "/bin") for n in ("ufw", "firewall-cmd", "netfilter-persistent")):
+                self.skipTest("host has ufw/firewalld/netfilter-persistent in /usr/bin")
+            res = run_sh(script, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            log = calls.read_text()
+            self.assertIn("update -qq", log)
+            self.assertEqual(log.count("install -y -qq iptables-persistent"), 2)
+
+    def test_ensure_unzip_uses_pkg_add_when_available(self):
+        fn = between("_ensure_unzip() {", "\n_dl_xray_inner() {")
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            script = (
+                "warn() { :; }\ndie() { echo \"DIE $1\" >&2; exit 1; }\n"
+                f"_pkg_add() {{ echo \"PKG_ADD $1 $2\"; printf '#!/bin/sh\\nexit 0\\n' > '{bindir}/unzip'; chmod 755 '{bindir}/unzip'; }}\n"
+                + fn + "\n_ensure_unzip\n"
+            )
+            # Only put our temp bindir + minimal PATH without unzip
+            for cmd in ("sh", "chmod", "printf"):
+                for d in ("/bin", "/usr/bin"):
+                    p = Path(d, cmd)
+                    if p.exists() and not (bindir / cmd).exists():
+                        (bindir / cmd).symlink_to(p)
+            env = dict(os.environ, PATH=str(bindir))
+            res = run_sh(script, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("PKG_ADD 正在安装 unzip unzip", res.stdout)
+
+    def test_reality_nodetxt_includes_public_key_short_id_and_fp(self):
+        urlenc = between("_urlenc() {", "\n_node_name() {")
+        cq_funcs = between("_cq_ok() {", "\n_cq_strip_xray() {")
+        sec13 = between("# ---------- 13. 生成节点链接 ----------", "# ---------- 14. 保存 + jiedian 命令 ----------")
+        sec14 = between("# ---------- 14. 保存 + jiedian 命令 ----------", "\nwrite_helper_cmds")
+        with tempfile.TemporaryDirectory() as tmp:
+            node_dir = Path(tmp) / "nodes" / "1"
+            node_dir.mkdir(parents=True)
+            script = (
+                "step() { :; }\ninfo() { :; }\nwarn() { :; }\ndie() { echo \"DIE $1\" >&2; exit 1; }\n"
+                + urlenc + "\n" + cq_funcs + "\n"
+                f"PROTO=vless\nPROTO_NAME='VLESS + REALITY + Vision'\nNODE_NAME='香港Vless'\n"
+                f"SERVER_IP='203.0.113.10'\nLINK_IP='203.0.113.10'\nPORT=443\nLINK_PORT=443\n"
+                f"UUID='11111111-2222-4333-8444-555555555555'\nREALITY_DOMAIN='www.samsung.com'\n"
+                f"REALITY_FP='safari'\nREALITY_PUB='PUBKEY123'\nREALITY_SID='deadbeef'\n"
+                f"NODE_KIND=permanent\nNODE_DIR='{node_dir}'\n"
+                + sec13 + "\n" + sec14 + "\n"
+            )
+            res = run_sh(script)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            nt = (node_dir / "node.txt").read_text()
+            self.assertIn("伪装域名: www.samsung.com", nt)
+            self.assertIn("公钥（PublicKey）: PUBKEY123", nt)
+            self.assertIn("shortId: deadbeef", nt)
+            self.assertIn("指纹（fp）: safari", nt)
+
+    def test_fix_existing_json_ipv6_verifies_both_tcp_and_udp_for_shadowsocks(self):
+        fn = between("_fix_existing_json_ipv6() {", "\n# Snell 节点同理")
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = Path(tmp) / "nodes"
+            d = nodes / "1"
+            d.mkdir(parents=True)
+            (d / "config.json").write_text('{\n  "inbounds": [ { "listen": "0.0.0.0", "port": 8388 } ]\n}\n')
+            (d / "fw_info").write_text("8388 tcp 0 0 1 4\n8388 udp 0 0 1 4\n")
+            fn_patched = fn.replace("/etc/xray-node/nodes", str(nodes))
+            # Case 1: UDP fails to listen on v6 -> must roll back to 0.0.0.0
+            script_fail = (
+                "warn() { echo \"WARN $1\"; }\ninfo() { echo \"INFO $1\"; }\n"
+                "_v6_listen_ok() { return 0; }\n"
+                "_svc_restart() { :; }\n"
+                "wait_for_port() { return 0; }\n"
+                " CALLED=0\n"
+                "_port_on_v6() {\n"
+                "  CALLED=$((CALLED + 1))\n"
+                "  [ \"$CALLED\" -eq 1 ] && return 1\n"
+                "  [ \"$2\" = \"tcp\" ] && return 0\n"
+                "  return 1\n"
+                "}\n"
+                + fn_patched + "\n_fix_existing_json_ipv6\n"
+            )
+            res = run_sh(script_fail)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("已改回原来的配置", res.stdout)
+            self.assertIn('"listen": "0.0.0.0"', (d / "config.json").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

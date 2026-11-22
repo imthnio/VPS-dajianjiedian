@@ -977,14 +977,14 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
     rc-update add "$_fw_svc" default >/dev/null 2>&1
     if "/etc/init.d/$_fw_svc" save >/dev/null 2>&1; then
       info "iptables 规则已存盘（重启后仍有效）"
+      return 0
     fi
-    return 0
   fi
   if command -v netfilter-persistent >/dev/null 2>&1; then
     if netfilter-persistent save >/dev/null 2>&1; then
       info "iptables 规则已存盘（重启后仍有效）"
+      return 0
     fi
-    return 0
   fi
   # 装了 ufw 或 firewalld 时不能装 iptables-persistent：ufw 的包声明和它冲突（Breaks），
   # apt -y 会顺手把 ufw 卸掉；firewalld 开机也会和整表回放打架。只恢复本脚本加的端口规则。
@@ -997,15 +997,26 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
     # DEBIAN_FRONTEND 必须设：iptables-persistent 装时会弹 debconf 提问（是否保存当前规则），
     # 不设的话在小白的终端上会突然蹦出个看不懂的提问，把人卡住
     export DEBIAN_FRONTEND=noninteractive
+    _sfw_apt_ok=0
     if _apt_do "正在安装 iptables-persistent（让防火墙规则重启后还在）" 300 -- install -y -qq iptables-persistent; then
+      _sfw_apt_ok=1
+    elif [ "${_pkg_updated:-0}" != "1" ]; then
+      # 机器原本就有 curl 时前面没跑过 apt-get update，新装系统的软件源列表可能是空的，更新后再试一次
+      _apt_do "正在更新软件源" 90 -- update -qq \
+        || _apt_do "正在更新软件源（改走 IPv4）" 90 -- -o Acquire::ForceIPv4=true update -qq \
+        || true
+      _pkg_updated=1
+      _apt_do "正在安装 iptables-persistent（让防火墙规则重启后还在）" 300 -- install -y -qq iptables-persistent \
+        && _sfw_apt_ok=1
+    fi
+    unset DEBIAN_FRONTEND
+    if [ "$_sfw_apt_ok" = "1" ]; then
       if command -v netfilter-persistent >/dev/null 2>&1 \
         && netfilter-persistent save >/dev/null 2>&1; then
         info "iptables 规则已存盘（重启后仍有效）"
       fi
-      unset DEBIAN_FRONTEND
       return 0
     fi
-    unset DEBIAN_FRONTEND
     if { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; } \
       || { command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; }; then
       _save_fw_light && return 0
@@ -2697,12 +2708,14 @@ _ipv6_rebind_nodes() {
         warn "节点 ${_id} 的监听地址没改成"
         continue
       }
-      _proto=tcp
+      chmod 600 "$_cfg" 2>/dev/null || true
+      _protos=""
       _port=""
       if [ -f "${_d}fw_info" ]; then
         read -r _port _fproto _frest < "${_d}fw_info"
-        case "$_fproto" in udp) _proto=udp ;; esac
+        _protos=$(awk '$1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") { if (!seen[$2]++) print $2 }' "${_d}fw_info" 2>/dev/null)
       fi
+      [ -n "$_protos" ] || _protos=tcp
       _svc_restart "$_id"
       case "$_port" in
         ''|*[!0-9]*)
@@ -2710,7 +2723,11 @@ _ipv6_rebind_nodes() {
           info "节点 ${_id} 已改为只听 IPv4"
           ;;
         *)
-          if wait_for_port "$_port" "$_proto" 15; then
+          _rb_ok=1
+          for _rb_p in $_protos; do
+            wait_for_port "$_port" "$_rb_p" 15 || { _rb_ok=0; break; }
+          done
+          if [ "$_rb_ok" = "1" ]; then
             rm -f "${_cfg}.bak-ipv6off"
             info "节点 ${_id} 已改为只听 IPv4，避免关掉 IPv6 后这个节点一起停"
           else
@@ -5547,7 +5564,9 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
   CQ_PATH=$(_cq_kv "WS 路径")
   CQ_PIN=$(_cq_kv "证书指纹")
   CQ_PBK=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]pbk=\([^&#]*\).*/\1/p')
+  [ -n "$CQ_PBK" ] || CQ_PBK=$(_cq_kv "公钥（PublicKey）")
   CQ_SID=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]sid=\([^&#]*\).*/\1/p')
+  [ -n "$CQ_SID" ] || CQ_SID=$(_cq_kv "shortId")
   CQ_OBFS=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]obfs=\([^&#]*\).*/\1/p')
   CQ_OBFS_HOST=$(printf '%s' "$_cq_link" | sed -n 's/.*[?&]obfs-host=\([^&#]*\).*/\1/p')
   return 0
@@ -5887,15 +5906,25 @@ _fix_existing_json_ipv6() {
     _jport=""; _jproto=""
     read -r _jport _jproto _jrest < "${_jd}fw_info"
     case "$_jport" in ''|*[!0-9]*) continue ;; esac
-    case "$_jproto" in udp) _jp=udp ;; *) _jp=tcp ;; esac
+    _jprotos=$(awk '$1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") { if (!seen[$2]++) print $2 }' "${_jd}fw_info" 2>/dev/null)
+    [ -n "$_jprotos" ] || { case "$_jproto" in udp) _jprotos=udp ;; *) _jprotos=tcp ;; esac; }
+    _jp=${_jprotos%%[[:space:]]*}
     _port_on_v6 "$_jport" "$_jp" && continue
     _jid=$(basename "$_jd")
     cp -a "$_jcfg" "${_jcfg}.bak-ipv6" || { warn "节点 $_jid 无法备份配置，跳过 IPv6"; continue; }
     if ! sed 's/"listen"[[:space:]]*:[[:space:]]*"0\.0\.0\.0"/"listen": "::"/' "${_jcfg}.bak-ipv6" > "$_jcfg"; then
       mv -f "${_jcfg}.bak-ipv6" "$_jcfg"; warn "节点 $_jid 没能改成同时听 IPv6"; continue
     fi
+    chmod 600 "$_jcfg" 2>/dev/null || true
     _svc_restart "$_jid"
-    if wait_for_port "$_jport" "$_jp" 15 && _port_on_v6 "$_jport" "$_jp"; then
+    _j_v6_ok=1
+    for _j_pr in $_jprotos; do
+      if ! wait_for_port "$_jport" "$_j_pr" 15 || ! _port_on_v6 "$_jport" "$_j_pr"; then
+        _j_v6_ok=0
+        break
+      fi
+    done
+    if [ "$_j_v6_ok" = "1" ]; then
       rm -f "${_jcfg}.bak-ipv6"
       if command -v ip6tables >/dev/null 2>&1; then
         _jf_pairs=$(awk '$1 ~ /^[0-9]+$/ && ($2 == "tcp" || $2 == "udp") { k = $1 ":" $2; if (!seen[k]++) print k }' "${_jd}fw_info" 2>/dev/null)
@@ -6343,19 +6372,24 @@ dl_singbox() { _gh_prepare; _dl_singbox_inner; _dl_rc=$?; _dns64_off; return "$_
 _ensure_unzip() {
   command -v unzip >/dev/null 2>&1 && return 0
   warn "缺少 unzip，正在安装…"
-  if command -v apt-get >/dev/null 2>&1; then
+  if command -v _pkg_add >/dev/null 2>&1; then
+    _pkg_add "正在安装 unzip" unzip
+  elif command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     _apt_do "正在安装 unzip" 300 -- install -y -qq unzip || true
     unset DEBIAN_FRONTEND
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache unzip >/dev/null 2>&1 || true
+    apk add --wait 90 --no-cache unzip >/dev/null 2>&1 || true
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y -q unzip >/dev/null 2>&1 || true
   elif command -v yum >/dev/null 2>&1; then
     yum install -y -q unzip >/dev/null 2>&1 || true
   elif command -v pacman >/dev/null 2>&1; then
     pacman -Sy --noconfirm --needed unzip >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install unzip >/dev/null 2>&1 || true
   fi
+  hash -r 2>/dev/null || true
   command -v unzip >/dev/null 2>&1 || die "装不上 unzip，请手动安装 unzip 后重试"
 }
 
@@ -6420,7 +6454,7 @@ _dl_xray_inner() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在
       fi
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
-    unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
+    unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || { rm -f "$DL_DIR/xray.zip"; die "下载的安装包已损坏，请重跑脚本重新下载"; }
     # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
     rm -f "${XRAY_BIN}.new"
     if _unpack_drip zip "$DL_DIR/xray.zip" xray "${XRAY_BIN}.new"; then
@@ -6429,9 +6463,11 @@ _dl_xray_inner() { # 下载并安装 Xray 内核；FORCE_DL=1 时即使已存在
     else
       rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
       _pace_start
-      unzip -o -q "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || { _pace_stop; die "解压失败"; }
-      [ -s "$DL_DIR/xray-dl/xray" ] || { _pace_stop; die "解压后没找到 xray 文件"; }
-      install -m 0755 "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" || { _pace_stop; rm -f "${XRAY_BIN}.new"; die "安装 Xray 失败"; }
+      unzip -o -q "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || { _pace_stop; rm -rf "$DL_DIR"; die "解压失败"; }
+      [ -s "$DL_DIR/xray-dl/xray" ] || { _pace_stop; rm -rf "$DL_DIR"; die "解压后没找到 xray 文件"; }
+      { install -m 0755 "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" 2>/dev/null \
+        || { cp -f "$DL_DIR/xray-dl/xray" "${XRAY_BIN}.new" && chmod 0755 "${XRAY_BIN}.new"; }; } \
+        || { _pace_stop; rm -rf "$DL_DIR"; rm -f "${XRAY_BIN}.new"; die "安装 Xray 失败"; }
       _pace_stop
     fi
     # 安装包用完就删：删掉以后它占的缓存马上还给系统，小内存机器试运行内核时才有地方
@@ -6516,10 +6552,10 @@ _dl_singbox_inner() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使�
         || die "sing-box 安装包校验没通过，已停止。请稍后重跑脚本"
     fi
     # 完整性校验：包坏了直接报错，不往下装半截文件
-    tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
+    tar tzf "$DL_DIR/sb.tar.gz" >/dev/null 2>&1 || { rm -f "$DL_DIR/sb.tar.gz"; die "下载的安装包已损坏，请重跑脚本重新下载"; }
     # 包内顶层目录名跟包名走（不同候选包名目录名不同），动态探测，不写死
     _sb_inner=$(tar tzf "$DL_DIR/sb.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)
-    [ -n "$_sb_inner" ] || die "解压后没找到 sing-box 文件"
+    [ -n "$_sb_inner" ] || { rm -rf "$DL_DIR"; die "解压后没找到 sing-box 文件"; }
     # 先装到临时名、验明能跑再原子替换：更新模式下旧内核一直可用，直到新内核确认没问题
     rm -f "${SB_BIN}.new"
     if _unpack_drip tgz "$DL_DIR/sb.tar.gz" "${_sb_inner}/sing-box" "${SB_BIN}.new"; then
@@ -6528,9 +6564,11 @@ _dl_singbox_inner() { # 下载并安装 sing-box 内核；FORCE_DL=1 时即使�
     else
       rm -rf "$DL_DIR/sb-dl" && mkdir -p "$DL_DIR/sb-dl"
       _pace_start
-      tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || { _pace_stop; die "解压失败"; }
-      [ -s "$DL_DIR/sb-dl/${_sb_inner}/sing-box" ] || { _pace_stop; die "解压后没找到 sing-box 文件"; }
-      install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" || { _pace_stop; rm -f "${SB_BIN}.new"; die "安装 sing-box 失败"; }
+      tar xzf "$DL_DIR/sb.tar.gz" -C "$DL_DIR/sb-dl" || { _pace_stop; rm -rf "$DL_DIR"; die "解压失败"; }
+      [ -s "$DL_DIR/sb-dl/${_sb_inner}/sing-box" ] || { _pace_stop; rm -rf "$DL_DIR"; die "解压后没找到 sing-box 文件"; }
+      { install -m 0755 "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" 2>/dev/null \
+        || { cp -f "$DL_DIR/sb-dl/${_sb_inner}/sing-box" "${SB_BIN}.new" && chmod 0755 "${SB_BIN}.new"; }; } \
+        || { _pace_stop; rm -rf "$DL_DIR"; rm -f "${SB_BIN}.new"; die "安装 sing-box 失败"; }
       _pace_stop
     fi
     # 安装包用完就删，占的缓存马上还给系统
@@ -6694,14 +6732,16 @@ _dl_snell_inner() { # _dl_snell_inner <4|5>
   _pace_start
   unzip -o -q "$_sn_zip" -d "$DL_DIR/snell-dl" snell-server || { _pace_stop; rm -rf "$DL_DIR"; die "Snell 解压失败"; }
   [ -s "$DL_DIR/snell-dl/snell-server" ] || { _pace_stop; rm -rf "$DL_DIR"; die "解压后没找到 snell-server 文件"; }
-  install -m 0755 "$DL_DIR/snell-dl/snell-server" "${_sn_bin}.new" || { _pace_stop; rm -rf "$DL_DIR"; rm -f "${_sn_bin}.new"; die "安装 Snell 失败"; }
+  { install -m 0755 "$DL_DIR/snell-dl/snell-server" "${_sn_bin}.new" 2>/dev/null \
+    || { cp -f "$DL_DIR/snell-dl/snell-server" "${_sn_bin}.new" && chmod 0755 "${_sn_bin}.new"; }; } \
+    || { _pace_stop; rm -rf "$DL_DIR"; rm -f "${_sn_bin}.new"; die "安装 Snell 失败"; }
   _pace_stop
   rm -rf "$DL_DIR"
   drop_page_cache
   if ! _snell_bin_ok "${_sn_bin}.new"; then
     rm -f "${_sn_bin}.new"
     if [ -f /etc/alpine-release ] || printf '%s' "${_SNELL_LAST_ERR:-}" | grep -qiE 'not found|GLIBC_|libc\.so|ld-linux'; then
-      die "下载的 Snell v${_sn_maj} 跑不起来（退出码 ${_SNELL_LAST_RC:-未知}）：官方 Snell 程序依赖 glibc，Alpine（musl）或老版 glibc 系统无法直接运行。请换 Debian / Ubuntu / CentOS / Arch，或改选 VLESS / Hysteria2 / AnyTLS / TUIC 等协议。系统说：$(printf '%s' "${_SNELL_LAST_ERR:-}" | tr '\n' ' ' | cut -c1-300)"
+      die "下载的 Snell v${_sn_maj} 跑不起来（退出码 ${_SNELL_LAST_RC:-未知}）：官方 Snell 程序依赖 glibc，Alpine（musl）或老版 glibc 系统无法直接运行。请换 Debian / Ubuntu / CentOS / Arch，或改选 VLESS / Hysteria2 / AnyTLS / TUIC / SOCKS5 等协议。系统说：$(printf '%s' "${_SNELL_LAST_ERR:-}" | tr '\n' ' ' | cut -c1-300)"
     fi
     die "下载的 Snell v${_sn_maj} 内核跑不起来（退出码 ${_SNELL_LAST_RC:-未知}）。内存大约 ${MEM_MB:-未知}MB。系统说：$(printf '%s' "${_SNELL_LAST_ERR:-}" | tr '\n' ' ' | cut -c1-300)"
   fi
@@ -7852,7 +7892,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
     elif command -v openssl >/dev/null 2>&1; then
       _rp_out=$(_timeout_cmd 20 openssl s_client -connect "${REALITY_DOMAIN}:443" \
         -servername "$REALITY_DOMAIN" -tls1_3 </dev/null 2>&1)
-      if printf "%s" "$_rp_out" | grep -q "Protocol *: *TLSv1.3" \
+      if printf "%s" "$_rp_out" | grep -qE "Protocol *: *TLSv1\.3|TLSv1\.3, Cipher is" \
         && printf "%s" "$_rp_out" | grep -q "Verify return code: 0"; then
         _rp_ok=1
       fi
@@ -7868,6 +7908,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
         _rp_ans=""
         printf "是否自动换成社区验证最多的 www.apple.com 再试一次？[默认 Y]: "
         read -r _rp_ans
+        _rp_ans=$(printf '%s' "$_rp_ans" | tr -d ' \t\r')
         case "$_rp_ans" in n|N|no|NO) _rp_swap=0 ;; esac
       else
         info "无交互环境，自动换成 www.apple.com 重试"
@@ -8720,7 +8761,12 @@ fi
       ;;
   esac
   case "$PROTO" in
-    vless|trojan|anytls) printf "伪装域名: %s\n" "$REALITY_DOMAIN" ;;
+    vless|trojan|anytls)
+      printf "伪装域名: %s\n" "$REALITY_DOMAIN"
+      printf "公钥（PublicKey）: %s\n" "$REALITY_PUB"
+      printf "shortId: %s\n" "$REALITY_SID"
+      printf "指纹（fp）: %s\n" "${REALITY_FP:-chrome}"
+      ;;
     vmess)        printf "WS 路径: %s\n" "$WS_PATH" ;;
     hy2)
       printf "SNI: %s\n" "$HY2_SNI"
