@@ -156,6 +156,7 @@ cd tests && python3 -m unittest discover
 | `tests/test_gl.py` | `gl` 命令 |
 | `tests/test_wgluodi.py` | 和 WireGuard 落地脚本的配合 |
 | `tests/test_snell.py` | Snell v4 / v5 下载、校验、配置、客户端行、生命周期与全面检查修复回归 |
+| `tests/test_socks5.py` | SOCKS5 协议配置、链接、Loon / Surge / mihomo / Telegram 行、jiedian 展示与全面检查修复回归 |
 | `tests/test_round_fixes.py` | 历次全面检查修掉的零散问题 |
 
 ---
@@ -351,6 +352,7 @@ os.write(fd, b'\x03')
 
 | 现象 | 根本原因 | 修法 | 教训 |
 |---|---|---|---|
+| Xray / sing-box 在仅 IPv4 机器上监听 `::` 失败时直接报错退出；无 `/proc/sys/kernel/random/uuid` 时生成的 UUID 不符合 v4 规范；`openssl` 失败时 `SS_PASS` 不回退；`iptables-persistent` 安装失败未回退轻量存盘 | 11b 节双栈回退只写了 Hysteria2 / Snell，漏了 Xray / sing-box；`gen_uuid` 兜底未置 v4/variant 位；`SS_PASS` 未做空值回退和凭据校验；`_save_fw` 在 apt 失败后直接返回 | 11b 节补齐 Xray / sing-box `::` → `0.0.0.0` 回退及多协议 `_svc_recheck`；`gen_uuid` 兜底按 RFC 4122 v4 置位；第 7 节为 `SS_PASS` 加回退并按协议校验凭据非空；`_save_fw` 安装 `iptables-persistent` 失败时回退 `_save_fw_light` | 所有内核的监听回退、凭据生成与防火墙存盘路径要对齐检查 |
 | IPv6 机器上 UDP 443 节点开启 1 台设备限制后，服务器本机发起 IPv6 QUIC 出站仍可能把用户挤掉 | `/proc/net/nf_conntrack` 记录展开的 8 段 IPv6（如 `2001:0db8:0000:...`），`ip -o addr show` 输出压缩 IPv6（`2001:db8::1`），直接字符串比对失配 | `xray-node-limit` 的 `_seen` 增加 `norm()` 把 IPv6 统一展开成规范 8 段后再存入/比对 `loc` | 比对内核表和 `ip` 输出的 IPv6 地址必须先规范化，不能直接字符串相等 |
 | 双栈机器新装 Xray / sing-box / Snell 节点在纯 iptables 防火墙上 IPv6 连不上 | 新装时节点已监听 `::` / `::0`，但第 12 节 `_FW_FAMILIES` 只对 Hysteria2 放行双栈，其它协议漏加 `ip6tables` 规则 | 第 12 节按实际双栈监听状态统一设置 `_FW_FAMILIES`（`4 6` / `6 4`），并在安全组提示标明 TCP/UDP 与映射端口 | 监听双栈就必须同步放行 IPv4/IPv6 两个地址族的防火墙 |
 | 换 DNS 失败还原后 `/etc/resolv.conf` 变成 `0600`；systemd 单元文件与 `99-xray-node-overcommit.conf` 权限为 `0600`；acme.sh 续期部署私钥时短时 `0644` | 主脚本 `umask 077` 下新建/还原的系统文件未显式 `chmod 644`；`xray-node-watch` 在默认 `umask 022` 下先写私钥再 `chmod` | `_resolv_restore`、overcommit sysctl 配置及所有生成的 systemd unit/timer 显式 `chmod 644`；`_acmesh_deploy` 在子 shell `umask 077` 下写私钥再按组设 `640`/`600` | `umask 077` 写系统文件必 `chmod 644`，非 `umask 077` 的后台脚本写私钥必先收紧 `umask` |

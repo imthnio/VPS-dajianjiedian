@@ -26,9 +26,12 @@
 # ---------------- 名词小词典（看不懂下面的注释先看这里） ----------------
 # 节点：你自己的一台“翻墙服务器入口”。手机/电脑上的客户端连上它，再由它替你上网。
 # 协议：客户端和服务器之间“说话的方式”，比如 VLESS、VMess、Trojan、Shadowsocks、
-#       AnyTLS、Hysteria2、TUIC、Snell v4、Snell v5。不同协议伪装方式、速度、兼容性不一样。
+#       AnyTLS、Hysteria2、TUIC、Snell v4、Snell v5、SOCKS5。不同协议伪装方式、速度、兼容性不一样。
 # 内核：真正干活的程序。本脚本按协议自动选：Xray、sing-box、官方 hysteria 或官方 snell-server。
 #       脚本只负责下载它、写好配置、让它开机自己跑起来。
+# SOCKS5：最通用的代理协议（由 Xray 内核运行），带随机生成的用户名和密码认证，支持 TCP 和 UDP。
+#       注意：SOCKS5 是明文传输（没有加密和伪装），适合做落地机 / 链式代理、Telegram 代理或常规工具，
+#       不建议直接用来跨墙连接。
 # Snell：Surge 团队开发的轻量加密代理协议，主打低延迟和高吞吐（官方程序依赖 glibc，
 #       Debian / Ubuntu / CentOS / Arch 原生支持，Alpine / musl 通常跑不起来）。
 #       Snell v4 走 TCP（UDP 也经 TCP 转发）；Snell v5 增加 QUIC 代理模式，需要同时放行 TCP 和 UDP，
@@ -214,16 +217,24 @@ rand_port() { # rand_port <tcp|udp|both> -> 随机一个空闲端口 20000-59999
 # VLESS / VMess / TUIC 用它当“用户身份”，相当于账号密码合在一起。
 gen_uuid() {
   if [ -r /proc/sys/kernel/random/uuid ]; then
-    tr 'A-Z' 'a-z' < /proc/sys/kernel/random/uuid | tr -d '\n'
+    tr 'A-Z' 'a-z' < /proc/sys/kernel/random/uuid | tr -d '\r\n'
   else
-    rand_hex 16 | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'
+    # 没有内核 uuid 接口时，按 RFC 4122 v4 规范把第 13 位设为 4、第 17 位设为 8/9/a/b
+    rand_hex 16 | awk '
+      length($0) == 32 {
+        v = index("0123456789abcdef", substr($0, 17, 1)) - 1
+        if (v < 0) v = 0
+        var = substr("89ab", (v % 4) + 1, 1)
+        printf "%s-%s-4%s-%s%s-%s", substr($0,1,8), substr($0,9,4), substr($0,14,3), var, substr($0,18,3), substr($0,21,12)
+      }
+    '
   fi
 }
 
 # base64 是把任意内容变成只含字母数字的一串字符的编码方式（不是加密）。
 # VMess 和 Shadowsocks 的分享链接规定要这样编码，客户端导入时会自动解开。
 b64url() { # 标准输入 -> base64url（去换行、去 =）
-  base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '='
+  base64 2>/dev/null | tr -d '\r\n' | tr '+/' '-_' | tr -d '='
 }
 
 # 找出这台服务器的公网 IP，写进分享链接里。
@@ -991,10 +1002,15 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
         && netfilter-persistent save >/dev/null 2>&1; then
         info "iptables 规则已存盘（重启后仍有效）"
       fi
-    else
-      warn "iptables-persistent 没装上：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
+      unset DEBIAN_FRONTEND
+      return 0
     fi
     unset DEBIAN_FRONTEND
+    if { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; } \
+      || { command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; }; then
+      _save_fw_light && return 0
+    fi
+    warn "iptables-persistent 没装上：防火墙规则重启后会丢失，重启后重跑一次一键脚本即可恢复"
     return 0
   fi
   if { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; } \
@@ -4005,9 +4021,9 @@ for _d in /etc/xray-node/nodes/*/; do
   _name=$(sed -n 's/^节点名: //p' "${_d}node.txt" | head -n 1 | tr -d '\r')
   [ -n "$_name" ] || _name=$(head -n 1 "${_d}name" 2>/dev/null | tr -d '\r')
   # 第一条分享链接就是主链接
-  _link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell)://' "${_d}node.txt" | tr -d '\r')
+  _link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell|socks5)://' "${_d}node.txt" | tr -d '\r')
   # Loon 行：“名字 = 协议,”，协议名首字母大写（Surge 行是小写，不会认错）
-  _loon=$(grep -m1 -E '^[^ ].* = (VLESS|Trojan|VMess|Shadowsocks|AnyTLS|Hysteria2|Snell),' "${_d}node.txt" | tr -d '\r')
+  _loon=$(grep -m1 -E '^[^ ].* = (VLESS|Trojan|VMess|Shadowsocks|AnyTLS|Hysteria2|Snell|SOCKS5),' "${_d}node.txt" | tr -d '\r')
   _surge=$(grep -m1 -E '^[^ ].* = snell,' "${_d}node.txt" | tr -d '\r')
   # 去掉“（1天后…）”：那是装的时候算的，过后就不对了
   _exp=$(sed -n 's/^失效时间: //p' "${_d}node.txt" | head -n 1 | tr -d '\r' | sed 's/（.*//')
@@ -5367,8 +5383,8 @@ _hy_migrate_hop_all() {
 # 这个开关是客户端自己的设置。分享链接（vless:// 这种）里没有通用的写法，
 # 所以脚本另外给 Loon、Surge 各生成一行“节点配置”，里面已经写好这个开关，粘贴导入后自动打开。
 # 下面这些函数用 CQ_ 开头的变量拼出这些行：
-#   CQ_PROTO 协议（vless/trojan/vmess/ss/anytls/hy2/tuic）  CQ_NAME 节点名
-#   CQ_HOST 服务器地址（IPv6 不带方括号）  CQ_PORT 端口  CQ_UUID  CQ_PASS 密码
+#   CQ_PROTO 协议（vless/trojan/vmess/ss/anytls/hy2/tuic/snell4/snell5/socks5）  CQ_NAME 节点名
+#   CQ_HOST 服务器地址（IPv6 不带方括号）  CQ_PORT 端口  CQ_UUID  CQ_USER 用户名  CQ_PASS 密码
 #   CQ_SNI 伪装域名  CQ_PBK / CQ_SID REALITY 公钥和 short-id  CQ_PATH WebSocket 路径
 
 _cq_ok() { # 值不能空，也不能带逗号、引号、空白：这些字符会把一整行配置切坏
@@ -5421,6 +5437,11 @@ _cq_loon_line() { # 打印 Loon 节点行（官方格式：节点名 = 协议,�
       printf '%s = Snell,%s,%s,"%s",version=%s%s,udp=true,block-quic=true\n' \
         "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$_cq_sv" "$_cq_so"
       ;;
+    socks5)
+      _cq_ok "$CQ_USER" "$CQ_PASS" || return 0
+      printf '%s = SOCKS5,%s,%s,%s,"%s",udp=true,block-quic=true\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_USER" "$CQ_PASS"
+      ;;
   esac
   return 0
 }
@@ -5461,6 +5482,11 @@ _cq_surge_line() { # 打印 Surge 节点行。Surge 不支持 VLESS 和 REALITY�
       printf '%s = snell, %s, %s, psk=%s, version=%s, reuse=true%s, block-quic=on\n' \
         "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_PASS" "$_cq_sv" "$_cq_so"
       ;;
+    socks5)
+      _cq_ok "$CQ_USER" "$CQ_PASS" || return 0
+      printf '%s = socks5, %s, %s, %s, %s, udp-relay=true, block-quic=on\n' \
+        "$CQ_NAME" "$CQ_HOST" "$CQ_PORT" "$CQ_USER" "$CQ_PASS"
+      ;;
   esac
   return 0
 }
@@ -5490,7 +5516,7 @@ _cq_section() { # 打印 node.txt 里“拦截 QUIC”这一段
 _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.txt 读出 CQ_ 变量
   _cq_nt="$1/node.txt"
   [ -f "$_cq_nt" ] || return 1
-  _cq_link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell)://' "$_cq_nt" 2>/dev/null | tr -d '\r')
+  _cq_link=$(grep -m1 -E '^(vless|trojan|vmess|ss|anytls|hysteria2|tuic|snell|socks5)://' "$_cq_nt" 2>/dev/null | tr -d '\r')
   case "$_cq_link" in
     vless://*) CQ_PROTO=vless ;;
     trojan://*) CQ_PROTO=trojan ;;
@@ -5505,6 +5531,7 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
         *) CQ_PROTO=snell4 ;;
       esac
       ;;
+    socks5://*) CQ_PROTO=socks5 ;;
     *) return 1 ;;
   esac
   CQ_NAME=$(_cq_kv "节点名")
@@ -5513,6 +5540,7 @@ _cq_from_nodetxt() { # _cq_from_nodetxt <节点目录>：从老节点的 node.tx
   CQ_HOST=$(_cq_kv "地址")
   CQ_PORT=$(_cq_kv "端口")
   CQ_UUID=$(_cq_kv "UUID")
+  CQ_USER=$(_cq_kv "用户名")
   CQ_PASS=$(_cq_kv "密码")
   [ -n "$CQ_PASS" ] || CQ_PASS=$(_cq_kv "PSK（密钥）")
   CQ_SNI=$(_cq_kv "伪装域名")
@@ -5534,8 +5562,8 @@ _cq_fix_nodetxt() { # _cq_fix_nodetxt <节点目录>
   _cf_nt="$1/node.txt"
   grep -qE '^拦截 QUIC: |^想在客户端也拦：' "$_cf_nt" 2>/dev/null || return 0
   (
-    CQ_PROTO=""; CQ_NAME=""; CQ_HOST=""; CQ_PORT=""; CQ_UUID=""; CQ_PASS=""
-    CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""; CQ_PIN=""
+    CQ_PROTO=""; CQ_NAME=""; CQ_HOST=""; CQ_PORT=""; CQ_UUID=""; CQ_USER=""; CQ_PASS=""
+    CQ_SNI=""; CQ_PBK=""; CQ_SID=""; CQ_PATH=""; CQ_PIN=""; CQ_OBFS=""; CQ_OBFS_HOST=""
     _cq_from_nodetxt "$1" || CQ_PROTO=""
     _cq_section
   ) > "$_cf_nt.quic" 2>/dev/null || { rm -f "$_cf_nt.quic"; return 1; }
@@ -7526,7 +7554,7 @@ case "$SERVER_IP" in
 esac
 
 # ---------- 4. 问：协议 ----------
-# 9 种协议任选一种。看不懂就用默认 1（VLESS + REALITY + Vision），目前最不容易被识别。
+# 10 种协议任选一种。看不懂就用默认 1（VLESS + REALITY + Vision），目前最不容易被识别。
 step "[2/4] 选一个协议"
 printf "  1) VLESS + REALITY + Vision（推荐，最难被识别）\n"
 printf "  2) VMess + WebSocket（兼容性好，老客户端也支持）\n"
@@ -7537,6 +7565,7 @@ printf "  6) Hysteria2（UDP，速度快，弱网表现好。可以选混淆和�
 printf "  7) TUIC（UDP，低延迟）\n"
 printf "  8) Snell v4（Surge 生态轻量协议，低延迟高吞吐；支持 Surge / Loon / Clash Meta / 小火箭）\n"
 printf "  9) Snell v5（Surge 生态新版，含 QUIC 代理模式，兼容 v4 客户端；需同时放行 TCP 和 UDP）\n"
+printf " 10) SOCKS5（通用代理，带账号密码认证，适合落地/链式代理或 Telegram；明文无加密）\n"
 while true; do
   ask "请选择" "1" _proto
   case "$_proto" in
@@ -7549,6 +7578,7 @@ while true; do
     7) PROTO="tuic"; break ;;
     8) PROTO="snell4"; break ;;
     9) PROTO="snell5"; break ;;
+    10) PROTO="socks5"; break ;;
     *) warn "没有这个选项，请重新选择" ;;
   esac
 done
@@ -7562,15 +7592,16 @@ case "$PROTO" in
   tuic)   PROTO_NAME="TUIC"; _nm_proto="TUIC" ;;
   snell4) PROTO_NAME="Snell v4"; _nm_proto="Snell4" ;;
   snell5) PROTO_NAME="Snell v5"; _nm_proto="Snell5" ;;
+  socks5) PROTO_NAME="SOCKS5"; _nm_proto="Socks5" ;;
 esac
 if [ "$PROTO" = "snell4" ] || [ "$PROTO" = "snell5" ]; then
   if [ -f /etc/alpine-release ]; then
-    warn "检测到这是 Alpine 系统（musl）：官方 Snell 程序依赖 glibc，大概率跑不起来（Debian / Ubuntu / CentOS / Arch 原生支持）。如果没装过 glibc 兼容环境，下载试运行后会停止，届时可改选 1-7 中的协议。"
+    warn "检测到这是 Alpine 系统（musl）：官方 Snell 程序依赖 glibc，大概率跑不起来（Debian / Ubuntu / CentOS / Arch 原生支持）。如果没装过 glibc 兼容环境，下载试运行后会停止，届时可改选 1-7 或 10 中的协议。"
   fi
 fi
 # 创建节点前先问名字
 _ask_node_name "$_nm_proto"
-# 1-4 用 Xray。AnyTLS / TUIC 用 sing-box。Snell v4 / v5 用官方 snell-server。
+# 1-4 和 10 用 Xray。AnyTLS / TUIC 用 sing-box。Snell v4 / v5 用官方 snell-server。
 # Hysteria2 用官方 hysteria：sing-box 1.14 解压后约 80MB，64MB 内存的 NAT 会在下载或启动时被撑死。
 case "$PROTO" in
   hy2) CORE="hysteria" ;;
@@ -7746,18 +7777,33 @@ TUIC_PASS=$(rand_hex 16)
 TUIC_PIN=""
 # Snell PSK：32 位随机字符（官方向导默认 32 位，纯字母数字避免引号/转义问题）
 SNELL_PSK=$(rand_hex 16)
+# SOCKS5 账号和密码：纯十六进制字符，避免 URL / Loon / Surge / YAML 转义问题
+SOCKS_USER=$(rand_hex 8)
+SOCKS_PASS=$(rand_hex 16)
+SS_PASS=""
 if command -v openssl >/dev/null 2>&1; then
-  SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\n')
-else
+  SS_PASS=$(openssl rand -base64 16 2>/dev/null | tr -d '\r\n')
+fi
+if [ -z "$SS_PASS" ]; then
   # 直接对 16 个随机字节做 base64。以前经 awk printf "%c" 转一道，
   # gawk 在 UTF-8 环境会把 >127 的字节写成两个字节，密钥长度不对，Xray 校验失败。
-  SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | base64 | tr -d '\n')
+  SS_PASS=$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
 fi
 WS_PATH="/$(rand_hex 16)"  # 16 字节随机路径，防止被轻易探测
+# 核对当前所选协议用到的随机账号/密码不为空，避免写入损坏的配置或链接
+case "$PROTO" in
+  vless)  [ -n "$UUID" ] || die "随机 UUID 生成失败，没有装上节点" ;;
+  vmess)  [ -n "$UUID" ] && [ "$WS_PATH" != "/" ] || die "随机 UUID 或 WS 路径生成失败，没有装上节点" ;;
+  trojan) [ -n "$TROJAN_PASS" ] || die "随机密码生成失败，没有装上节点" ;;
+  ss)     [ -n "$SS_PASS" ] || die "随机 Shadowsocks 密钥生成失败，没有装上节点" ;;
+  anytls) [ -n "$ANYTLS_PASS" ] || die "随机密码生成失败，没有装上节点" ;;
+  tuic)   [ -n "$UUID" ] && [ -n "$TUIC_PASS" ] || die "随机 UUID 或密码生成失败，没有装上节点" ;;
+  socks5) [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ] || die "随机 SOCKS5 账号密码生成失败，没有装上节点" ;;
+esac
 info "账号密码已随机生成（装完会显示在链接里，完整参数平时输入 jiedian all 能看）"
 
 # ---------- 8. 下载内核 ----------
-# 1-4 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria，8 和 9 用官方 snell-server。已经有能用的就不重复下载。
+# 1-4 和 10 用 Xray，5 和 7 用 sing-box，6 用官方 hysteria，8 和 9 用官方 snell-server。已经有能用的就不重复下载。
 case "$CORE" in
   xray)     dl_xray ;;
   hysteria) dl_hysteria ;;
@@ -8015,6 +8061,27 @@ EOF
 }
 EOF
     ;;
+  socks5)
+    cat > "$NODE_DIR/config.json" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "$XRAY_LISTEN",
+      "port": $PORT,
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [ { "user": "$SOCKS_USER", "pass": "$SOCKS_PASS" } ],
+        "udp": true
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom" } ]
+}
+EOF
+    ;;
 esac
 _xray_test=$("$XRAY_BIN" -test -config "$NODE_DIR/config.json" 2>&1) \
   || die "配置文件校验没通过。$(printf '%s' "$_xray_test" | tr '\n' ' ' | cut -c1-300)"
@@ -8265,13 +8332,15 @@ if [ "$_svc_listen_ok" = "1" ]; then
   fi
 fi
 # 端口在听，并且这个节点自己的服务还在，才算起来了。
-_svc_recheck() { # _svc_recheck [等几秒] [协议]
+_svc_recheck() { # _svc_recheck [等几秒] [协议列表]
   _svc_listen_ok=1
-  _sr_proto="${2:-udp}"
-  if ! wait_for_port "$PORT" "$_sr_proto" "${1:-15}"; then
-    _svc_listen_ok=0
-    return
-  fi
+  _sr_protos="${2:-udp}"
+  for _sr_p in $_sr_protos; do
+    if ! wait_for_port "$PORT" "$_sr_p" "${1:-15}"; then
+      _svc_listen_ok=0
+      return
+    fi
+  done
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && [ -n "$SVC_UNIT" ]; then
     systemctl is-active --quiet "$SVC_UNIT" || _svc_listen_ok=0
   elif command -v rc-service >/dev/null 2>&1; then
@@ -8301,6 +8370,20 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$P
     _hop_set_family "$NODE_DIR" "$IPVER"
     _svc_restart "$NODE_ID"
     _svc_recheck
+  fi
+fi
+if [ "$_svc_listen_ok" != "1" ] && { [ "$CORE" = "xray" ] || [ "$CORE" = "sing-box" ]; } \
+  && [ "$IPVER" = "4" ] && grep -q '"listen"[[:space:]]*:[[:space:]]*"::"' "$NODE_DIR/config.json" 2>/dev/null; then
+  warn "同时听 IPv4 和 IPv6 没成功，改回只听 IPv4 再试一次"
+  if sed 's/"listen"[[:space:]]*:[[:space:]]*"::"/"listen": "0.0.0.0"/' "$NODE_DIR/config.json" > "$NODE_DIR/config.json.tmp"; then
+    mv -f "$NODE_DIR/config.json.tmp" "$NODE_DIR/config.json"
+    chmod 600 "$NODE_DIR/config.json" 2>/dev/null
+    [ "$CORE" = "xray" ] && XRAY_LISTEN="0.0.0.0"
+    [ "$CORE" = "sing-box" ] && SB_LISTEN="0.0.0.0"
+    _svc_restart "$NODE_ID"
+    _svc_recheck 15 "$_SVC_PROTOS"
+  else
+    rm -f "$NODE_DIR/config.json.tmp"
   fi
 fi
 if [ "$_svc_listen_ok" != "1" ] && { [ "$PROTO" = "snell4" ] || [ "$PROTO" = "snell5" ]; } \
@@ -8515,7 +8598,7 @@ case "$PROTO" in
     ;;
   vmess)
     _json="{\"v\":\"2\",\"ps\":\"${NODE_NAME}\",\"add\":\"${SERVER_IP}\",\"port\":\"${LINK_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
-    LINK="vmess://$(printf "%s" "$_json" | base64 2>/dev/null | tr -d '\n')"
+    LINK="vmess://$(printf "%s" "$_json" | base64 2>/dev/null | tr -d '\r\n')"
     ;;
   ss)
     LINK="ss://$(printf "%s" "2022-blake3-aes-128-gcm:${SS_PASS}" | b64url)@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
@@ -8579,6 +8662,9 @@ case "$PROTO" in
       SURGE_LINE="${NODE_NAME} = snell, ${SERVER_IP}, ${LINK_PORT}, psk=${SNELL_PSK}, version=4, reuse=true${_sn_obfs_s}, block-quic=on"
     fi
     ;;
+  socks5)
+    LINK="socks5://${SOCKS_USER}:${SOCKS_PASS}@${LINK_IP}:${LINK_PORT}#${NAME_ENC}"
+    ;;
 esac
 
 # ---------- 14. 保存 + jiedian 命令 ----------
@@ -8627,6 +8713,10 @@ fi
     snell4|snell5)
       printf "PSK（密钥）: %s\n" "$SNELL_PSK"
       printf "协议版本: v%s\n" "$SNELL_VER"
+      ;;
+    socks5)
+      printf "用户名: %s\n" "$SOCKS_USER"
+      printf "密码: %s\n" "$SOCKS_PASS"
       ;;
   esac
   case "$PROTO" in
@@ -8765,11 +8855,19 @@ fi
         printf "    obfs-opts:\n      mode: http\n      host: %s\n" "$SNELL_OBFS_HOST"
       fi
       ;;
+    socks5)
+      printf "安全提醒: SOCKS5 是明文协议（没有加密和伪装），适合做落地机 / 链式代理、Telegram 代理或常规工具，不建议直接用来跨墙连接。\n"
+      printf "Telegram 代理链接: https://t.me/socks?server=%s&port=%s&user=%s&pass=%s\n" \
+        "$SERVER_IP" "$LINK_PORT" "$SOCKS_USER" "$SOCKS_PASS"
+      printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
+      printf "  - name: \"%s\"\n    type: socks5\n    server: %s\n    port: %s\n    username: %s\n    password: %s\n    udp: true\n" \
+        "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$SOCKS_USER" "$SOCKS_PASS"
+      ;;
   esac
   # 拦截 QUIC 是客户端的开关：给 Loon / Surge 各拼一行已经打开它的节点配置，再说明别的 App 怎么开
   CQ_PROTO="$PROTO"; CQ_NAME="$NODE_NAME"; CQ_HOST="$SERVER_IP"; CQ_PORT="$LINK_PORT"
   CQ_UUID="${UUID:-}"; CQ_SNI="${REALITY_DOMAIN:-}"; CQ_PBK="${REALITY_PUB:-}"; CQ_SID="${REALITY_SID:-}"
-  CQ_PATH="${WS_PATH:-}"; CQ_PASS=""; CQ_OBFS=""; CQ_OBFS_HOST=""
+  CQ_PATH="${WS_PATH:-}"; CQ_USER=""; CQ_PASS=""; CQ_OBFS=""; CQ_OBFS_HOST=""
   case "$PROTO" in
     trojan) CQ_PASS="$TROJAN_PASS" ;;
     ss)     CQ_PASS="$SS_PASS" ;;
@@ -8779,6 +8877,10 @@ fi
       CQ_PASS="$SNELL_PSK"
       CQ_OBFS="$SNELL_OBFS"
       CQ_OBFS_HOST="$SNELL_OBFS_HOST"
+      ;;
+    socks5)
+      CQ_USER="$SOCKS_USER"
+      CQ_PASS="$SOCKS_PASS"
       ;;
   esac
   CQ_PIN=""

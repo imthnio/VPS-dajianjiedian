@@ -1227,7 +1227,7 @@ class ChoiceRetryTest(unittest.TestCase):
     def test_protocol_unknown_is_asked_again(self):
         block = between('while true; do\n  ask "请选择" "1" _proto', '\ncase "$PROTO" in')
         trailer = "\nprintf 'PROTO %s\\n' \"$PROTO\"\n"
-        bad = self.run_choice(block, "10\n6\n", trailer)
+        bad = self.run_choice(block, "11\n6\n", trailer)
         self.assertIn("WARN 没有这个选项，请重新选择", bad)
         self.assertIn("PROTO hy2", bad)
         chosen = self.run_choice(block, "\n", trailer)
@@ -1236,6 +1236,7 @@ class ChoiceRetryTest(unittest.TestCase):
         self.assertIn("PROTO hy2", self.run_choice(block, "  6 \n", trailer))
         self.assertIn("PROTO snell4", self.run_choice(block, "8\n", trailer))
         self.assertIn("PROTO snell5", self.run_choice(block, "9\n", trailer))
+        self.assertIn("PROTO socks5", self.run_choice(block, "10\n", trailer))
 
     def test_ip_version_unknown_is_asked_again(self):
         block = between('while true; do\n  ask "请选择" "$_ipdef" _ipver', '\nprintf "正在检测公网 IP')

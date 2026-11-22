@@ -99,7 +99,7 @@ UUID: 11111111-2222-3333-4444-555555555555
 class ServerSideRemovedTest(unittest.TestCase):
     def test_no_server_side_quic_block_left(self):
         source = INSTALLER.read_text()
-        self.assertEqual(source.count('  "outbounds": [ { "protocol": "freedom" } ]\n'), 4)
+        self.assertEqual(source.count('  "outbounds": [ { "protocol": "freedom" } ]\n'), 5)
         self.assertNotIn('{ "protocol": "blackhole", "tag": "block" }', source)
         self.assertNotIn("${SB_ROUTE}", source)
         self.assertNotIn("SB_ROUTE=", source)

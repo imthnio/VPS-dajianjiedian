@@ -378,7 +378,7 @@ class XrayListenTest(unittest.TestCase):
         """Pure IPv6 installs must not leave Xray on default 0.0.0.0-only (false success)."""
         source = INSTALLER.read_text()
         self.assertIn('if [ "$IPVER" = "6" ] || _v6_listen_ok; then XRAY_LISTEN="::"; else XRAY_LISTEN="0.0.0.0"; fi', source)
-        self.assertEqual(source.count('"listen": "$XRAY_LISTEN"'), 4)
+        self.assertEqual(source.count('"listen": "$XRAY_LISTEN"'), 5)
         # Each Xray protocol inbound must include the listen field.
         for proto in ("vless", "trojan", "vmess", "shadowsocks"):
             self.assertIn(f'"protocol": "{proto}"', source)
