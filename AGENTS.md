@@ -40,8 +40,8 @@
 | 路径 | 内容 |
 |---|---|
 | `/etc/xray-node/nodes/<编号>/` | 一个节点一个目录，互不影响 |
-| `…/config.json`、`config.yaml` 或 `config.conf` | 内核配置（Xray、sing-box 用 json；官方 Hysteria2 用 yaml；Snell v4/v5 用 conf） |
-| `…/core` | 这个节点用哪个内核：`xray` / `sing-box` / `hysteria` / `snell-v4` / `snell-v5` |
+| `…/config.json`、`config.yaml` 或 `config.conf` | 内核配置（Xray、sing-box 用 json；官方 Hysteria2 用 yaml；Snell v5/v6 用 conf） |
+| `…/core` | 这个节点用哪个内核：`xray` / `sing-box` / `hysteria` / `snell-v5` / `snell-v6` |
 | `…/node.txt` | 给用户看的全部参数和链接，`jiedian all` 显示的就是它 |
 | `…/name`、`…/link_port` | 节点名；NAT 小鸡的公网映射端口 |
 | `…/fw_info` | 这个节点放行了哪些端口（第一行是“端口 协议”），删节点时照着撤销 |
@@ -51,14 +51,14 @@
 | `/etc/xray-node/install.sh` | 上次运行的脚本副本，`gl` 断网时用 |
 | `/etc/xray-node/our_bins` | 哪些内核是本脚本装的（卸载时只删这些） |
 | `/etc/xray-node/rules.v4`、`rules.v6` | 存盘的防火墙规则 |
-| `/usr/local/bin/xray`、`sing-box`、`hysteria`、`snell-server-v4`、`snell-server-v5` | 各协议对应的内核 |
+| `/usr/local/bin/xray`、`sing-box`、`hysteria`、`snell-server-v5`、`snell-server-v6` | 各协议对应的内核 |
 | `/usr/local/bin/jiedian`、`shanjiedian`、`gl` | 三个快捷命令（`gl` 打开主菜单，先取最新 `install.sh`，取不到用 `/etc/xray-node/install.sh`） |
 | `/usr/local/bin/xray-node-watch` | 每分钟巡检：补端口跳跃规则、回程路由、证书续期时开关 80/443 |
 | `/usr/local/bin/xray-node-hop`、`-route`、`-limit`、`-expire`、`-fw-restore`、`-run` | 端口跳跃、回程路由、设备限制、到点删除、开机恢复防火墙、启动包装 |
 | `/var/log/xray-node-watch.log`、`-limit.log`、`-expire.log` | 后台小程序的日志 |
 | `/etc/resolv.conf.xray-node-orig` | 换 DNS 之前的备份（没换过就没有） |
 
-- 服务名：systemd 是 `xray-node@<编号>`、`hysteria-node@<编号>`、`singbox-node@<编号>`、`snell-v4-node@<编号>`、`snell-v5-node@<编号>` 模板实例；Alpine（OpenRC）是 `xray-node-<编号>`，用 `rc-status` 看。
+- 服务名：systemd 是 `xray-node@<编号>`、`hysteria-node@<编号>`、`singbox-node@<编号>`、`snell-v5-node@<编号>`、`snell-v6-node@<编号>` 模板实例；Alpine（OpenRC）是 `xray-node-<编号>`，用 `rc-status` 看。
 - **所有后台小程序都是 `install.sh` 里用 heredoc 写出来的**（`install_hop_bin`、`install_route_bin`、`install_watch_bin`、`install_expire_bins`、`install_limit_bin`、`write_helper_cmds`、`_write_gl_cmd`）。改它们要改 `install.sh` 里的这些函数，不是改机器上的文件；用户重跑一次脚本就会被覆盖成新的。
 
 ---
@@ -155,7 +155,7 @@ cd tests && python3 -m unittest discover
 | `tests/test_quic_client.py` | Loon / Surge 节点行、阻止 QUIC |
 | `tests/test_gl.py` | `gl` 命令 |
 | `tests/test_wgluodi.py` | 和 WireGuard 落地脚本的配合 |
-| `tests/test_snell.py` | Snell v4 / v5 下载、校验、配置、客户端行、生命周期与全面检查修复回归 |
+| `tests/test_snell.py` | Snell v5 / v6 下载、校验、配置、客户端行、生命周期与全面检查修复回归 |
 | `tests/test_socks5.py` | SOCKS5 协议配置、链接、Loon / Surge / mihomo / Telegram 行、jiedian 展示与全面检查修复回归 |
 | `tests/test_round_fixes.py` | 历次全面检查修掉的零散问题 |
 
@@ -252,7 +252,7 @@ cd tests && python3 -m unittest discover
 
 ### 7.7 `[下载] 获取 … 内核…` 卡住或失败
 
-- 章节 `下载三个内核`、`下载 Snell 内核（v4 / v5）` 和 `下载工具` 三节。顺序：查最新版 → 下载 → SHA256 校验（`_gh_expect_sum` / `_snell_expect_sum`、`_verify_dl`）→ 解压 → 试运行确认能用。
+- 章节 `下载三个内核`、`下载 Snell 内核（v5 / v6）` 和 `下载工具` 三节。顺序：查最新版 → 下载 → SHA256 校验（`_gh_expect_sum` / `_snell_expect_sum`、`_verify_dl`）→ 解压 → 试运行确认能用。
 - GitHub 连不上：`_gh_get` 自动换镜像；只有 IPv6 的机器临时开 DNS64（`_dns64_on` / `_dns64_off`，脚本中途被杀掉时下次启动由 `_dns64_recover` 还原）。`dl.nssurge.com` 也只有 IPv4，纯 IPv6 机器由 `_snell_prepare` 临时开 DNS64。
 - 官方 `snell-server` 依赖 glibc，Alpine（musl）原生跑不起来；`_snell_bin_ok` 试运行失败时会直接给出中文说明。
 - 小内存机器（64MB / 128MB）：`小内存机器的特殊处理` 一节。`prepare_low_memory` 会加 swap、清缓存；解压用 `_unpack_drip` 边解边写盘，不把整个文件读进内存。sing-box 解压后约 80MB，64MB 的机器装不下，会明说。测试在 `tests/test_lowmem.py`。

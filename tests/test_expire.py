@@ -1234,8 +1234,8 @@ class ChoiceRetryTest(unittest.TestCase):
         self.assertIn("PROTO vless", chosen)
         self.assertNotIn("WARN", chosen)
         self.assertIn("PROTO hy2", self.run_choice(block, "  6 \n", trailer))
-        self.assertIn("PROTO snell4", self.run_choice(block, "8\n", trailer))
-        self.assertIn("PROTO snell5", self.run_choice(block, "9\n", trailer))
+        self.assertIn("PROTO snell5", self.run_choice(block, "8\n", trailer))
+        self.assertIn("PROTO snell6", self.run_choice(block, "9\n", trailer))
         self.assertIn("PROTO socks5", self.run_choice(block, "10\n", trailer))
 
     def test_ip_version_unknown_is_asked_again(self):
