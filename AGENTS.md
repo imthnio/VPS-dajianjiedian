@@ -31,7 +31,7 @@
 | 仓库文件 | 作用 |
 |---|---|
 | `README.md` | 给用户看的说明，内容尽量少。**里面那一行安装命令是唯一入口**：自动识别系统、没 curl 先装、DNS 坏了换、GitHub 连不上换镜像，然后下载 `install.sh` 运行。 |
-| `install.sh` | 全部逻辑，一个 POSIX sh 文件，约 8000 行。装节点、更新内核、节点管理都在这里。开头是很长的注释（用法和“名词小词典”），后面按 `# ---------- 编号. 标题 ----------` 分节（搜 `# ----------` 看目录）。 |
+| `install.sh` | 全部逻辑，一个 POSIX sh 文件，约 9000 行。装节点、更新内核、节点管理都在这里。开头是很长的注释（用法和“名词小词典”），后面按 `# ---------- 编号. 标题 ----------` 分节（搜 `# ----------` 看目录）。 |
 | `AGENTS.md` | 本文件：给所有 AI 和维护者看的唯一手册（开发规矩 + 排障手册 + 历史故障）。 |
 | `tests/*.py` | Python unittest。从 `install.sh` / `README.md` 里切出片段，用假命令（stub）在本机跑。 |
 
@@ -276,7 +276,7 @@ cd tests && python3 -m unittest discover
 2. **服务器自己的防火墙**：`12. 放行端口`（`_fw_allow`）。规则存盘走 `_save_fw`，重启后由 `/usr/local/bin/xray-node-fw-restore` 恢复，存盘文件是 `/etc/xray-node/rules.v4`、`rules.v6`。测试在 `tests/test_firewall_restore.py`。
 3. **云厂商的安全组**：脚本改不到，装完的提示里会让用户自己去控制台放行。
 4. **NAT 小鸡的端口映射**：服务商给的公网端口和节点端口不一样时，要在“公网映射端口”那一问里填公网端口（存在节点目录的 `link_port`）。
-5. **UDP 节点（Hysteria2 / TUIC / Shadowsocks）回程走错网卡**：多网卡、多 IP 的机器。小程序 `xray-node-route` 负责加策略路由，`回程路由小程序` 一节，测试在 `tests/test_route.py`。
+5. **UDP 节点（Hysteria2 / TUIC / Shadowsocks / Snell v5）回程走错网卡**：多网卡、多 IP 的机器。小程序 `xray-node-route` 负责加策略路由，`回程路由小程序` 一节，测试在 `tests/test_route.py`。
 6. **端口跳跃失效**：Hysteria2。LXC / OpenVZ 小鸡常常没有 nat 转发权限，`_hy_hop_probe` 会先试，做不了就关掉跳跃并说明。防火墙重启会清掉转发规则，巡检 `xray-node-watch` 每分钟补回来。新节点的端口不能落进别的节点的跳跃范围（`_hop_taken`，测试 `tests/test_hop_conflict.py`）。
 7. **客户端填的是 IPv6 地址但节点只听 IPv4**：`Hysteria2 的 IPv4 / IPv6 双栈` 一节（`_hy_listen_for`、`_v6_listen_ok`）。
 8. **服务器时间不对**：VMess 对时间敏感。
@@ -352,6 +352,7 @@ os.write(fd, b'\x03')
 
 | 现象 | 根本原因 | 修法 | 教训 |
 |---|---|---|---|
+| 无 `CAP_NET_ADMIN` 的 Podman/容器上设置设备限制假成功并空转守护进程；AnyTLS 缺 `openssl` 时 9c 节打印“跳过验证”后又误报“验证通过”；只读容器关 IPv6 刷屏 `can't create`；`: >` 在 `dash`/`ash` 下重定向失败直接退出脚本；OpenRC 脚本与 `/etc/sysctl.d` 在 `umask 077` 下权限 `0700`；`_dl_hysteria_inner` 覆盖已有第三方二进制；`_hy_migrate_hop_all` 迁移后不验转发规则；mihomo YAML 遇 `::` 结尾 IPv6 或纯数字 hex 报错；`jiedian` 误报 Snell v6 为旧版脚本 | `shanjiedian` 未探测防火墙写权限；9c 节把跳过分支设为 `_rp_ok=1` 且未复用已有 `xray`/回退 `curl --tlsv1.3`；POSIX 特殊内建 `:` 重定向失败直接中止 shell，普通重定向未用 `{ ...; } 2>/dev/null` 包裹；`chmod +x`/`mkdir -p` 受 `umask 077` 影响；`_dl_hysteria_inner` 复用前仍查最新版；`_hy_migrate_hop_all` 未调 `xray-node-hop check`；YAML 标量未加双引号；`jiedian` 未特判 `snell://*version=6*` | `xray-node-limit` 增加 `fw-ok` 预检并在 `_limit_menu` 写入前拦截；9c 节复用 `$XRAY_BIN`/回退 `curl --tlsv1.3` 且跳过用 `_rp_ok=2`；改用 `{ true > ...; } 2>/dev/null` 并保护 `_resolv_restore` 失败不删备份；OpenRC 脚本与 `/etc/sysctl.d` 显式 `chmod 755`；`_virt_kind` 识别 Podman 并用 `tr '\0' '\n'` 读 `/proc/1/environ`；`_dl_hysteria_inner` 复用已有可用二进制；9b 节指纹剥冒号并回退 `_cert_pin`；`_hy_migrate_hop_all` 核验 `xray-node-hop check` 否则回滚；11b 先单栈再 `hy_root`；mihomo YAML 给 `server`/`ports`/凭据加引号；`jiedian` 与 15 节补 Snell v6 提示；14b BBR 补 `/proc/sys` 回退与 Alpine `sysctl boot` | 真机（无特权容器/Alpine）实测能立刻暴露权限、重定向和检测逻辑的假成功；POSIX 特殊内建 `:` 不能拿来配 `||` 抓重定向失败 |
 | 预装 `curl` 的全新 Debian/Ubuntu 机器装 Xray / Snell 时 `unzip` 或 `iptables-persistent` 报找不到包；`jiedian all` 查看 REALITY 节点缺 `PublicKey` 和 `shortId`；Shadowsocks 双栈迁移未核验 UDP | `_ensure_unzip` 与 `_save_fw` 在 `_pkg_updated=0` 时直接 `apt-get install` 而未先 `apt-get update`；第 14 节 REALITY 协议只打印了伪装域名；`_fix_existing_json_ipv6` 与 `_ipv6_rebind_nodes` 只读 `fw_info` 首行协议 | `_ensure_unzip` 复用 `_pkg_add`；`_save_fw` 首次安装失败且未更新源时先 `update` 再重试，失败回退 `_save_fw_light`；第 14 节补齐 REALITY `公钥（PublicKey）`/`shortId`/`指纹（fp）`；JSON 节点双栈迁移与关 IPv6 按 `fw_info` 全协议（TCP+UDP）核验并保持 `0600` 权限 | 延后按需安装的软件包不能假定前面已经跑过 `apt-get update`；同时占 TCP+UDP 的协议在迁移时两个都要核验 |
 | Xray / sing-box 在仅 IPv4 机器上监听 `::` 失败时直接报错退出；无 `/proc/sys/kernel/random/uuid` 时生成的 UUID 不符合 v4 规范；`openssl` 失败时 `SS_PASS` 不回退；`iptables-persistent` 安装失败未回退轻量存盘 | 11b 节双栈回退只写了 Hysteria2 / Snell，漏了 Xray / sing-box；`gen_uuid` 兜底未置 v4/variant 位；`SS_PASS` 未做空值回退和凭据校验；`_save_fw` 在 apt 失败后直接返回 | 11b 节补齐 Xray / sing-box `::` → `0.0.0.0` 回退及多协议 `_svc_recheck`；`gen_uuid` 兜底按 RFC 4122 v4 置位；第 7 节为 `SS_PASS` 加回退并按协议校验凭据非空；`_save_fw` 安装 `iptables-persistent` 失败时回退 `_save_fw_light` | 所有内核的监听回退、凭据生成与防火墙存盘路径要对齐检查 |
 | IPv6 机器上 UDP 443 节点开启 1 台设备限制后，服务器本机发起 IPv6 QUIC 出站仍可能把用户挤掉 | `/proc/net/nf_conntrack` 记录展开的 8 段 IPv6（如 `2001:0db8:0000:...`），`ip -o addr show` 输出压缩 IPv6（`2001:db8::1`），直接字符串比对失配 | `xray-node-limit` 的 `_seen` 增加 `norm()` 把 IPv6 统一展开成规范 8 段后再存入/比对 `loc` | 比对内核表和 `ip` 输出的 IPv6 地址必须先规范化，不能直接字符串相等 |

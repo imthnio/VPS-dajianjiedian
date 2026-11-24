@@ -2,6 +2,7 @@
 
 import base64
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -732,3 +733,301 @@ class AlpineOpenRCTest(unittest.TestCase):
         self.assertIn('if h curl;then curl -fsSL', cmd)
         self.assertNotIn('-T 15 -t 2', cmd)
         self.assertIn('-T 15 $T $u', cmd)
+
+
+class FullAuditRound2FixesTest(unittest.TestCase):
+    def test_reality_domain_check_skips_honestly_and_uses_xray_or_curl(self):
+        sec9c = between("# ---------- 9c. REALITY 伪装域名可用性检查 ----------", "# 前面的输入和下载都成功后才创建新节点目录")
+        # 1) 没有任何检测工具时：打印跳过验证，绝不矛盾打印“验证通过”
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_bin = Path(tmp) / "empty"
+            empty_bin.mkdir()
+            for tool in ("grep", "tr", "sed", "cat"):
+                src = shutil.which(tool)
+                if src:
+                    os.symlink(src, empty_bin / tool)
+            script = (
+                f'PATH="{empty_bin}"\n'
+                'step() { echo "STEP $1"; }; info() { echo "INFO $1"; }; warn() { echo "WARN $1"; }\n'
+                '_timeout_cmd() { shift; "$@"; }\n'
+                'NEED_REALITY=1; CORE=sing-box; XRAY_BIN=/nonexistent/xray; REALITY_DOMAIN=www.samsung.com\n'
+                + sec9c
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("没有可用的检测工具，跳过验证", res.stdout)
+            self.assertNotIn("伪装域名验证通过", res.stdout)
+            self.assertNotIn("验证没通过", res.stdout)
+
+        # 2) CORE=sing-box 但机器已有 XRAY_BIN：复用 xray tls ping
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_xray = root / "xray"
+            fake_xray.write_text('#!/bin/sh\necho "Handshake succeeded TLS 1.3"\n')
+            fake_xray.chmod(0o755)
+            script = (
+                'step() { :; }; info() { echo "INFO $1"; }; warn() { echo "WARN $1"; }\n'
+                '_timeout_cmd() { shift; "$@"; }\n'
+                f'NEED_REALITY=1; CORE=sing-box; XRAY_BIN="{fake_xray}"; REALITY_DOMAIN=www.samsung.com\n'
+                + sec9c
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("伪装域名验证通过：www.samsung.com", res.stdout)
+
+        # 3) 无 xray / openssl，老版 curl 不支持 --tlsv1.3（返回 2）：跳过验证且不误报通过
+        with tempfile.TemporaryDirectory() as tmp:
+            b = Path(tmp) / "bin"
+            b.mkdir()
+            for tool in ("grep", "tr", "sed"):
+                src = shutil.which(tool)
+                if src:
+                    os.symlink(src, b / tool)
+            (b / "curl").write_text("#!/bin/sh\nexit 2\n")
+            (b / "curl").chmod(0o755)
+            script = (
+                f'PATH="{b}"\n'
+                'step() { :; }; info() { echo "INFO $1"; }; warn() { echo "WARN $1"; }\n'
+                '_timeout_cmd() { shift; "$@"; }\n'
+                'NEED_REALITY=1; CORE=sing-box; XRAY_BIN=/nonexistent/xray; REALITY_DOMAIN=www.samsung.com\n'
+                + sec9c
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("没有可用的检测工具，跳过验证", res.stdout)
+            self.assertNotIn("伪装域名验证通过", res.stdout)
+
+    def test_dl_hysteria_reuses_existing_binary_without_overwriting_or_marking(self):
+        fn = between("_hysteria_local_ver() {", "\ndl_hysteria() {")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy_bin = root / "hysteria"
+            hy_bin.write_text('#!/bin/sh\necho "Version:\tv2.10.0"\n')
+            hy_bin.chmod(0o755)
+            calls = root / "calls.log"
+            script = (
+                f'HY_BIN="{hy_bin}"; MACH=amd64; FORCE_DL=0\n'
+                'step() { :; }; info() { echo "INFO $1"; }; warn() { :; }; die() { echo "DIE $1" >&2; exit 1; }\n'
+                f'_latest_hysteria_ver() {{ echo "LATEST" >> "{calls}"; echo "2.14.0"; }}\n'
+                f'mark_our_bin() {{ echo "MARK $1" >> "{calls}"; }}\n'
+                + fn + "\n_dl_hysteria_inner\n"
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("Hysteria2 已存在，直接用现有的：v2.10.0", res.stdout)
+            self.assertFalse(calls.exists(), "should neither query latest nor call mark_our_bin when reusing")
+
+    def test_hy2_cert_pin_strips_colons_and_falls_back_without_openssl(self):
+        sec9b = between("# ---------- 9b. 自签证书", "# ---------- 10. 写配置文件")
+        cert_pin = between("_cert_pin() {", "\n_timeout_cmd() {")
+        sha_fn = between("_sha256_of() {", "\n# _gh_get ")
+        # 1) pinSHA256 带冒号时也能正常解析
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nd = root / "node"
+            nd.mkdir()
+            hy = root / "hysteria"
+            pin_colons = ":".join(["ab"] * 32)
+            hy.write_text(
+                '#!/bin/sh\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  case "$1" in --cert) c="$2"; shift 2 ;; --key) k="$2"; shift 2 ;; *) shift ;; esac\n'
+                'done\n'
+                'printf "%s\\n%s\\n%s\\n" "-----BEGIN CERTIFICATE-----" "AQID" "-----END CERTIFICATE-----" > "$c"\n'
+                'printf "KEY\\n" > "$k"\n'
+                f'printf "pinSHA256: {pin_colons}\\n"\n'
+            )
+            hy.chmod(0o755)
+            script = (
+                'step() { :; }; info() { :; }; warn() { :; }; die() { echo "DIE $1" >&2; exit 1; }\n'
+                'drop_page_cache() { :; }\n'
+                f'PROTO=hy2; HY_BIN="{hy}"; HY2_CERT_HOST=deb.debian.org; NODE_DIR="{nd}"\n'
+                + sha_fn + "\n" + cert_pin + "\n" + sec9b + '\nprintf "PIN=%s\\n" "$HY2_PIN"\n'
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn(f"PIN={'AB' * 32}", res.stdout)
+
+        # 2) hysteria 不输出 pinSHA256 且无 openssl 时：通过 _cert_pin 从 cert.pem 算出指纹
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nd = root / "node"
+            nd.mkdir()
+            hy = root / "hysteria"
+            hy.write_text(
+                '#!/bin/sh\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  case "$1" in --cert) c="$2"; shift 2 ;; --key) k="$2"; shift 2 ;; *) shift ;; esac\n'
+                'done\n'
+                'printf "%s\\n%s\\n%s\\n" "-----BEGIN CERTIFICATE-----" "AQID" "-----END CERTIFICATE-----" > "$c"\n'
+                'printf "KEY\\n" > "$k"\n'
+            )
+            hy.chmod(0o755)
+            b = root / "bin"
+            b.mkdir()
+            for tool in ("awk", "sed", "tr", "head", "chmod", "rm", "base64", "sha256sum", "shasum"):
+                src = shutil.which(tool)
+                if src:
+                    os.symlink(src, b / tool)
+            script = (
+                f'PATH="{b}"\n'
+                'step() { :; }; info() { :; }; warn() { :; }; die() { echo "DIE $1" >&2; exit 1; }\n'
+                'drop_page_cache() { :; }\n'
+                f'PROTO=hy2; HY_BIN="{hy}"; HY2_CERT_HOST=deb.debian.org; NODE_DIR="{nd}"\n'
+                + sha_fn + "\n" + cert_pin + "\n" + sec9b + '\nprintf "PIN=%s\\n" "$HY2_PIN"\n'
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            # sha256(b"\x01\x02\x03") = 039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81
+            self.assertIn("PIN=039058C6F2C0CB492C533B0A4D14EF77CC0F78ABCCCED5287D84A1A2011CFB81", res.stdout)
+
+    def test_hy_migrate_hop_all_rolls_back_when_hop_check_fails(self):
+        fns = between("_hy_set_listen() {", "\n# ---------- 阻止 QUIC")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nodes = root / "nodes"
+            nd = nodes / "1"
+            nd.mkdir(parents=True)
+            (nd / "core").write_text("hysteria\n")
+            orig_cfg = 'listen: ":443,20000-20010"\nauth:\n  password: "abc"\n'
+            (nd / "config.yaml").write_text(orig_cfg)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            hop = fake_bin / "xray-node-hop"
+            hop.write_text('#!/bin/sh\n[ "$1" = down ] && exit 0\nexit 1\n')
+            hop.chmod(0o755)
+            patched = fns.replace("/etc/xray-node/nodes", str(nodes))
+            script = (
+                f'XRAY_BIN_DIR="{fake_bin}"\n'
+                'info() { echo "INFO $1"; }; warn() { echo "WARN $1"; }\n'
+                '_svc_restart() { :; }; wait_for_port() { return 0; }\n'
+                + patched + "\n_hy_migrate_hop_all\n"
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("已恢复原来的配置", res.stdout)
+            self.assertEqual((nd / "config.yaml").read_text(), orig_cfg)
+            self.assertFalse((nd / "hop").exists())
+
+    def test_mihomo_yaml_quotes_ipv6_and_numeric_credentials(self):
+        urlenc = between("_urlenc() {", "\n_node_name() {")
+        cq_funcs = between("_cq_ok() {", "\n_cq_strip_xray() {")
+        sec13 = between("# ---------- 13. 生成节点链接 ----------", "# ---------- 14. 保存 + jiedian 命令 ----------")
+        sec14 = between("# ---------- 14. 保存 + jiedian 命令 ----------", "\nwrite_helper_cmds")
+        with tempfile.TemporaryDirectory() as tmp:
+            nd = Path(tmp) / "1"
+            nd.mkdir()
+            script = (
+                "step() { :; }; info() { :; }; warn() { :; }; die() { echo \"DIE $1\" >&2; exit 1; }\n"
+                + urlenc + "\n" + cq_funcs + "\n"
+                "PROTO=socks5; PROTO_NAME=SOCKS5; NODE_NAME='v6Socks'\n"
+                "SERVER_IP='2a01:4f8:c2c:1234::'; LINK_IP='[2a01:4f8:c2c:1234::]'\n"
+                "PORT=1080; LINK_PORT=1080; IPVER=6; NODE_KIND=permanent\n"
+                "SOCKS_USER='1234567890123456'; SOCKS_PASS='00112233445566778899001122334455'\n"
+                f"NODE_DIR='{nd}'\n"
+                + sec13 + "\n" + sec14 + "\n"
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            nt = (nd / "node.txt").read_text()
+            self.assertIn('server: "2a01:4f8:c2c:1234::"', nt)
+            self.assertIn('username: "1234567890123456"', nt)
+            self.assertIn('password: "00112233445566778899001122334455"', nt)
+
+    def test_jiedian_snell6_explains_loon_unsupported(self):
+        jd = between("cat > /usr/local/bin/jiedian <<'JDEOF'\n", "\nJDEOF").split("\n", 1)[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nd = root / "1"
+            nd.mkdir()
+            (nd / "node.txt").write_text(
+                "snell://aabbccdd00112233445566778899aabb@1.2.3.4:23457?version=6&mode=default&reuse=true#HK6\n"
+                "节点名: 香港Snell6\n"
+                "协议: Snell v6\n"
+                "地址: 1.2.3.4\n"
+                "端口: 23457\n"
+                "香港Snell6 = snell, 1.2.3.4, 23457, psk=aabbccdd00112233445566778899aabb, version=6, mode=default, reuse=true, block-quic=on\n"
+            )
+            patched = jd.replace("/etc/xray-node/nodes", str(root)).replace("/usr/local/bin/xray-node-expire", "/nonexistent")
+            res = subprocess.run(["sh", "-c", patched], text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("Loon 不支持 Snell v6", res.stdout)
+            self.assertNotIn("旧版脚本装的", res.stdout)
+
+    def test_resolv_restore_preserves_backup_when_target_read_only(self):
+        fn = between("_resolv_restore() {", "\n_dfb_undo() {")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bak = root / "resolv.bak"
+            bak.write_text("nameserver 9.9.9.9\n")
+            target = root / "ro_dir" / "resolv.conf"
+            target.parent.mkdir()
+            target.write_text("nameserver 1.1.1.1\n")
+            target.chmod(0o444)
+            target.parent.chmod(0o555)
+            try:
+                patched = fn.replace("/etc/resolv.conf", str(target))
+                res = subprocess.run(["sh", "-c", f'{patched}\n_resolv_restore "{bak}"\n'], text=True, capture_output=True)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stderr.strip(), "")
+                if os.geteuid() != 0:
+                    self.assertTrue(bak.exists(), "backup must remain when restore write fails")
+            finally:
+                target.parent.chmod(0o755)
+                target.chmod(0o644)
+
+    def test_unpack_drip_fails_when_upstream_extractor_fails(self):
+        helpers = between('_PACE_PID=""', "_http_save() {")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "unzip").write_text('#!/bin/sh\nif [ "$1" = -l ]; then echo "2000000 01-01-2026 00:00 xray"; exit 0; fi\nhead -c 2000000 /dev/zero\nexit 1\n')
+            (fake_bin / "unzip").chmod(0o755)
+            out = root / "xray.new"
+            script = (
+                f'PATH="{fake_bin}:$PATH"\nLOW_MEM=1\n'
+                + helpers
+                + f'\n_drip_to() {{ cat > "$1"; }}\n_unpack_drip zip "{root}/a.zip" xray "{out}"\n'
+            )
+            res = subprocess.run(["sh", "-c", script], text=True, capture_output=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertFalse(out.exists())
+
+    def test_round2_static_safety_and_permissions_guards(self):
+        source = INSTALLER.read_text()
+        # 1) OpenRC init 脚本统一 chmod 755（避免 umask 077 下变成 0700）
+        self.assertIn("chmod 755 /etc/init.d/${_si_svc}", between("_svc_install() {", "\n_svc_restart() {"))
+        self.assertIn("chmod 755 /etc/init.d/xray-node-expire", between("arm_expire_watch() {", "\n# ---------- 设备数量限制"))
+        self.assertIn("chmod 755 /etc/init.d/xray-node-fw", between("_save_fw_light() {", "\n# 把刚加的放行规则保存下来"))
+        # 2) /etc/sysctl.d 与 _ipv6_persist 目录显式 chmod 755
+        self.assertIn("chmod 755 /etc/sysctl.d", between("prepare_low_memory() {", "\n# ---------- 下载三个内核"))
+        self.assertIn("chmod 755 /etc/sysctl.d", between("# ---------- 14b. BBR 加速", "# ---------- 15. 显示结果"))
+        self.assertIn('chmod 755 "$_cdir"', between("_ipv6_persist() {", "\n# 关掉 IPv6 后"))
+        # 3) POSIX dash/ash 下不能对特殊内建 : 做带 || 的重定向失败捕获
+        self.assertIn('{ true > "$1"; } 2>/dev/null || return 1', between("_drip_to() {", "\n# _unpack_drip"))
+        self.assertIn('{ true > /etc/resolv.conf.xray-node-bak.none; } 2>/dev/null || return 1', between("_dns64_on() {", "\n_dns64_off() {"))
+        # 4) _virt_kind 支持 podman 且用 tr '\0' '\n' 兼容 BusyBox grep
+        vk = between("_virt_kind() {", "\n# 端口跳跃打不开时")
+        self.assertIn("/run/.containerenv", vk)
+        self.assertIn("tr '\\0' '\\n' < /proc/1/environ", vk)
+        # 5) _hy_acmesh_issue 装完包后 hash -r 且始终检查 openssl
+        ac = between("_hy_acmesh_issue() {", "\n# 写 Hysteria2 的配置文件")
+        self.assertIn("hash -r 2>/dev/null || true", ac)
+        self.assertLess(ac.index('warn "openssl 没装上，申请不了证书"'), ac.index('[ "$HY2_ACME_TYPE" != "tls" ]'))
+        # 6) 11b Hysteria2 先回退单栈监听，再考虑永久写 hy_root
+        s11b = between("_svc_recheck() {", "\n# 端口跳跃：不靠")
+        self.assertLess(s11b.index('HY_LISTEN="0.0.0.0:$PORT"'), s11b.index(": > /etc/xray-node/hy_root"))
+        # 7) 2c 老版迁移识别大写 Hysteria2
+        s2c = between("# ---------- 2c. 老版本迁移", "# ---------- 2d. 已有节点时的主菜单")
+        self.assertIn("hy2|hysteria2|Hysteria2|tuic|TUIC", s2c)
+        # 8) 14b BBR 兼容无 sysctl 的 /proc/sys 回退与 Alpine OpenRC sysctl boot
+        bbr = between("# ---------- 14b. BBR 加速", "# ---------- 15. 显示结果")
+        self.assertIn("/proc/sys/net/ipv4/tcp_congestion_control", bbr)
+        self.assertIn("rc-update add sysctl boot", bbr)
+        # 9) _save_fw 装完 iptables-persistent 后 hash -r，失败继续回退 _save_fw_light
+        sfw = between("_save_fw() {", "\n# 放行端口 =")
+        self.assertIn("hash -r 2>/dev/null || true", sfw)
+        self.assertIn("netfilter-persistent save >/dev/null 2>&1; then\n        info", sfw)
+        # 10) _ipv6_apply 包裹整个重定向避免只读 /proc/sys 报错刷屏
+        self.assertIn('{ printf \'%s\\n\' "$_iv" > "$_f"; } 2>/dev/null || true', between("_ipv6_apply() {", "\n_ipv6_sysctl_block() {"))

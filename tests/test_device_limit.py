@@ -265,6 +265,26 @@ class LimitBinTest(unittest.TestCase):
         self.assertFalse((self.root / "cron" / "xray-node-limit").exists())
         self.assertFalse((self.root / "limit.pid").exists())
 
+    def test_fw_ok_probe_nft_iptables_and_denied(self):
+        # 1) nft 可用：fw-ok 返回 0，且不破坏现有表规则文件检查
+        res = self.run_limit("fw-ok", check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # 2) nft 无权限，回退到 iptables：fw-ok 返回 0
+        (self.bin / "nft").write_text("#!/bin/sh\necho 'Operation not permitted' >&2\nexit 1\n")
+        (self.bin / "iptables").write_text(IPT_MOCK)
+        (self.bin / "iptables").chmod(0o755)
+        self.env["IPT_LOG"] = str(self.root / "ipt-probe.log")
+        res2 = self.run_limit("fw-ok", check=False)
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertIn("iptables -w -N XRAY_NODE_LIMIT_PROBE", (self.root / "ipt-probe.log").read_text())
+        self.assertIn("iptables -w -X XRAY_NODE_LIMIT_PROBE", (self.root / "ipt-probe.log").read_text())
+        # 3) nft 与 iptables 都无权限 / 不存在（如无 CAP_NET_ADMIN 的 Podman 容器）：返回非 0
+        (self.bin / "iptables").write_text("#!/bin/sh\nexit 1\n")
+        (self.bin / "ip6tables").write_text("#!/bin/sh\nexit 1\n")
+        (self.bin / "ip6tables").chmod(0o755)
+        res3 = self.run_limit("fw-ok", check=False)
+        self.assertNotEqual(res3.returncode, 0)
+
 
 class LimitCleanupTest(unittest.TestCase):
     def test_every_delete_path_releases_devices(self):
@@ -296,7 +316,7 @@ class LimitMenuTest(unittest.TestCase):
         script = script.replace("/usr/local/bin/xray-node-limit", str(limit_bin))
         return script.replace("NODES_DIR=/etc/xray-node/nodes", f"NODES_DIR={nodes}", 1)
 
-    def run_menu(self, answers, node_ids=("2", "5"), limits=None):
+    def run_menu(self, answers, node_ids=("2", "5"), limits=None, fw_ok=True):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             nodes = root / "nodes"
@@ -309,7 +329,13 @@ class LimitMenuTest(unittest.TestCase):
                     (directory / "limit").write_text(limits[node_id] + "\n")
             log = root / "limit.log"
             limit_bin = root / "xray-node-limit"
-            limit_bin.write_text(f'#!/bin/sh\necho "$*" >> {log}\n[ "$1" = udp-ok ] && exit 1\nexit 0\n')
+            fw_rc = "0" if fw_ok else "1"
+            limit_bin.write_text(
+                f'#!/bin/sh\necho "$*" >> {log}\n'
+                f'[ "$1" = udp-ok ] && exit 1\n'
+                f'[ "$1" = fw-ok ] && exit {fw_rc}\n'
+                f'exit 0\n'
+            )
             limit_bin.chmod(0o755)
             result = subprocess.run(
                 ["sh", "-c", self.menu_script(nodes, limit_bin)],
@@ -347,6 +373,18 @@ class LimitMenuTest(unittest.TestCase):
     def test_node_list_shows_current_limit(self):
         result, _, _ = self.run_menu("0\n", limits={"5": "2"})
         self.assertIn("最多 2 台设备", result.stdout)
+
+    def test_menu_refuses_when_fw_ok_fails_but_still_allows_clearing(self):
+        result, values, calls = self.run_menu("7\n5\n2\n", fw_ok=False)
+        self.assertEqual(values, {})
+        self.assertIn("fw-ok", calls)
+        self.assertNotIn("arm", calls)
+        self.assertIn("没有修改防火墙的权限", result.stdout)
+        # 设为 0 解除已有设备限制时不受 fw-ok 阻拦
+        result2, values2, calls2 = self.run_menu("7\n2\n0\n", limits={"2": "3"}, fw_ok=False)
+        self.assertEqual(values2, {})
+        self.assertIn("clear 2", calls2)
+        self.assertIn("不限制", result2.stdout)
 
 
 if __name__ == "__main__":

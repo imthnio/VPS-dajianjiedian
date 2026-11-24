@@ -10,10 +10,10 @@
 #      没有 curl、也没有 wget 时，这一行会先装上再继续。
 #   3. 按提示回答几个问题（看不懂就一路回车用默认），装完自动给你节点链接
 #
-# 装完之后，想看所有节点随时输入：  jiedian（只显示通用链接和 Loon 行；jiedian all 看完整参数）
+# 装完之后，想看所有节点随时输入：  jiedian（显示通用链接和 Loon 行，Snell 另附 Surge 行；jiedian all 看完整参数）
 # 输入 shanjiedian 进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
 # 输入 gl 直接打开主菜单（更新内核、添加节点、节点管理等），不用再粘贴一键安装命令
-# 已经装过节点的机器再跑一次：选“更新内核”或“添加节点”时，Xray / sing-box 有新的正式版会自动升级（beta 不装）
+# 已经装过节点的机器再跑一次：选“更新内核”时会把已装内核升到最新正式版（beta 不装）；选“添加节点”时 Xray / sing-box 有新的正式版会顺便升级
 #
 # 节点分两种，装的时候先选：
 #   永久节点：一直有效
@@ -443,7 +443,7 @@ _pace_stop() {
 # 这样等着写盘的内容最多 4MB，64MB 的机器解压几十 MB 的内核也不会被杀。
 # 这台机器的 dd 不认这种写法时返回 1，调用的地方再换老办法。
 _drip_to() {
-  : > "$1" 2>/dev/null || return 1
+  { true > "$1"; } 2>/dev/null || return 1
   while :; do
     _dt=$(LC_ALL=C dd bs=1048576 count=4 iflag=fullblock conv=fsync 2>&1 >>"$1") || return 1
     case "$_dt" in
@@ -459,21 +459,24 @@ _drip_to() {
 _unpack_drip() {
   [ "$LOW_MEM" = "1" ] || return 1
   _ud_want=""
-  rm -f "$4"
+  _ud_rcf="$4.rc.$$"
+  rm -f "$4" "$_ud_rcf"
   case "$1" in
     zip)
       _ud_want=$(unzip -l "$2" "$3" 2>/dev/null | awk -v n="$3" '$NF == n { print $1; exit }')
-      unzip -p "$2" "$3" 2>/dev/null | _drip_to "$4"
+      ( unzip -p "$2" "$3" 2>/dev/null; printf '%s\n' "$?" > "$_ud_rcf" ) | _drip_to "$4"
       ;;
     tgz)
-      tar xzOf "$2" "$3" 2>/dev/null | _drip_to "$4"
+      ( tar xzOf "$2" "$3" 2>/dev/null; printf '%s\n' "$?" > "$_ud_rcf" ) | _drip_to "$4"
       ;;
     *) return 1 ;;
   esac
   _ud_rc=$?
+  _ud_src_rc=$(tr -d ' \r\n' 2>/dev/null < "$_ud_rcf")
+  rm -f "$_ud_rcf"
   _ud_have=$(wc -c 2>/dev/null < "$4" | tr -d ' ')
   case "$_ud_want" in ''|*[!0-9]*) _ud_want="" ;; esac
-  if [ "$_ud_rc" -eq 0 ] && [ -n "$_ud_have" ] && [ "$_ud_have" -ge 1000000 ] \
+  if [ "$_ud_rc" -eq 0 ] && [ "${_ud_src_rc:-1}" = "0" ] && [ -n "$_ud_have" ] && [ "$_ud_have" -ge 1000000 ] \
      && { [ -z "$_ud_want" ] || [ "$_ud_have" = "$_ud_want" ]; }; then
     return 0
   fi
@@ -569,11 +572,11 @@ _dns64_on() {
     mv -f /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null ||
       cp -P /etc/resolv.conf /etc/resolv.conf.xray-node-bak 2>/dev/null || return 1
   else
-    : > /etc/resolv.conf.xray-node-bak.none 2>/dev/null || return 1
+    { true > /etc/resolv.conf.xray-node-bak.none; } 2>/dev/null || return 1
   fi
   {
-    for _ds in $DNS64_SERVERS; do printf 'nameserver %s\n' "$_ds"; done
-  } > /etc/resolv.conf 2>/dev/null || { _DNS64_ON=1; _dns64_off; return 1; }
+    { for _ds in $DNS64_SERVERS; do printf 'nameserver %s\n' "$_ds"; done; } > /etc/resolv.conf
+  } 2>/dev/null || { _DNS64_ON=1; _dns64_off; return 1; }
   chmod 644 /etc/resolv.conf 2>/dev/null || true
   _DNS64_ON=1
   trap '_dns64_off; exit 130' INT TERM HUP
@@ -587,7 +590,7 @@ _dns64_off() {
     if rm -f /etc/resolv.conf 2>/dev/null && mv -f /etc/resolv.conf.xray-node-bak /etc/resolv.conf 2>/dev/null; then
       :
     else
-      cat /etc/resolv.conf.xray-node-bak > /etc/resolv.conf 2>/dev/null &&
+      { cat /etc/resolv.conf.xray-node-bak > /etc/resolv.conf; } 2>/dev/null &&
         chmod 644 /etc/resolv.conf 2>/dev/null &&
         rm -f /etc/resolv.conf.xray-node-bak
     fi
@@ -643,9 +646,10 @@ _resolv_restore() {
     rm -f /etc/resolv.conf 2>/dev/null
     mv -f "$1" /etc/resolv.conf 2>/dev/null
   elif [ -e "$1" ]; then
-    cat "$1" > /etc/resolv.conf 2>/dev/null
-    chmod 644 /etc/resolv.conf 2>/dev/null || true
-    rm -f "$1"
+    if { cat "$1" > /etc/resolv.conf; } 2>/dev/null; then
+      chmod 644 /etc/resolv.conf 2>/dev/null || true
+      rm -f "$1"
+    fi
   fi
 }
 
@@ -687,7 +691,7 @@ _dns_fix_broken() {
   fi
   # 链接（systemd-resolved 的 stub）先拿掉，写成普通文件，别的程序就不会再改回去
   [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-  if ! { for _ds in $_dfb_servers; do printf 'nameserver %s\n' "$_ds"; done; } > /etc/resolv.conf 2>/dev/null; then
+  if ! { { for _ds in $_dfb_servers; do printf 'nameserver %s\n' "$_ds"; done; } > /etc/resolv.conf; } 2>/dev/null; then
     _dfb_undo
     warn "改不了 /etc/resolv.conf（可能被锁住或只读），请到服务商后台把 DNS 改成 1.1.1.1 / 8.8.8.8 后再运行"
     return 1
@@ -703,7 +707,7 @@ _dns_fix_broken() {
   # Alpine 等系统的 dhcpcd 续租时会重新生成 resolv.conf，商家 DHCP 不给 DNS 时只剩几行注释，
   # 节点能连上却打不开任何网站。dhcpcd 会把 resolv.conf.head 原样放在最前面，写一份进去就不会被冲掉。
   if command -v dhcpcd >/dev/null 2>&1 || [ -f /etc/dhcpcd.conf ]; then
-    cat /etc/resolv.conf > /etc/resolv.conf.head 2>/dev/null && chmod 644 /etc/resolv.conf.head 2>/dev/null
+    { cat /etc/resolv.conf > /etc/resolv.conf.head; } 2>/dev/null && chmod 644 /etc/resolv.conf.head 2>/dev/null
   fi
   info "DNS 已换成：${_dfb_servers}（原来的备份在 ${_dfb_bak}）"
   return 0
@@ -952,7 +956,7 @@ start() {
   /usr/local/bin/xray-node-fw-restore
 }
 FWEOF
-    chmod +x /etc/init.d/xray-node-fw || return 1
+    chmod 755 /etc/init.d/xray-node-fw || return 1
     rc-update add xray-node-fw default >/dev/null 2>&1 || return 1
     rm -f /etc/xray-node/rules.v4 /etc/xray-node/rules.v6
     info "本脚本添加的防火墙规则已设为开机恢复"
@@ -1012,11 +1016,12 @@ _save_fw() { # _save_fw <4|6>：把刚加的 iptables 规则存盘，重启后�
     fi
     unset DEBIAN_FRONTEND
     if [ "$_sfw_apt_ok" = "1" ]; then
+      hash -r 2>/dev/null || true
       if command -v netfilter-persistent >/dev/null 2>&1 \
         && netfilter-persistent save >/dev/null 2>&1; then
         info "iptables 规则已存盘（重启后仍有效）"
+        return 0
       fi
-      return 0
     fi
     if { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; } \
       || { command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; }; then
@@ -1312,10 +1317,12 @@ _virt_kind() { # 打印 none / kvm / lxc / openvz / docker / 其它
   if [ -z "$_vk" ] || [ "$_vk" = "none" ]; then
     if [ -f /proc/user_beancounters ] || { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }; then
       _vk=openvz
-    elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || [ "$(cat /run/container_type 2>/dev/null)" = "lxc" ]; then
+    elif { [ -r /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -qx 'container=lxc'; } || [ "$(cat /run/container_type 2>/dev/null)" = "lxc" ]; then
       _vk=lxc
-    elif [ -f /.dockerenv ] || grep -qa 'container=docker' /proc/1/environ 2>/dev/null; then
+    elif [ -f /.dockerenv ] || { [ -r /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -qx 'container=docker'; }; then
       _vk=docker
+    elif [ -f /run/.containerenv ] || { [ -r /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -qx 'container=podman'; }; then
+      _vk=podman
     elif grep -q '^flags.* hypervisor' /proc/cpuinfo 2>/dev/null; then
       _vk=kvm
     else
@@ -2527,7 +2534,7 @@ _ipv6_apply() { # _ipv6_apply 0|1：立刻生效。以 all/disable_ipv6 的结�
   [ -d "$_root" ] || return 1
   for _f in "$_root"/*/disable_ipv6; do
     [ -f "$_f" ] || continue
-    printf '%s\n' "$_iv" > "$_f" 2>/dev/null || true
+    { printf '%s\n' "$_iv" > "$_f"; } 2>/dev/null || true
   done
   _all="${_root}/all/disable_ipv6"
   if [ ! -f "$_all" ] || [ "$(tr -d ' \r\n' 2>/dev/null < "$_all")" != "$_iv" ]; then
@@ -2555,7 +2562,7 @@ _ipv6_sysctl_block() { # off|on：改 sysctl.conf 里的标记段，开机时还
       { print }
     ' "$_sc" > "$_tmp" || { rm -f "$_tmp"; return 1; }
   else
-    : > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    { true > "$_tmp"; } 2>/dev/null || { rm -f "$_tmp"; return 1; }
   fi
   if [ "$_mode" = "off" ]; then
     if [ -s "$_tmp" ]; then
@@ -2589,7 +2596,7 @@ _ipv6_gai() { # off|on：让程序查地址时先用 IPv4。关掉 IPv6 时写�
       return 1
     fi
   else
-    : > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    { true > "$_tmp"; } 2>/dev/null || { rm -f "$_tmp"; return 1; }
   fi
   if [ "$_mode" = "off" ]; then
     printf '%s\n' "precedence ::ffff:0:0/96  100  # xray-node-ipv6" >> "$_tmp" || { rm -f "$_tmp"; return 1; }
@@ -2790,7 +2797,7 @@ _ipv6_persist() { # off|on
   _conf=$(_ipv6_conf_path)
   _cdir=$(dirname "$_conf")
   if [ "$_mode" = "off" ]; then
-    mkdir -p "$_cdir" 2>/dev/null || return 1
+    [ -d "$_cdir" ] || { mkdir -p "$_cdir" 2>/dev/null && chmod 755 "$_cdir" 2>/dev/null; } || return 1
     cat > "$_conf" <<'EOF' || return 1
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -3350,7 +3357,7 @@ $(_openrc_bg)
 pidfile="/run/xray-node-expire.pid"
 depend() { after localmount; }
 EOF
-      chmod 700 /etc/init.d/xray-node-expire || return 0
+      chmod 755 /etc/init.d/xray-node-expire || return 0
       rc-update add xray-node-expire default >/dev/null 2>&1 || true
       rc-service xray-node-expire restart >/dev/null 2>&1 || rc-service xray-node-expire start >/dev/null 2>&1 || true
       if [ "$_aw_new" = "1" ]; then
@@ -3424,6 +3431,7 @@ install_limit_bin() { # 写出 /usr/local/bin/xray-node-limit。重复运行只�
 #   xray-node-limit clear <编号>    放开这个节点被挤掉的设备，忘掉它的在线记录
 #   xray-node-limit status <编号>   打印这个节点现在在线的设备和被挤掉的设备
 #   xray-node-limit udp-ok          这台机器能看到 UDP 连接（Hysteria2 / TUIC 要用）就返回 0
+#   xray-node-limit fw-ok           这台机器能用 nftables 或 iptables 写入拦人规则就返回 0
 # 一台设备按客户端的公网 IP 算。IPv6 按前 64 位算：同一台手机的 IPv6 地址会经常换。
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 NODES_DIR=${XRAY_NODE_DIR:-/etc/xray-node/nodes}
@@ -3481,6 +3489,29 @@ _ports() { # _ports <节点编号>：每行“端口 协议”，就是客户端
 _udp_ok() {
   [ -r "$PROC_NET/nf_conntrack" ] && return 0
   command -v conntrack >/dev/null 2>&1 && conntrack -L -p udp >/dev/null 2>&1
+}
+
+_fw_ok_probe() { # 试建并立刻删掉一张临时表/链，确认这台机器有权限写入拦人规则（不动现用规则）
+  if command -v nft >/dev/null 2>&1; then
+    _fp_t="${TABLE}_probe"
+    if printf 'table inet %s {}\ndelete table inet %s\ntable inet %s {\n  chain input {\n    type filter hook input priority -5; policy accept;\n  }\n}\n' "$_fp_t" "$_fp_t" "$_fp_t" \
+      | nft -f - >/dev/null 2>&1; then
+      nft delete table inet "$_fp_t" >/dev/null 2>&1 || true
+      return 0
+    fi
+    nft delete table inet "$_fp_t" >/dev/null 2>&1 || true
+  fi
+  _fp_c="${CHAIN}_PROBE"
+  for _fp_b in iptables ip6tables; do
+    command -v "$_fp_b" >/dev/null 2>&1 || continue
+    "$_fp_b" -w -F "$_fp_c" >/dev/null 2>&1 || true
+    "$_fp_b" -w -X "$_fp_c" >/dev/null 2>&1 || true
+    if "$_fp_b" -w -N "$_fp_c" >/dev/null 2>&1; then
+      "$_fp_b" -w -X "$_fp_c" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 1
 }
 
 _seen() { # _seen <端口文件>：每行一台正连着的设备（IPv4 地址，或 IPv6 的 前缀::/64）
@@ -3926,7 +3957,8 @@ case "$1" in
   clear) _id_ok "$2"; _clear "$2" ;;
   status) _id_ok "$2"; _status "$2" ;;
   udp-ok) _udp_ok; exit $? ;;
-  *) echo "用法：xray-node-limit loop|tick|arm|disarm|udp-ok|clear <编号>|status <编号>" >&2; exit 2 ;;
+  fw-ok) _fw_ok_probe; exit $? ;;
+  *) echo "用法：xray-node-limit loop|tick|arm|disarm|udp-ok|fw-ok|clear <编号>|status <编号>" >&2; exit 2 ;;
 esac
 exit 0
 LIMITEOF
@@ -4064,6 +4096,7 @@ for _d in /etc/xray-node/nodes/*/; do
   else
     case "$_link" in
       tuic://*) printf "Loon 不支持 TUIC，请用上面的通用链接。\n" ;;
+      snell://*version=6*) printf "Loon 不支持 Snell v6，请用上面的通用链接或下面的 Surge 节点。\n" ;;
       *) printf "这个节点是旧版脚本装的，没有现成的 Loon 行。请用上面的通用链接，或输入 jiedian all 看参数在 Loon 里手动添加。\n" ;;
     esac
   fi
@@ -4376,6 +4409,10 @@ _limit_menu() {
   fi
   if [ ! -x "$_lm_bin" ]; then
     echo "设备数限制程序还没装上。请重新运行一键安装脚本，选「更新内核」后再来设置。"
+    return 0
+  fi
+  if ! "$_lm_bin" fw-ok >/dev/null 2>&1; then
+    echo "这台机器没有修改防火墙的权限（或没装 nft / iptables，容器 VPS 常见），无法把超出的设备挡在节点外面，设了也不会生效。没有改动。"
     return 0
   fi
   printf '%s\n' "$_lm_n" > "$NODES_DIR/$_lm_sel/limit"
@@ -4723,7 +4760,7 @@ stop_post() {
     /usr/local/bin/xray-node-route down ${_si_id} >/dev/null 2>&1 || true
 }
 RCEOF
-    chmod +x /etc/init.d/${_si_svc}
+    chmod 755 /etc/init.d/${_si_svc}
     rc-update add "$_si_svc" default >/dev/null 2>&1
     # 先清掉可能残留的旧状态，再启动（比 restart 更稳）
     rc-service "$_si_svc" zap >/dev/null 2>&1
@@ -5196,20 +5233,23 @@ _hy_acmesh_issue() {
   # acme.sh 自己临时开个小网站给 Let's Encrypt 验证：80 端口用 socat 或 python，443 端口（--alpn）和签发密钥用 openssl
   if ! command -v openssl >/dev/null 2>&1; then
     _pkg_add "正在安装 openssl（申请证书时用）" openssl
+    hash -r 2>/dev/null || true
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    warn "openssl 没装上，申请不了证书"
+    return 1
   fi
   if [ "$HY2_ACME_TYPE" != "tls" ]; then
     if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
       && ! command -v python >/dev/null 2>&1; then
       _pkg_add "正在安装 socat（申请证书时用）" socat
+      hash -r 2>/dev/null || true
     fi
     if ! command -v socat >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1 \
       && ! command -v python >/dev/null 2>&1; then
       warn "socat 没装上，申请不了证书"
       return 1
     fi
-  elif ! command -v openssl >/dev/null 2>&1; then
-    warn "openssl 没装上，申请不了证书"
-    return 1
   fi
   if [ "$HY2_ACME_TYPE" = "tls" ]; then
     _ai_mode="--alpn --tlsport 443"
@@ -5408,14 +5448,26 @@ _hy_migrate_hop_all() {
     chmod 600 "${_mh_d}hop" 2>/dev/null
     if _hy_set_listen "$_mh_cfg" "${_mh_pre}${_mh_main}"; then
       _svc_restart "$_mh_id"
+      _mh_hop_bin="${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop"
       if wait_for_port "$_mh_main" udp 15; then
-        rm -f "${_mh_cfg}.bak-hop"
-        info "节点 $_mh_id 的端口跳跃改成了新写法：主端口 ${_mh_main}，跳跃端口 $_mh_hops"
-        continue
+        _mh_hop_ok=0
+        if [ -x "$_mh_hop_bin" ]; then
+          if "$_mh_hop_bin" check "$_mh_id" >/dev/null 2>&1; then
+            _mh_hop_ok=1
+          elif "$_mh_hop_bin" up "$_mh_id" >/dev/null 2>&1 \
+            && "$_mh_hop_bin" check "$_mh_id" >/dev/null 2>&1; then
+            _mh_hop_ok=1
+          fi
+        fi
+        if [ "$_mh_hop_ok" = "1" ]; then
+          rm -f "${_mh_cfg}.bak-hop"
+          info "节点 $_mh_id 的端口跳跃改成了新写法：主端口 ${_mh_main}，跳跃端口 $_mh_hops"
+          continue
+        fi
       fi
     fi
     mv -f "${_mh_cfg}.bak-hop" "$_mh_cfg"
-    [ -x /usr/local/bin/xray-node-hop ] && /usr/local/bin/xray-node-hop down "$_mh_id" >/dev/null 2>&1
+    [ -x "${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop" ] && "${XRAY_BIN_DIR:-/usr/local/bin}/xray-node-hop" down "$_mh_id" >/dev/null 2>&1
     rm -f "${_mh_d}hop"
     _svc_restart "$_mh_id"
     warn "节点 $_mh_id 换成新的端口跳跃写法后没起来，已恢复原来的配置"
@@ -6237,7 +6289,7 @@ prepare_low_memory() {
     if [ "$_oc" != "1" ]; then
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
         || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
-        mkdir -p /etc/sysctl.d 2>/dev/null
+        [ -d /etc/sysctl.d ] || { mkdir -p /etc/sysctl.d 2>/dev/null && chmod 755 /etc/sysctl.d 2>/dev/null; }
         printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null
         chmod 644 /etc/sysctl.d/99-xray-node-overcommit.conf 2>/dev/null || true
         info "已放开内存申请限制（小内存机器需要这一步）"
@@ -6348,14 +6400,14 @@ _hy_asset() {
 _dl_hysteria_inner() { # 下载官方 Hysteria2。它是静态的小程序，64MB 内存装得下；sing-box 1.14 解压后约 80MB，装不上。
   step "[下载] 获取 Hysteria2 内核…"
   _hy_asset=$(_hy_asset) || die "这个 CPU 架构没有对应的 Hysteria2 程序：$(uname -m)"
-  _hy_latest=$(_latest_hysteria_ver) || _hy_latest=""
   if [ "$FORCE_DL" != "1" ] && [ -x "$HY_BIN" ]; then
     _hy_have=$(_hysteria_local_ver "$HY_BIN")
-    if [ -n "$_hy_have" ] && { [ -z "$_hy_latest" ] || [ "$_hy_have" = "$_hy_latest" ]; }; then
+    if [ -n "$_hy_have" ]; then
       info "Hysteria2 已存在，直接用现有的：v${_hy_have}"
       return 0
     fi
   fi
+  _hy_latest=$(_latest_hysteria_ver) || _hy_latest=""
   recover_disk_space
   _hy_free=$(_disk_free_mb /usr/local)
   if [ -z "$_hy_free" ]; then _hy_free=$(_disk_free_mb /); fi
@@ -6971,7 +7023,7 @@ if [ -f /etc/xray-node/node.txt ] && [ ! -d /etc/xray-node/nodes ]; then
     _m_port=$(sed -n 's/^端口: //p' /etc/xray-node/node.txt | head -1)
     _m_proto=tcp
     case "$(sed -n 's/^协议: //p' /etc/xray-node/node.txt | head -1)" in
-      hy2|hysteria2|tuic|TUIC) _m_proto=udp ;;
+      hy2|hysteria2|Hysteria2|tuic|TUIC) _m_proto=udp ;;
     esac
     if [ -f /etc/xray-node/fw_info ]; then
       read -r _m_fw_port _m_fw_proto _m_rest < /etc/xray-node/fw_info
@@ -7943,7 +7995,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   while [ "$_rp_try" -lt 2 ]; do
     _rp_try=$((_rp_try + 1))
     _rp_out=""
-    if [ "$CORE" = "xray" ] && [ -x "$XRAY_BIN" ]; then
+    if [ -x "$XRAY_BIN" ]; then
       _rp_out=$(_timeout_cmd 25 "$XRAY_BIN" tls ping "$REALITY_DOMAIN" 2>&1)
       if printf "%s" "$_rp_out" | grep -q "Handshake succeeded" \
         && printf "%s" "$_rp_out" | grep -q "TLS 1.3"; then
@@ -7956,11 +8008,20 @@ if [ "$NEED_REALITY" -eq 1 ]; then
         && printf "%s" "$_rp_out" | grep -q "Verify return code: 0"; then
         _rp_ok=1
       fi
+    elif command -v curl >/dev/null 2>&1; then
+      _timeout_cmd 20 curl -sS --tlsv1.3 -o /dev/null --connect-timeout 10 -m 18 "https://${REALITY_DOMAIN}/" >/dev/null 2>&1
+      _rp_crc=$?
+      if [ "$_rp_crc" -eq 0 ]; then
+        _rp_ok=1
+      elif [ "$_rp_crc" -eq 2 ] || [ "$_rp_crc" -eq 4 ]; then
+        info "没有可用的检测工具，跳过验证"
+        _rp_ok=2
+      fi
     else
       info "没有可用的检测工具，跳过验证"
-      _rp_ok=1
+      _rp_ok=2
     fi
-    if [ "$_rp_ok" -eq 1 ]; then break; fi
+    if [ "$_rp_ok" -ge 1 ]; then break; fi
     if [ "$_rp_try" -eq 1 ] && [ "$REALITY_DOMAIN" != "www.apple.com" ]; then
       warn "你选的 $REALITY_DOMAIN 从这台 VPS 握手不太顺，伪装效果可能打折。"
       _rp_swap=1
@@ -7983,7 +8044,7 @@ if [ "$NEED_REALITY" -eq 1 ]; then
   done
   if [ "$_rp_ok" -eq 1 ]; then
     info "伪装域名验证通过：${REALITY_DOMAIN}（TLS 1.3 握手正常）"
-  else
+  elif [ "$_rp_ok" -ne 2 ]; then
     warn "伪装域名 $REALITY_DOMAIN 验证没通过，继续安装（节点照常用，伪装效果可能打折）。"
   fi
 fi
@@ -8011,16 +8072,12 @@ if [ "$PROTO" = "hy2" ]; then
   fi
   chmod 600 "$NODE_DIR/key.pem" "$NODE_DIR/cert.pem" 2>/dev/null
   # 新版 Xray 已经取消“跳过证书验证”，客户端必须带这张证书的指纹才能连。
-  HY2_PIN=$(printf '%s\n' "$_hy_cert_err" | sed -n 's/.*pinSHA256:[[:space:]]*//p' | head -1 | tr -d ' \r\n' | tr 'a-f' 'A-F')
+  HY2_PIN=$(printf '%s\n' "$_hy_cert_err" | sed -n 's/.*pinSHA256:[[:space:]]*//p' | head -1 | tr -d ' :"\r\n' | tr 'a-f' 'A-F')
   case "$HY2_PIN" in
     *[!0-9A-F]*|"") HY2_PIN="" ;;
   esac
-  if [ -z "$HY2_PIN" ] && command -v openssl >/dev/null 2>&1; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      HY2_PIN=$(openssl x509 -in "$NODE_DIR/cert.pem" -outform der 2>/dev/null | sha256sum 2>/dev/null | awk '{print toupper($1)}')
-    elif command -v shasum >/dev/null 2>&1; then
-      HY2_PIN=$(openssl x509 -in "$NODE_DIR/cert.pem" -outform der 2>/dev/null | shasum -a 256 2>/dev/null | awk '{print toupper($1)}')
-    fi
+  if [ -z "$HY2_PIN" ]; then
+    HY2_PIN=$(_cert_pin "$NODE_DIR/cert.pem") || HY2_PIN=""
   fi
   case "$HY2_PIN" in
     *[!0-9A-F]*|"") HY2_PIN="" ;;
@@ -8472,14 +8529,7 @@ _svc_recheck() { # _svc_recheck [等几秒] [协议列表]
     pgrep -f "$_sr_pat" >/dev/null 2>&1 || _svc_listen_ok=0
   fi
 }
-# 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
-if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ ! -f /etc/xray-node/hy_root ] \
-  && grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
-  warn "用普通用户身份跑不起来，改用 root 再试一次"
-  : > /etc/xray-node/hy_root
-  _svc_restart "$NODE_ID"
-  _svc_recheck
-fi
+# 双栈监听失败时先回退为单栈，避免因双栈绑不上端口而永久退回 root 运行。
 if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$PORT" ]; then
   warn "同时听 IPv4 和 IPv6 没成功，改回只听你刚才选的那一种"
   if [ "$IPVER" = "6" ]; then HY_LISTEN="[::]:$PORT"; else HY_LISTEN="0.0.0.0:$PORT"; fi
@@ -8489,6 +8539,14 @@ if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ "$HY_LISTEN" = ":$P
     _svc_restart "$NODE_ID"
     _svc_recheck
   fi
+fi
+# 以非 root 身份跑不起来时（个别精简系统、老内核），改回 root 再试一次。
+if [ "$_svc_listen_ok" != "1" ] && [ "$PROTO" = "hy2" ] && [ ! -f /etc/xray-node/hy_root ] \
+  && grep -q '^User=xray-node' /etc/systemd/system/hysteria-node@.service 2>/dev/null; then
+  warn "用普通用户身份跑不起来，改用 root 再试一次"
+  : > /etc/xray-node/hy_root
+  _svc_restart "$NODE_ID"
+  _svc_recheck
 fi
 if [ "$_svc_listen_ok" != "1" ] && { [ "$CORE" = "xray" ] || [ "$CORE" = "sing-box" ]; } \
   && [ "$IPVER" = "4" ] && grep -q '"listen"[[:space:]]*:[[:space:]]*"::"' "$NODE_DIR/config.json" 2>/dev/null; then
@@ -8961,16 +9019,16 @@ fi
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$HY2_PASS" "$HY2_SNI" "$_hy_surge_cert" "$_hy_surge_obfs" "$_hy_surge_hop" "${HY2_BW_DOWN:+, download-bandwidth=${HY2_BW_DOWN}}"
       # mihomo（Clash Meta、Clash Verge、FlClash 用的内核）原生支持端口跳跃：ports + hop-interval。
       printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
-      printf "  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
+      printf "  - name: \"%s\"\n    type: hysteria2\n    server: \"%s\"\n    port: %s\n" "$NODE_NAME" "$SERVER_IP" "$LINK_PORT"
       if [ -n "$HY_MPORT" ]; then
-        printf "    ports: %s\n    hop-interval: 30\n" "$HY_MPORT"
+        printf "    ports: \"%s\"\n    hop-interval: 30\n" "$HY_MPORT"
       fi
-      printf "    password: %s\n    sni: %s\n    alpn: [h3]\n" "$HY2_PASS" "$HY2_SNI"
+      printf "    password: \"%s\"\n    sni: %s\n    alpn: [h3]\n" "$HY2_PASS" "$HY2_SNI"
       if [ -z "$HY2_DOMAIN" ]; then
         printf "    fingerprint: %s\n" "$(printf '%s' "$HY2_PIN" | tr 'A-F' 'a-f')"
       fi
       if [ "$HY2_USE_OBFS" = "1" ]; then
-        printf "    obfs: salamander\n    obfs-password: %s\n" "$HY2_OBFS"
+        printf "    obfs: salamander\n    obfs-password: \"%s\"\n" "$HY2_OBFS"
       fi
       [ -n "$HY2_BW_UP" ] && printf "    up: \"%s Mbps\"\n" "$HY2_BW_UP"
       [ -n "$HY2_BW_DOWN" ] && printf "    down: \"%s Mbps\"\n" "$HY2_BW_DOWN"
@@ -8993,7 +9051,7 @@ fi
       printf "说明: Snell v5 服务端向下兼容 v4 客户端（老客户端可把 version=5 改成 version=4）；需要同时放行端口 %s 的 TCP 和 UDP。\n" "$LINK_PORT"
       printf "如果走 QUIC 容易断，改用下面「拦截 QUIC」里带 block-quic=on 的 Surge 行。\n"
       printf "mihomo / Clash Meta / Stash 配置（贴到 proxies: 下面）:\n"
-      printf "  - name: \"%s\"\n    type: snell\n    server: %s\n    port: %s\n    psk: %s\n    version: 5\n    udp: true\n    reuse: true\n" \
+      printf "  - name: \"%s\"\n    type: snell\n    server: \"%s\"\n    port: %s\n    psk: \"%s\"\n    version: 5\n    udp: true\n    reuse: true\n" \
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$SNELL_PSK"
       if [ "$SNELL_OBFS" = "http" ]; then
         printf "    obfs-opts:\n      mode: http\n      host: %s\n" "$SNELL_OBFS_HOST"
@@ -9007,7 +9065,7 @@ fi
       fi
       printf "Surge 节点配置（贴到 [Proxy] 下面，已写好 block-quic=on）:\n%s\n" "$SURGE_LINE"
       printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
-      printf "  - name: \"%s\"\n    type: snell\n    server: %s\n    port: %s\n    psk: %s\n    version: 6\n    mode: %s\n    udp: true\n    reuse: true\n" \
+      printf "  - name: \"%s\"\n    type: snell\n    server: \"%s\"\n    port: %s\n    psk: \"%s\"\n    version: 6\n    mode: %s\n    udp: true\n    reuse: true\n" \
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$SNELL_PSK" "$SNELL_MODE"
       ;;
     socks5)
@@ -9015,7 +9073,7 @@ fi
       printf "Telegram 代理链接: https://t.me/socks?server=%s&port=%s&user=%s&pass=%s\n" \
         "$SERVER_IP" "$LINK_PORT" "$SOCKS_USER" "$SOCKS_PASS"
       printf "mihomo / Clash Meta 配置（贴到 proxies: 下面）:\n"
-      printf "  - name: \"%s\"\n    type: socks5\n    server: %s\n    port: %s\n    username: %s\n    password: %s\n    udp: true\n" \
+      printf "  - name: \"%s\"\n    type: socks5\n    server: \"%s\"\n    port: %s\n    username: \"%s\"\n    password: \"%s\"\n    udp: true\n" \
         "$NODE_NAME" "$SERVER_IP" "$LINK_PORT" "$SOCKS_USER" "$SOCKS_PASS"
       ;;
   esac
@@ -9074,7 +9132,9 @@ fi
 # BBR 是 Linux 内核自带的一种 TCP 加速算法，网络差时速度更稳，打开不影响别的程序。
 step "检查 BBR 加速…"
 _BBR_ON=0
-if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+_bbr_cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+[ -n "$_bbr_cur" ] || _bbr_cur=$(tr -d ' \r\n' 2>/dev/null < /proc/sys/net/ipv4/tcp_congestion_control)
+if [ "$_bbr_cur" = "bbr" ]; then
   _BBR_ON=1
   info "BBR 已经开启，不用动"
 fi
@@ -9084,12 +9144,21 @@ if [ "$_BBR_ON" = "0" ]; then
     command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
   fi
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
-       sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
-      mkdir -p /etc/sysctl.d
-      printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-xray-node-bbr.conf
+    _bbr_set=0
+    if { sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || { printf 'fq\n' > /proc/sys/net/core/default_qdisc; } 2>/dev/null; } \
+      && { sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || { printf 'bbr\n' > /proc/sys/net/ipv4/tcp_congestion_control; } 2>/dev/null; }; then
+      _bbr_set=1
+    fi
+    if [ "$_bbr_set" = "1" ]; then
+      [ -d /etc/sysctl.d ] || { mkdir -p /etc/sysctl.d 2>/dev/null && chmod 755 /etc/sysctl.d 2>/dev/null; }
+      printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-xray-node-bbr.conf 2>/dev/null
       chmod 644 /etc/sysctl.d/99-xray-node-bbr.conf 2>/dev/null || true
-      if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+      if [ -x /etc/init.d/sysctl ] && command -v rc-update >/dev/null 2>&1; then
+        rc-update add sysctl boot >/dev/null 2>&1 || true
+      fi
+      _bbr_now=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+      [ -n "$_bbr_now" ] || _bbr_now=$(tr -d ' \r\n' 2>/dev/null < /proc/sys/net/ipv4/tcp_congestion_control)
+      if [ "$_bbr_now" = "bbr" ]; then
         _BBR_ON=1
         info "BBR 已自动开启（立即生效，已写入开机配置）"
       fi
@@ -9109,6 +9178,8 @@ printf "${YELLOW}%s${NC}\n" "$LINK"
 printf "\n${CYAN}${BOLD}【2】Loon 节点${NC}（Loon 里添加节点，复制整行粘贴）\n\n"
 if [ -n "$LOON_LINE" ]; then
   printf "${YELLOW}%s${NC}\n" "$LOON_LINE"
+elif [ -n "$SURGE_LINE" ]; then
+  printf "Loon 不支持 %s，请用上面的通用链接或下面的 Surge 节点。\n" "$PROTO_NAME"
 else
   printf "Loon 不支持 %s，请用上面的通用链接。\n" "$PROTO_NAME"
 fi
