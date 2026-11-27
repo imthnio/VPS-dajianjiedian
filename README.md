@@ -16,9 +16,3 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH";export
 ```
 
 3. 按提示回答问题：节点名称、端口、伪装域名等都会停下来等你输入（Hysteria2 还会问上下行带宽，只填数字），看不懂就回车用默认。
-
-## 赞赏支持
-如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
-微信扫一扫下方赞赏码即可：
-
-![赞赏码](./appreciate.png)
