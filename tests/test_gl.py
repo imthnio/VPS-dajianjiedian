@@ -61,7 +61,9 @@ class GlTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
-    def run_gl(self, curl):
+    def run_gl(self, curl, uid="0"):
+        (self.mock / "id").write_text(f"#!/bin/sh\necho {uid}\n")
+        (self.mock / "id").chmod(0o755)
         (self.mock / "curl").write_text(curl)
         (self.mock / "curl").chmod(0o755)
         env = dict(self.env, PATH=f"{self.mock}:{self.env['PATH']}")
@@ -119,6 +121,8 @@ class GlTest(unittest.TestCase):
         )
         (self.mock / "wget").chmod(0o755)
         # 用一个没有 curl 的 PATH
+        (self.mock / "id").write_text("#!/bin/sh\necho 0\n")
+        (self.mock / "id").chmod(0o755)
         for tool in ("sh", "dirname", "mkdir", "rm", "mv", "chmod", "head", "grep", "tail", "sed"):
             p = subprocess.run(["sh", "-c", f"command -v {tool}"], capture_output=True, text=True).stdout.strip()
             if p and not (self.mock / tool).exists():
@@ -138,10 +142,18 @@ class GlTest(unittest.TestCase):
         self.assertIn("WARN", r.stdout)
         self.assertIn("someone-else", (self.bin / "gl").read_text())
 
+    def test_gl_auto_elevates_for_non_root(self):
+        self.write_gl()
+        (self.mock / "sudo").write_text('#!/bin/sh\nprintf "GL_SUDO %s\\n" "$*"\n')
+        (self.mock / "sudo").chmod(0o755)
+        r = self.run_gl(CURL_OK, uid="1000")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"GL_SUDO sh {self.bin / 'gl'} x", r.stdout)
+
     def test_uninstall_removes_gl(self):
         source = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
         self.assertIn("grep -q 'xray-node-gl' /usr/local/bin/gl 2>/dev/null && rm -f /usr/local/bin/gl", source)
-        self.assertIn("chmod 700 /usr/local/bin/shanjiedian\n_write_gl_cmd\n", source)
+        self.assertIn("chmod 755 /usr/local/bin/shanjiedian\n_write_gl_cmd\n", source)
 
 
 if __name__ == "__main__":

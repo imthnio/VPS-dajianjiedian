@@ -4,7 +4,7 @@
 #
 # 要改这个文件的人或 AI：每次动手前，先读完仓库里的 AGENTS.md（规矩、排障手册与历史故障）。
 #
-# 小白用法（root 用户）：
+# 小白用法（root 或带 sudo 权限的普通用户如 ubuntu 均可，会自动提权）：
 #   1. SSH 连上你的服务器
 #   2. 粘贴 README 里的那一行安装命令，回车。
 #      没有 curl、也没有 wget 时，这一行会先装上再继续。
@@ -4003,6 +4003,15 @@ _write_gl_cmd() {
 #!/bin/sh
 # xray-node-gl：输入 gl 打开节点主菜单。由一键安装脚本写入，卸载节点时一起删除。
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; export PATH
+if [ "$(id -u)" -ne 0 ] && [ -f "$0" ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo sh "$0" "$@"
+  elif command -v doas >/dev/null 2>&1; then
+    exec doas sh "$0" "$@"
+  fi
+  echo "请用 root 用户运行（root 下直接运行，或在命令前加 sudo / 用 su - 切到 root）" >&2
+  exit 1
+fi
 F=${XRAY_GL_CACHE:-/etc/xray-node/install.sh}
 T="$F.new"
 E="$F.err"
@@ -4057,6 +4066,15 @@ cat > /usr/local/bin/jiedian <<'JDEOF'
 # 输入 jiedian all：显示每个节点的完整参数（端口、密码、Surge / Clash 配置等）
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
+if [ "$(id -u)" -ne 0 ] && [ -f "$0" ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo sh "$0" "$@"
+  elif command -v doas >/dev/null 2>&1; then
+    exec doas sh "$0" "$@"
+  fi
+  echo "请用 root 用户运行（root 下直接运行，或在命令前加 sudo / 用 su - 切到 root）" >&2
+  exit 1
+fi
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
@@ -4113,12 +4131,21 @@ else
 fi
 exit 0
 JDEOF
-chmod 700 /usr/local/bin/jiedian
+chmod 755 /usr/local/bin/jiedian
 cat > /usr/local/bin/shanjiedian <<'XZEOF'
 #!/bin/sh
 # 输入 shanjiedian，进入节点管理：查看节点、删除单个节点、限制节点能连几台设备，或全部卸载
 PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
+if [ "$(id -u)" -ne 0 ] && [ -f "$0" ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo sh "$0" "$@"
+  elif command -v doas >/dev/null 2>&1; then
+    exec doas sh "$0" "$@"
+  fi
+  echo "请用 root 用户运行（root 下直接运行，或在命令前加 sudo / 用 su - 切到 root）" >&2
+  exit 1
+fi
 if [ -x /usr/local/bin/xray-node-expire ]; then
   /usr/local/bin/xray-node-expire || true
 fi
@@ -4494,7 +4521,7 @@ case "$_sel" in
     ;;
 esac
 XZEOF
-chmod 700 /usr/local/bin/shanjiedian
+chmod 755 /usr/local/bin/shanjiedian
 _write_gl_cmd
 # 旧版的 xiezai 是"一键全删"，改名后把它删掉，免得留着误导人
 rm -f /usr/local/bin/xiezai
@@ -6864,9 +6891,18 @@ _dl_snell_inner() { # _dl_snell_inner <5|6>
 dl_snell() { _snell_prepare; _dl_snell_inner "$1"; _dl_rc=$?; _dns64_off; return "$_dl_rc"; }
 
 # ---------- 1. 必须是 root ----------
-# 装软件、写系统配置、改防火墙都要管理员（root）权限，普通用户做不了。
+# 装软件、写系统配置、改防火墙都要管理员（root）权限；普通用户自动用 sudo / doas 提权。
 if [ "$(id -u)" -ne 0 ]; then
-  die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo）"
+  if [ -f "$0" ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      info "当前不是 root 用户，自动使用 sudo 提权运行…"
+      exec sudo sh "$0" "$@"
+    elif command -v doas >/dev/null 2>&1; then
+      info "当前不是 root 用户，自动使用 doas 提权运行…"
+      exec doas sh "$0" "$@"
+    fi
+  fi
+  die "请用 root 用户运行（root 下直接运行，或在命令前加 sudo / 用 su - 切到 root）"
 fi
 # 用 heredoc 或管道把脚本喂给 sh 时，标准输入已经结束。
 # 提问会读到空，回车的默认值会被当成你的选择，端口和伪装域名就不再问。

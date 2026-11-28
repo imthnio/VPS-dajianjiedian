@@ -525,7 +525,7 @@ class InstallPromptTest(unittest.TestCase):
             sysbin = root / "sysbin"
             sysbin.mkdir()
             # /usr/bin 也要：macOS 上 grep / sed / tail 在 /usr/bin，不链进来安装命令就跑不全
-            skip = ("curl", "wget", "busybox", "dpkg", "apt-get", "apk", "yum", "dnf", "pacman", "zypper", "getent", "nslookup")
+            skip = ("curl", "wget", "busybox", "dpkg", "apt-get", "apk", "yum", "dnf", "pacman", "zypper", "getent", "nslookup", "sudo", "doas")
             for d in ("/bin", "/usr/bin"):
                 for tool in Path(d).iterdir():
                     if tool.name in skip or (sysbin / tool.name).exists():
@@ -686,6 +686,88 @@ class InstallPromptTest(unittest.TestCase):
         result, _logged, _out = self.run_line({"curl": CURL_STUB}, "#!/bin/sh\nexit 3\n", stdin="")
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertNotIn("安装脚本没下载下来", result.stdout)
+
+    def test_one_line_auto_uses_sudo_for_non_root(self):
+        id_nonroot = "#!/bin/sh\necho 1000\n"
+        sudo_stub = '#!/bin/sh\nprintf "sudo %s\\n" "$*" >> "$LOG"\nexec "$@"\n'
+        result, logged, _out = self.run_line(
+            {"id": id_nonroot, "sudo": sudo_stub, "apt-get": APT_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertIn("sudo apt-get update -qq", logged)
+        self.assertIn("sudo apt-get install -y curl", logged)
+        self.assertIn("sudo sh ", logged)
+
+    def test_one_line_auto_uses_doas_when_sudo_missing(self):
+        id_nonroot = "#!/bin/sh\necho 1000\n"
+        doas_stub = '#!/bin/sh\nprintf "doas %s\\n" "$*" >> "$LOG"\nexec "$@"\n'
+        result, logged, _out = self.run_line(
+            {"id": id_nonroot, "doas": doas_stub, "curl": CURL_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertIn("doas sh ", logged)
+
+    def test_one_line_skips_sudo_when_already_root(self):
+        id_root = "#!/bin/sh\necho 0\n"
+        result, logged, _out = self.run_line(
+            {"id": id_root, "sudo": FAIL_STUB, "doas": FAIL_STUB, "curl": CURL_STUB},
+            "#!/bin/sh\nread -r ans\nprintf 'GOT %s\\n' \"$ans\"\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GOT 8443", result.stdout)
+        self.assertNotIn("fail ", logged)
+
+    def test_installer_auto_elevates_for_non_root_and_skips_for_root(self):
+        sec1 = between("# ---------- 1. 必须是 root ----------", "# 用 heredoc 或管道")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = root / "install.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                'info() { printf "INFO %s\\n" "$1"; }\n'
+                'die() { printf "DIE %s\\n" "$1"; exit 1; }\n'
+                + sec1
+                + 'printf "RAN_AS_ROOT %s\\n" "$*"\n'
+            )
+            script.chmod(0o755)
+            for mode in ("root", "sudo", "doas", "none"):
+                bindir = root / f"bin-{mode}"
+                bindir.mkdir()
+                (bindir / "id").write_text("#!/bin/sh\necho 0\n" if mode == "root" else "#!/bin/sh\necho 1000\n")
+                (bindir / "id").chmod(0o755)
+                if mode == "sudo":
+                    (bindir / "sudo").write_text('#!/bin/sh\nprintf "ELEV_SUDO %s\\n" "$*"\n')
+                    (bindir / "sudo").chmod(0o755)
+                elif mode == "doas":
+                    (bindir / "doas").write_text('#!/bin/sh\nprintf "ELEV_DOAS %s\\n" "$*"\n')
+                    (bindir / "doas").chmod(0o755)
+                elif mode == "root":
+                    (bindir / "sudo").write_text("#!/bin/sh\necho BAD_SUDO; exit 99\n")
+                    (bindir / "sudo").chmod(0o755)
+                r = subprocess.run(
+                    ["/bin/sh", str(script), "--arg1"],
+                    env={"PATH": str(bindir)},
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if mode == "root":
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn("RAN_AS_ROOT --arg1", r.stdout)
+                    self.assertNotIn("BAD_SUDO", r.stdout)
+                elif mode == "sudo":
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn(f"ELEV_SUDO sh {script} --arg1", r.stdout)
+                elif mode == "doas":
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn(f"ELEV_DOAS sh {script} --arg1", r.stdout)
+                else:
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn("请用 root 用户运行", r.stdout)
 
 
 CURL_STUB = """#!/bin/sh
